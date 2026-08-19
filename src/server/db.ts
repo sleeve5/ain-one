@@ -85,19 +85,29 @@ function migrate(db: DatabaseSync): void {
 }
 
 function migrateQueuedMessageSequence(db: DatabaseSync): void {
-  const hasEnqueueSeq = (db
-    .prepare("PRAGMA table_info(queued_messages)")
-    .all() as Array<{ name: string }>).some((column) => column.name === "enqueue_seq");
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    const hasEnqueueSeq = (db
+      .prepare("PRAGMA table_info(queued_messages)")
+      .all() as Array<{ name: string }>).some(
+      (column) => column.name === "enqueue_seq",
+    );
 
-  if (!hasEnqueueSeq) {
-    db.exec("ALTER TABLE queued_messages ADD COLUMN enqueue_seq INTEGER;");
+    if (!hasEnqueueSeq) {
+      db.exec("ALTER TABLE queued_messages ADD COLUMN enqueue_seq INTEGER;");
+    }
+
     db.exec(`
       WITH ranked AS (
         SELECT
           rowid AS message_rowid,
           ROW_NUMBER() OVER (
             PARTITION BY conversation_id
-            ORDER BY created_at ASC, rowid ASC
+            ORDER BY
+              CASE WHEN enqueue_seq IS NULL THEN 1 ELSE 0 END,
+              enqueue_seq ASC,
+              created_at ASC,
+              rowid ASC
           ) AS enqueue_seq
         FROM queued_messages
       )
@@ -108,17 +118,30 @@ function migrateQueuedMessageSequence(db: DatabaseSync): void {
         WHERE ranked.message_rowid = queued_messages.rowid
       )
     `);
+
+    const incomplete = db
+      .prepare(
+        "SELECT COUNT(*) AS count FROM queued_messages WHERE enqueue_seq IS NULL",
+      )
+      .get() as { count: number };
+    if (incomplete.count > 0) {
+      throw new Error("Failed to backfill queued message sequence");
+    }
+
+    db.exec("DROP INDEX IF EXISTS queued_messages_pending_idx;");
+    db.exec(`
+      CREATE INDEX queued_messages_pending_idx
+      ON queued_messages(conversation_id, enqueue_seq)
+      WHERE status = 'pending'
+    `);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_sequence_idx
+      ON queued_messages(conversation_id, enqueue_seq)
+      WHERE enqueue_seq IS NOT NULL
+    `);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
   }
-
-  db.exec(`
-    CREATE INDEX IF NOT EXISTS queued_messages_pending_idx
-    ON queued_messages(conversation_id, enqueue_seq)
-    WHERE status = 'pending'
-  `);
-
-  db.exec(`
-    CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_sequence_idx
-    ON queued_messages(conversation_id, enqueue_seq)
-    WHERE enqueue_seq IS NOT NULL
-  `);
 }

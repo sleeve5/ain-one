@@ -1,34 +1,41 @@
+import { afterAll } from "vitest";
+
+const SQLITE_EXPERIMENTAL_WARNING =
+  "SQLite is an experimental feature and might change at any time";
 const originalEmitWarning = process.emitWarning.bind(process);
 
-process.emitWarning = ((warning: unknown, ...args: unknown[]) => {
-  if (isSqliteExperimentalWarning(warning, args)) {
-    return;
-  }
-  originalEmitWarning(
-    warning as Parameters<typeof originalEmitWarning>[0],
-    ...(args as []),
-  );
-}) as typeof process.emitWarning;
+export function createWarningFilter(
+  forward: (...args: unknown[]) => void,
+): (...args: unknown[]) => void {
+  return (warning: unknown, ...args: unknown[]) => {
+    if (isNodeSqliteExperimentalWarning(warning, args)) {
+      return;
+    }
+    forward(warning, ...args);
+  };
+}
 
-process.once("exit", () => {
+process.emitWarning = createWarningFilter(
+  originalEmitWarning as (...args: unknown[]) => void,
+) as typeof process.emitWarning;
+
+afterAll(() => {
   process.emitWarning = originalEmitWarning;
 });
 
-function isSqliteExperimentalWarning(
+function isNodeSqliteExperimentalWarning(
   warning: unknown,
   args: unknown[],
 ): boolean {
   if (warning instanceof Error) {
     return (
       warning.name === "ExperimentalWarning" &&
-      warning.message.includes("SQLite")
+      warning.message === SQLITE_EXPERIMENTAL_WARNING
     );
   }
 
-  if (typeof warning === "string") {
-    const warningType = typeof args[0] === "string" ? args[0] : undefined;
-    return warningType === "ExperimentalWarning" && warning.includes("SQLite");
-  }
-
-  return false;
+  return (
+    warning === SQLITE_EXPERIMENTAL_WARNING &&
+    args[0] === "ExperimentalWarning"
+  );
 }

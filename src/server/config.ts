@@ -19,4 +19,3 @@ export function createServerConfig(
 function defaultDataDir(): string {
   return join(homedir(), ".ain-one");
 }
-

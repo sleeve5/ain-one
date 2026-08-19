@@ -43,6 +43,7 @@ class ControlledConnector implements AgentConnector {
   readonly id = "codex" as const;
   prompts: string[] = [];
   startAttempts = 0;
+  startedTurnIds: string[] = [];
   createSessionCalls = 0;
   cancelRequests: Array<{ sessionId: string; nativeTurnId: string | null }> = [];
   cancelMode: "confirm" | "reject" | "throw" = "confirm";
@@ -100,6 +101,7 @@ class ControlledConnector implements AgentConnector {
       content: input.content,
     };
     this.startedTurns.push(started);
+    this.startedTurnIds.push(started.turnId);
 
     return { nativeTurnId: started.nativeTurnId };
   }
@@ -185,6 +187,22 @@ class DefiniteRejectConnector extends ControlledConnector {
     };
     error.definiteStartRejection = true;
     throw error;
+  }
+}
+
+class EarlyTerminalConnector extends ControlledConnector {
+  private emittedEarly = false;
+
+  override async startTurn(
+    session: LiveSession,
+    input: StartTurnInput,
+  ): Promise<NativeTurn> {
+    const nativeTurn = await super.startTurn(session, input);
+    if (!this.emittedEarly) {
+      this.emittedEarly = true;
+      await this.emitTerminal(input.turnId!, "completed");
+    }
+    return nativeTurn;
   }
 }
 
@@ -294,6 +312,33 @@ describe("TurnCoordinator", () => {
 
     expect(app.repositories.getTurn(secondTurnId)?.status).toBe("running");
     expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(false);
+  });
+
+  it("does not resurrect a Turn completed before startTurn resolves", async () => {
+    const runtime = new EarlyTerminalConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    app.repositories.setConversationQueuePaused(conversation.id, true);
+    app.repositories.enqueueMessage(conversation.id, "first");
+    app.repositories.enqueueMessage(conversation.id, "second");
+    app.repositories.setConversationQueuePaused(conversation.id, false);
+
+    await app.coordinator.dispatchNext(conversation.id);
+
+    const secondTurn = app.repositories.getActiveTurn(conversation.id);
+    if (!secondTurn) {
+      throw new Error("expected second Turn to be active");
+    }
+    const firstTurnId = runtime.startedTurnIds[0];
+    if (!firstTurnId) {
+      throw new Error("expected first Turn ID");
+    }
+
+    expect(app.repositories.getTurn(firstTurnId)?.status).toBe("completed");
+    expect(app.repositories.getTurn(secondTurn.id)?.status).toBe("running");
+    expect(runtime.prompts).toEqual(["first", "second"]);
+    expect(runtime.startAttempts).toBe(2);
   });
 
   it("serializes concurrent dispatches so one session/start wins and cancel targets the active native turn", async () => {

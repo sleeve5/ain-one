@@ -27,7 +27,7 @@ export interface Repositories {
     conversationId: string,
     snapshot: TurnSnapshot,
   ): { message: QueuedMessage; turn: Turn } | null;
-  markTurnRunning(turnId: string, nativeTurnId: string | null): void;
+  markTurnRunning(turnId: string, nativeTurnId: string | null): boolean;
   markTurnCancelling(turnId: string): void;
   finishTurn(turnId: string, status: TerminalTurnStatus, error?: NormalizedError): void;
   requeueClaimedMessage(turnId: string): void;
@@ -272,23 +272,30 @@ class SqliteRepositories implements Repositories {
     });
   }
 
-  markTurnRunning(turnId: string, nativeTurnId: string | null): void {
-    const now = isoNow();
-    this.db
-      .prepare(
-        `UPDATE turns
-         SET status = 'running', native_turn_id = ?, updated_at = ?
-         WHERE id = ?`,
-      )
-      .run(nativeTurnId, now, turnId);
+  markTurnRunning(turnId: string, nativeTurnId: string | null): boolean {
+    return this.immediateTransaction(() => {
+      const now = isoNow();
+      const result = this.db
+        .prepare(
+          `UPDATE turns
+           SET status = 'running', native_turn_id = ?, updated_at = ?
+           WHERE id = ? AND status = 'starting'`,
+        )
+        .run(nativeTurnId, now, turnId);
 
-    this.db
-      .prepare(
-        `UPDATE queued_messages
-         SET status = 'consumed', updated_at = ?
-         WHERE id = (SELECT message_id FROM turns WHERE id = ?)`,
-      )
-      .run(now, turnId);
+      if (result.changes === 0) {
+        return false;
+      }
+
+      this.db
+        .prepare(
+          `UPDATE queued_messages
+           SET status = 'consumed', updated_at = ?
+           WHERE id = (SELECT message_id FROM turns WHERE id = ?)`,
+        )
+        .run(now, turnId);
+      return true;
+    });
   }
 
   markTurnCancelling(turnId: string): void {

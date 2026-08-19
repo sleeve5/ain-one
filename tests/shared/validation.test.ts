@@ -23,4 +23,35 @@ describe("API validation", () => {
       "Message cannot be empty",
     );
   });
+
+  it("rejects non-object payloads", () => {
+    expect(() => parseCreateConversation(null)).toThrow(
+      "Invalid create conversation payload",
+    );
+    expect(() => parseQueueMessage([])).toThrow(
+      "Invalid queue message payload",
+    );
+  });
+
+  it("rejects fields with the wrong types", () => {
+    expect(() =>
+      parseCreateConversation({ projectId: 1, agentProductId: "codex" }),
+    ).toThrow("projectId must be a string");
+    expect(() =>
+      parseCreateConversation({
+        projectId: "p1",
+        agentProductId: "codex",
+        modelId: 5,
+      }),
+    ).toThrow("modelId must be a string or null");
+    expect(() => parseQueueMessage({ content: 1 })).toThrow(
+      "content must be a string",
+    );
+  });
+
+  it("rejects an empty project ID", () => {
+    expect(() =>
+      parseCreateConversation({ projectId: "  ", agentProductId: "codex" }),
+    ).toThrow("projectId cannot be empty");
+  });
 });

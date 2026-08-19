@@ -1,5 +1,13 @@
 import { randomBytes } from "node:crypto";
-import { mkdirSync, openSync, readFileSync, writeFileSync, closeSync } from "node:fs";
+import {
+  chmodSync,
+  closeSync,
+  lstatSync,
+  mkdirSync,
+  openSync,
+  readFileSync,
+  writeFileSync,
+} from "node:fs";
 import { homedir } from "node:os";
 import { join } from "node:path";
 
@@ -39,17 +47,44 @@ function defaultDataDir(): string {
 
 function readOrCreateInstallToken(dataDir: string): string {
   const tokenPath = join(dataDir, "install.token");
-
-  try {
-    const existing = readFileSync(tokenPath, "utf8").trim();
-    if (existing.length > 0) {
-      return existing;
-    }
-  } catch {
-    // fall through to create
+  const existing = readExistingInstallToken(tokenPath);
+  if (existing !== null) {
+    return existing;
   }
 
+  return createInstallTokenAtomically(tokenPath);
+}
+
+function readExistingInstallToken(tokenPath: string): string | null {
+  let stats: ReturnType<typeof lstatSync>;
+  try {
+    stats = lstatSync(tokenPath);
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return null;
+    }
+    throw error;
+  }
+
+  if (!stats.isFile()) {
+    throw new Error("install.token must be a regular file inside dataDir");
+  }
+
+  if ((stats.mode & 0o777) !== 0o600) {
+    chmodSync(tokenPath, 0o600);
+  }
+
+  const existing = readFileSync(tokenPath, "utf8").trim();
+  if (existing.length === 0) {
+    throw new Error("install.token exists but is empty");
+  }
+
+  return existing;
+}
+
+function createInstallTokenAtomically(tokenPath: string): string {
   const created = `${randomBytes(24).toString("hex")}\n`;
+
   try {
     const fd = openSync(tokenPath, "wx", 0o600);
     try {
@@ -58,11 +93,17 @@ function readOrCreateInstallToken(dataDir: string): string {
       closeSync(fd);
     }
     return created.trim();
-  } catch {
-    const fallback = readFileSync(tokenPath, "utf8").trim();
-    if (fallback.length > 0) {
-      return fallback;
+  } catch (error) {
+    if (isErrno(error, "EEXIST")) {
+      const existing = readExistingInstallToken(tokenPath);
+      if (existing !== null) {
+        return existing;
+      }
     }
     throw new Error("Failed to create installation token");
   }
+}
+
+function isErrno(error: unknown, code: string): boolean {
+  return typeof error === "object" && error !== null && "code" in error && (error as { code?: string }).code === code;
 }

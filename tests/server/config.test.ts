@@ -1,4 +1,13 @@
-import { existsSync, lstatSync, mkdtempSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import {
+  chmodSync,
+  existsSync,
+  lstatSync,
+  mkdtempSync,
+  readFileSync,
+  rmSync,
+  symlinkSync,
+  writeFileSync,
+} from "node:fs";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -48,5 +57,31 @@ describe("server config token", () => {
     expect(fromEnv.token).toBe("env-token");
 
     expect(readFileSync(tokenPath, "utf8").trim()).toBe("stored-token");
+  });
+
+  it("repairs permissions to 0600 for an existing non-empty token file", () => {
+    const dataDir = makeDataDir();
+    const tokenPath = join(dataDir, "install.token");
+    writeFileSync(tokenPath, "existing-token\n", { mode: 0o644 });
+    chmodSync(tokenPath, 0o644);
+
+    const config = createServerConfig({ dataDir });
+
+    expect(config.token).toBe("existing-token");
+    expect(readFileSync(tokenPath, "utf8").trim()).toBe("existing-token");
+    expect(lstatSync(tokenPath).mode & 0o777).toBe(0o600);
+  });
+
+  it("fails closed when install.token is a symlink", () => {
+    const dataDir = makeDataDir();
+    const outsideDir = mkdtempSync(join(tmpdir(), "ain-one-task3-config-outside-"));
+    tempDirs.push(outsideDir);
+
+    const outsideSecret = join(outsideDir, "outside-secret.txt");
+    writeFileSync(outsideSecret, "outside-token\n", { mode: 0o600 });
+    symlinkSync(outsideSecret, join(dataDir, "install.token"));
+
+    expect(() => createServerConfig({ dataDir })).toThrow("install.token must be a regular file");
+    expect(readFileSync(outsideSecret, "utf8").trim()).toBe("outside-token");
   });
 });

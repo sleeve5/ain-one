@@ -1,4 +1,5 @@
 import { randomUUID } from "node:crypto";
+import type { DatabaseSync } from "node:sqlite";
 import { describe, expect, it } from "vitest";
 import type {
   AgentCatalog,
@@ -22,20 +23,32 @@ import { createRepositories } from "../../src/server/repositories.js";
 import { TurnCoordinator } from "../../src/server/turn-coordinator.js";
 
 type TurnCallbacks = {
-  onTerminal: (
-    conversationId: string,
-    status: TerminalTurnStatus,
-    error?: NormalizedError,
-  ) => Promise<void>;
+  onTerminal: (input: {
+    conversationId: string;
+    turnId: string;
+    nativeTurnId: string | null;
+    status: TerminalTurnStatus;
+    error?: NormalizedError;
+  }) => Promise<void>;
+};
+
+type StartedTurn = {
+  turnId: string;
+  conversationId: string;
+  nativeTurnId: string;
+  content: string;
 };
 
 class ControlledConnector implements AgentConnector {
   readonly id = "codex" as const;
   prompts: string[] = [];
   startAttempts = 0;
+  createSessionCalls = 0;
+  cancelRequests: Array<{ sessionId: string; nativeTurnId: string | null }> = [];
+  cancelMode: "confirm" | "reject" | "throw" = "confirm";
+  sessionMode: "ok" | "definite_fail" | "uncertain_fail" = "ok";
   private callbacks: TurnCallbacks | null = null;
-  private activeConversationId: string | null = null;
-  cancelConfirmed = true;
+  private startedTurns: StartedTurn[] = [];
 
   setTurnCallbacks(callbacks: TurnCallbacks): void {
     this.callbacks = callbacks;
@@ -53,6 +66,20 @@ class ControlledConnector implements AgentConnector {
   }
 
   async createOrResumeSession(input: SessionInput): Promise<LiveSession> {
+    this.createSessionCalls += 1;
+
+    if (this.sessionMode === "definite_fail") {
+      const error = new Error("session create rejected") as Error & {
+        definiteSessionFailure?: boolean;
+      };
+      error.definiteSessionFailure = true;
+      throw error;
+    }
+
+    if (this.sessionMode === "uncertain_fail") {
+      throw new Error("session create outcome unknown");
+    }
+
     return {
       id: input.conversationId,
       nativeSessionId: input.nativeSessionId ?? `native-session-${input.conversationId}`,
@@ -60,19 +87,43 @@ class ControlledConnector implements AgentConnector {
   }
 
   async startTurn(session: LiveSession, input: StartTurnInput): Promise<NativeTurn> {
+    if (!input.turnId) {
+      throw new Error("expected turnId in StartTurnInput");
+    }
     this.startAttempts += 1;
     this.prompts.push(input.content);
-    this.activeConversationId = session.id;
-    return { nativeTurnId: `native-turn-${this.prompts.length}` };
+
+    const started: StartedTurn = {
+      turnId: input.turnId,
+      conversationId: session.id,
+      nativeTurnId: `native-turn-${this.startAttempts}`,
+      content: input.content,
+    };
+    this.startedTurns.push(started);
+
+    return { nativeTurnId: started.nativeTurnId };
   }
 
-  async completeActiveTurn(status: TerminalTurnStatus = "completed"): Promise<void> {
-    if (!this.callbacks || !this.activeConversationId) {
-      throw new Error("No active Turn to complete");
+  async emitTerminal(
+    turnId: string,
+    status: TerminalTurnStatus = "completed",
+    error?: NormalizedError,
+  ): Promise<void> {
+    if (!this.callbacks) {
+      throw new Error("No callbacks configured");
     }
-    const activeConversationId = this.activeConversationId;
-    this.activeConversationId = null;
-    await this.callbacks.onTerminal(activeConversationId, status);
+    const started = this.startedTurns.find((turn) => turn.turnId === turnId);
+    if (!started) {
+      throw new Error(`Unknown turn: ${turnId}`);
+    }
+
+    await this.callbacks.onTerminal({
+      conversationId: started.conversationId,
+      turnId,
+      nativeTurnId: started.nativeTurnId,
+      status,
+      error,
+    });
   }
 
   async respondToPermission(
@@ -85,12 +136,19 @@ class ControlledConnector implements AgentConnector {
 
   async cancelTurn(
     session: LiveSession,
-    _nativeTurnId: string | null,
+    nativeTurnId: string | null,
   ): Promise<CancelResult> {
-    if (this.cancelConfirmed) {
-      this.activeConversationId = null;
+    this.cancelRequests.push({ sessionId: session.id, nativeTurnId });
+
+    if (this.cancelMode === "throw") {
+      throw new Error("cancel transport failure");
     }
-    return { confirmed: this.cancelConfirmed && this.activeConversationId !== session.id };
+
+    if (this.cancelMode === "reject") {
+      return { confirmed: false };
+    }
+
+    return { confirmed: true };
   }
 
   async closeSession(): Promise<void> {
@@ -107,15 +165,20 @@ class ControlledConnector implements AgentConnector {
 }
 
 class UncertainStartConnector extends ControlledConnector {
-  override async startTurn(): Promise<NativeTurn> {
+  override async startTurn(_session: LiveSession, input: StartTurnInput): Promise<NativeTurn> {
+    if (!input.turnId) {
+      throw new Error("expected turnId in StartTurnInput");
+    }
     this.startAttempts += 1;
-    const error = new Error("native start outcome unknown");
-    throw error;
+    throw new Error("native start outcome unknown");
   }
 }
 
 class DefiniteRejectConnector extends ControlledConnector {
-  override async startTurn(): Promise<NativeTurn> {
+  override async startTurn(_session: LiveSession, input: StartTurnInput): Promise<NativeTurn> {
+    if (!input.turnId) {
+      throw new Error("expected turnId in StartTurnInput");
+    }
     this.startAttempts += 1;
     const error = new Error("native start rejected") as Error & {
       definiteStartRejection?: boolean;
@@ -126,6 +189,7 @@ class DefiniteRejectConnector extends ControlledConnector {
 }
 
 function createTestCoordinator(connector: ControlledConnector): {
+  db: DatabaseSync;
   coordinator: TurnCoordinator;
   repositories: ReturnType<typeof createRepositories>;
   createConversation: () => Conversation;
@@ -139,6 +203,7 @@ function createTestCoordinator(connector: ControlledConnector): {
   const project = repositories.createProject(`/tmp/project-${randomUUID()}`, "test");
 
   return {
+    db,
     coordinator,
     repositories,
     createConversation: () =>
@@ -160,14 +225,105 @@ describe("TurnCoordinator", () => {
     await app.coordinator.enqueueMessage(conversation.id, "second");
 
     expect(runtime.prompts).toEqual(["first"]);
-    expect(app.repositories.listQueuedMessages(conversation.id)).toHaveLength(1);
 
-    await runtime.completeActiveTurn();
+    const firstTurnId = app.repositories.getLatestTurn(conversation.id)?.id;
+    if (!firstTurnId) {
+      throw new Error("expected first turn");
+    }
+
+    await runtime.emitTerminal(firstTurnId);
 
     expect(runtime.prompts).toEqual(["first", "second"]);
   });
 
-  it("pauses the queue after an interrupted Turn from unknown start outcome", async () => {
+  it("keeps FIFO order when pending messages share the same created_at timestamp", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    app.repositories.setConversationQueuePaused(conversation.id, true);
+    const first = app.repositories.enqueueMessage(conversation.id, "first");
+    const second = app.repositories.enqueueMessage(conversation.id, "second");
+
+    const fixed = "2026-08-19T00:00:00.000Z";
+    app.db
+      .prepare(`UPDATE queued_messages SET created_at = ? WHERE id IN (?, ?)`)
+      .run(fixed, first.id, second.id);
+
+    app.repositories.setConversationQueuePaused(conversation.id, false);
+    await app.coordinator.dispatchNext(conversation.id);
+
+    let activeTurn = app.repositories.getActiveTurn(conversation.id);
+    if (!activeTurn) {
+      throw new Error("expected first active turn");
+    }
+    await runtime.emitTerminal(activeTurn.id, "completed");
+
+    activeTurn = app.repositories.getActiveTurn(conversation.id);
+    if (!activeTurn) {
+      throw new Error("expected second active turn");
+    }
+    await runtime.emitTerminal(activeTurn.id, "completed");
+
+    expect(runtime.prompts).toEqual(["first", "second"]);
+  });
+
+  it("ignores stale terminal callbacks that do not match the current active Turn", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)?.id;
+    if (!firstTurnId) {
+      throw new Error("expected first active turn");
+    }
+    await runtime.emitTerminal(firstTurnId, "completed");
+
+    const secondTurnId = app.repositories.getActiveTurn(conversation.id)?.id;
+    if (!secondTurnId) {
+      throw new Error("expected second active turn");
+    }
+
+    await runtime.emitTerminal(firstTurnId, "failed", {
+      code: "stale",
+      message: "late callback",
+    });
+
+    expect(app.repositories.getTurn(secondTurnId)?.status).toBe("running");
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(false);
+  });
+
+  it("serializes concurrent dispatches so one session/start wins and cancel targets the active native turn", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    app.repositories.enqueueMessage(conversation.id, "first");
+
+    await Promise.all([
+      app.coordinator.dispatchNext(conversation.id),
+      app.coordinator.dispatchNext(conversation.id),
+    ]);
+
+    expect(runtime.createSessionCalls).toBe(1);
+    expect(runtime.startAttempts).toBe(1);
+
+    const activeTurn = app.repositories.getActiveTurn(conversation.id);
+    if (!activeTurn) {
+      throw new Error("expected active turn after dispatch");
+    }
+
+    await app.coordinator.cancelActiveTurn(conversation.id);
+
+    expect(runtime.cancelRequests).toEqual([
+      expect.objectContaining({ nativeTurnId: activeTurn.nativeTurnId }),
+    ]);
+  });
+
+  it("pauses queue and keeps message bound after unknown start outcome", async () => {
     const runtime = new UncertainStartConnector();
     const app = createTestCoordinator(runtime);
     const conversation = app.createConversation();
@@ -182,7 +338,7 @@ describe("TurnCoordinator", () => {
     expect(runtime.startAttempts).toBe(1);
   });
 
-  it("requeues after definite start rejection and pauses automatic dispatch", async () => {
+  it("requeues exactly once after definite start rejection and pauses automatic dispatch", async () => {
     const runtime = new DefiniteRejectConnector();
     const app = createTestCoordinator(runtime);
     const conversation = app.createConversation();
@@ -192,6 +348,7 @@ describe("TurnCoordinator", () => {
     if (!requeued) {
       throw new Error("expected message to be requeued");
     }
+
     await app.coordinator.dispatchNext(conversation.id);
 
     expect(app.repositories.getActiveTurn(conversation.id)).toBeNull();
@@ -203,6 +360,38 @@ describe("TurnCoordinator", () => {
     expect(runtime.startAttempts).toBe(1);
   });
 
+  it("treats definite session creation failure as start_failed and requeues once", async () => {
+    const runtime = new ControlledConnector();
+    runtime.sessionMode = "definite_fail";
+
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "retry me");
+    await app.coordinator.dispatchNext(conversation.id);
+
+    expect(runtime.startAttempts).toBe(0);
+    expect(app.repositories.getLatestTurn(conversation.id)?.status).toBe("start_failed");
+    expect(app.repositories.listQueuedMessages(conversation.id)).toHaveLength(1);
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+  });
+
+  it("treats uncertain session creation failure as interrupted and keeps message bound", async () => {
+    const runtime = new ControlledConnector();
+    runtime.sessionMode = "uncertain_fail";
+
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "unsafe to repeat");
+    await app.coordinator.dispatchNext(conversation.id);
+
+    expect(runtime.startAttempts).toBe(0);
+    expect(app.repositories.getLatestTurn(conversation.id)?.status).toBe("interrupted");
+    expect(app.repositories.listQueuedMessages(conversation.id)).toHaveLength(0);
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+  });
+
   it("does not release FIFO after failed Turn", async () => {
     const runtime = new ControlledConnector();
     const app = createTestCoordinator(runtime);
@@ -210,7 +399,12 @@ describe("TurnCoordinator", () => {
 
     await app.coordinator.enqueueMessage(conversation.id, "first");
     await app.coordinator.enqueueMessage(conversation.id, "second");
-    await runtime.completeActiveTurn("failed");
+
+    const activeTurnId = app.repositories.getActiveTurn(conversation.id)?.id;
+    if (!activeTurnId) {
+      throw new Error("expected first active turn");
+    }
+    await runtime.emitTerminal(activeTurnId, "failed");
 
     expect(runtime.prompts).toEqual(["first"]);
     expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
@@ -231,5 +425,43 @@ describe("TurnCoordinator", () => {
 
     expect(runtime.prompts).toEqual(["first", "second"]);
     expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(false);
+  });
+
+  it("marks cancel_failed and keeps queue paused when cancel is not confirmed", async () => {
+    const runtime = new ControlledConnector();
+    runtime.cancelMode = "reject";
+
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+    await app.coordinator.cancelActiveTurn(conversation.id);
+
+    expect(runtime.prompts).toEqual(["first"]);
+    expect(app.repositories.getLatestTurn(conversation.id)?.status).toBe("cancel_failed");
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "second" }),
+    ]);
+  });
+
+  it("marks cancel_failed and keeps queue paused when cancel throws", async () => {
+    const runtime = new ControlledConnector();
+    runtime.cancelMode = "throw";
+
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+    await app.coordinator.cancelActiveTurn(conversation.id);
+
+    expect(runtime.prompts).toEqual(["first"]);
+    expect(app.repositories.getLatestTurn(conversation.id)?.status).toBe("cancel_failed");
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "second" }),
+    ]);
   });
 });

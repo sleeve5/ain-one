@@ -144,23 +144,49 @@ class SqliteRepositories implements Repositories {
   }
 
   enqueueMessage(conversationId: string, content: string): QueuedMessage {
-    const now = isoNow();
-    const message: QueuedMessage = {
-      id: randomUUID(),
-      conversationId,
-      content,
-      createdAt: now,
-    };
+    return this.immediateTransaction(() => {
+      const nextSequenceRow = this.getRow<{ enqueue_seq: number }>(
+        `SELECT COALESCE(MAX(enqueue_seq), 0) + 1 AS enqueue_seq
+         FROM queued_messages
+         WHERE conversation_id = ?`,
+        conversationId,
+      );
+      if (!nextSequenceRow) {
+        throw new Error("Failed to allocate queued message sequence");
+      }
 
-    this.db
-      .prepare(
-        `INSERT INTO queued_messages (
-          id, conversation_id, content, status, claimed_turn_id, created_at, updated_at
-        ) VALUES (?, ?, ?, 'pending', NULL, ?, ?)`,
-      )
-      .run(message.id, message.conversationId, message.content, message.createdAt, now);
+      const now = isoNow();
+      const message: QueuedMessage = {
+        id: randomUUID(),
+        conversationId,
+        content,
+        createdAt: now,
+      };
 
-    return message;
+      this.db
+        .prepare(
+          `INSERT INTO queued_messages (
+            id,
+            conversation_id,
+            enqueue_seq,
+            content,
+            status,
+            claimed_turn_id,
+            created_at,
+            updated_at
+          ) VALUES (?, ?, ?, ?, 'pending', NULL, ?, ?)`,
+        )
+        .run(
+          message.id,
+          message.conversationId,
+          nextSequenceRow.enqueue_seq,
+          message.content,
+          message.createdAt,
+          now,
+        );
+
+      return message;
+    });
   }
 
   listQueuedMessages(conversationId: string): QueuedMessage[] {
@@ -168,7 +194,7 @@ class SqliteRepositories implements Repositories {
       `SELECT id, conversation_id, content, created_at
        FROM queued_messages
        WHERE conversation_id = ? AND status = 'pending'
-       ORDER BY created_at ASC, id ASC`,
+       ORDER BY enqueue_seq ASC`,
       conversationId,
     );
 
@@ -196,7 +222,7 @@ class SqliteRepositories implements Repositories {
         `SELECT id, conversation_id, content, created_at
          FROM queued_messages
          WHERE conversation_id = ? AND status = 'pending'
-         ORDER BY created_at ASC, id ASC
+         ORDER BY enqueue_seq ASC
          LIMIT 1`,
         conversationId,
       );

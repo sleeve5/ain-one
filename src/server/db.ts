@@ -39,11 +39,13 @@ function migrate(db: DatabaseSync): void {
     CREATE TABLE IF NOT EXISTS queued_messages (
       id TEXT PRIMARY KEY,
       conversation_id TEXT NOT NULL REFERENCES conversations(id) ON DELETE CASCADE,
+      enqueue_seq INTEGER NOT NULL,
       content TEXT NOT NULL,
       status TEXT NOT NULL,
       claimed_turn_id TEXT,
       created_at TEXT NOT NULL,
-      updated_at TEXT NOT NULL
+      updated_at TEXT NOT NULL,
+      UNIQUE (conversation_id, enqueue_seq)
     );
 
     CREATE TABLE IF NOT EXISTS turns (
@@ -74,13 +76,49 @@ function migrate(db: DatabaseSync): void {
       UNIQUE (conversation_id, sequence)
     );
 
-    CREATE INDEX IF NOT EXISTS queued_messages_pending_idx
-    ON queued_messages(conversation_id, created_at)
-    WHERE status = 'pending';
-
     CREATE UNIQUE INDEX IF NOT EXISTS turns_one_active_per_conversation
     ON turns(conversation_id)
     WHERE status IN ('starting', 'running', 'cancelling');
   `);
+
+  migrateQueuedMessageSequence(db);
 }
 
+function migrateQueuedMessageSequence(db: DatabaseSync): void {
+  const hasEnqueueSeq = (db
+    .prepare("PRAGMA table_info(queued_messages)")
+    .all() as Array<{ name: string }>).some((column) => column.name === "enqueue_seq");
+
+  if (!hasEnqueueSeq) {
+    db.exec("ALTER TABLE queued_messages ADD COLUMN enqueue_seq INTEGER;");
+    db.exec(`
+      WITH ranked AS (
+        SELECT
+          rowid AS message_rowid,
+          ROW_NUMBER() OVER (
+            PARTITION BY conversation_id
+            ORDER BY created_at ASC, rowid ASC
+          ) AS enqueue_seq
+        FROM queued_messages
+      )
+      UPDATE queued_messages
+      SET enqueue_seq = (
+        SELECT ranked.enqueue_seq
+        FROM ranked
+        WHERE ranked.message_rowid = queued_messages.rowid
+      )
+    `);
+  }
+
+  db.exec(`
+    CREATE INDEX IF NOT EXISTS queued_messages_pending_idx
+    ON queued_messages(conversation_id, enqueue_seq)
+    WHERE status = 'pending'
+  `);
+
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_sequence_idx
+    ON queued_messages(conversation_id, enqueue_seq)
+    WHERE enqueue_seq IS NOT NULL
+  `);
+}

@@ -1,14 +1,18 @@
 const originalEmitWarning = process.emitWarning.bind(process);
 
-(process as { emitWarning: (...args: unknown[]) => void }).emitWarning = (
-  warning: unknown,
-  ...args: unknown[]
-) => {
+process.emitWarning = ((warning: unknown, ...args: unknown[]) => {
   if (isSqliteExperimentalWarning(warning, args)) {
     return;
   }
-  originalEmitWarning(warning as Parameters<typeof originalEmitWarning>[0], ...(args as []));
-};
+  originalEmitWarning(
+    warning as Parameters<typeof originalEmitWarning>[0],
+    ...(args as []),
+  );
+}) as typeof process.emitWarning;
+
+process.once("exit", () => {
+  process.emitWarning = originalEmitWarning;
+});
 
 function isSqliteExperimentalWarning(
   warning: unknown,

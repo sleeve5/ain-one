@@ -139,6 +139,7 @@ export interface LiveSession {
 export interface StartTurnInput {
   content: string;
   snapshot: TurnSnapshot;
+  turnId?: string;
 }
 
 export interface NativeTurn {

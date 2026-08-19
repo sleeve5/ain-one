@@ -15,11 +15,13 @@ interface TurnCoordinatorOptions {
 
 interface ConnectorWithCallbacks extends AgentConnector {
   setTurnCallbacks?: (callbacks: {
-    onTerminal: (
-      conversationId: string,
+    onTerminal: (input: {
+      conversationId: string;
+      turnId: string;
+      nativeTurnId: string | null;
       status: TerminalTurnStatus,
-      error?: NormalizedError,
-    ) => Promise<void>;
+      error?: NormalizedError;
+    }) => Promise<void>;
   }) => void;
 }
 
@@ -35,8 +37,8 @@ export class TurnCoordinator {
     for (const connector of Object.values(this.connectors)) {
       const callbackCapable = connector as ConnectorWithCallbacks;
       callbackCapable.setTurnCallbacks?.({
-        onTerminal: async (conversationId, status, error) => {
-          await this.handleTerminalUpdate(conversationId, status, error);
+        onTerminal: async (input) => {
+          await this.handleTerminalUpdate(input);
         },
       });
     }
@@ -73,10 +75,14 @@ export class TurnCoordinator {
       pluginVersions: [],
     };
 
-    const sessionRecord = this.repositories.getNativeSession(conversationId);
+    const claimed = this.repositories.claimNextMessage(conversationId, snapshot);
+    if (!claimed) {
+      return;
+    }
 
     let session: LiveSession;
     try {
+      const sessionRecord = this.repositories.getNativeSession(conversationId);
       session = await connector.createOrResumeSession({
         projectPath: project.path,
         conversationId,
@@ -84,13 +90,15 @@ export class TurnCoordinator {
       });
       this.repositories.upsertNativeSession(conversationId, session.nativeSessionId);
       this.liveSessions.set(conversationId, session);
-    } catch {
+    } catch (error) {
+      const normalized = normalizeError(error);
+      if (isDefinitePreStartFailure(error)) {
+        this.repositories.finishTurn(claimed.turn.id, "start_failed", normalized);
+        this.repositories.requeueClaimedMessage(claimed.turn.id);
+      } else {
+        this.repositories.finishTurn(claimed.turn.id, "interrupted", normalized);
+      }
       this.repositories.setConversationQueuePaused(conversationId, true);
-      return;
-    }
-
-    const claimed = this.repositories.claimNextMessage(conversationId, snapshot);
-    if (!claimed) {
       return;
     }
 
@@ -98,6 +106,7 @@ export class TurnCoordinator {
       const nativeTurn = await connector.startTurn(session, {
         content: claimed.message.content,
         snapshot,
+        turnId: claimed.turn.id,
       });
       this.repositories.markTurnRunning(claimed.turn.id, nativeTurn.nativeTurnId);
     } catch (error) {
@@ -171,13 +180,20 @@ export class TurnCoordinator {
     return changed;
   }
 
-  private async handleTerminalUpdate(
-    conversationId: string,
-    status: TerminalTurnStatus,
-    error?: NormalizedError,
-  ): Promise<void> {
+  private async handleTerminalUpdate(input: {
+    conversationId: string;
+    turnId: string;
+    nativeTurnId: string | null;
+    status: TerminalTurnStatus;
+    error?: NormalizedError;
+  }): Promise<void> {
+    const { conversationId, turnId, status, error } = input;
     const activeTurn = this.repositories.getActiveTurn(conversationId);
     if (!activeTurn) {
+      return;
+    }
+
+    if (activeTurn.id !== turnId) {
       return;
     }
 
@@ -225,3 +241,19 @@ function isDefiniteStartRejection(error: unknown): boolean {
   );
 }
 
+function isDefinitePreStartFailure(error: unknown): boolean {
+  if (!error || typeof error !== "object") {
+    return false;
+  }
+  const candidate = error as {
+    definiteSessionFailure?: unknown;
+    definiteStartRejection?: unknown;
+    code?: unknown;
+  };
+  return (
+    candidate.definiteSessionFailure === true ||
+    candidate.definiteStartRejection === true ||
+    candidate.code === "DEFINITE_SESSION_FAILURE" ||
+    candidate.code === "DEFINITE_START_REJECTION"
+  );
+}

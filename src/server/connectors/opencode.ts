@@ -12,6 +12,8 @@ import {
   BaseConnector,
   type ActiveTurnController,
   type BaseConnectorOptions,
+  isMissingExecutableError,
+  parseVersion,
   type RuntimeSession,
   UnsupportedCapabilityError,
 } from "./base.js";
@@ -62,7 +64,41 @@ export class OpenCodeConnector extends BaseConnector {
         diagnostic: "@opencode-ai/sdk is not installed",
       };
     }
-    return this.sdkAdapter.probe();
+
+    let localVersion: string | undefined;
+    try {
+      const version = await this.runCommand({ args: ["--version"] });
+      if (version.exitCode !== 0) {
+        return {
+          status: "runtime_error",
+          diagnostic: version.stderr.trim() || version.stdout.trim(),
+        };
+      }
+      localVersion = parseVersion(version.stdout);
+    } catch (error) {
+      if (isMissingExecutableError(error)) {
+        return {
+          status: "not_installed",
+          diagnostic: "opencode executable is not installed",
+        };
+      }
+      return {
+        status: "runtime_error",
+        diagnostic: error instanceof Error ? error.message : "Failed to probe opencode",
+      };
+    }
+
+    const sdkProbe = await this.sdkAdapter.probe();
+    if (sdkProbe.status === "not_installed") {
+      return sdkProbe;
+    }
+    if (!sdkProbe.version && localVersion) {
+      return {
+        ...sdkProbe,
+        version: localVersion,
+      };
+    }
+    return sdkProbe;
   }
 
   async fetchCatalog(projectPath: string): Promise<AgentCatalog> {
@@ -72,27 +108,26 @@ export class OpenCodeConnector extends BaseConnector {
         permissionModes: [],
       };
     }
+    if (!(await this.hasLocalExecutable())) {
+      return {
+        models: [],
+        permissionModes: [],
+      };
+    }
     return this.sdkAdapter.fetchCatalog(projectPath);
   }
 
   async createOrResumeSession(input: SessionInput): Promise<LiveSession> {
+    await this.ensureRuntimeAvailable();
     const runtime = this.createRuntimeSession(input);
-    if (!this.sdkAdapter) {
-      return runtime;
-    }
 
-    const session = await this.sdkAdapter.createOrResumeSession(input);
+    const session = await this.sdkAdapter!.createOrResumeSession(input);
     runtime.nativeSessionId = session.nativeSessionId;
     return runtime;
   }
 
   async startTurn(session: LiveSession, input: StartTurnInput): Promise<{ nativeTurnId: string | null }> {
-    if (!this.sdkAdapter) {
-      throw new UnsupportedCapabilityError(
-        "opencode_sdk",
-        "@opencode-ai/sdk is required to start OpenCode sessions",
-      );
-    }
+    await this.ensureRuntimeAvailable();
 
     const runtime = this.asRuntimeSession(session);
     if (runtime.activeTurn) {
@@ -101,7 +136,7 @@ export class OpenCodeConnector extends BaseConnector {
       throw error;
     }
 
-    const activeTurn = await this.sdkAdapter.startTurn(session, input, {
+    const activeTurn = await this.sdkAdapter!.startTurn(session, input, {
       emitEvent: async (event) => {
         await this.emitEvent(runtime, event);
       },
@@ -109,6 +144,15 @@ export class OpenCodeConnector extends BaseConnector {
         await this.syncNativeSessionId(runtime, nativeSessionId);
       },
       emitTerminal: async (terminal) => {
+        await this.emitEvent(runtime, {
+          type: "turn_status",
+          payload: {
+            turnId: terminal.turnId ?? input.turnId ?? null,
+            nativeTurnId: terminal.nativeTurnId,
+            status: terminal.status,
+            ...(terminal.error ? { error: terminal.error } : {}),
+          },
+        });
         await this.emitTerminal(runtime, terminal);
       },
     });
@@ -121,5 +165,32 @@ export class OpenCodeConnector extends BaseConnector {
     });
 
     return { nativeTurnId: activeTurn.nativeTurnId };
+  }
+
+  private async ensureRuntimeAvailable(): Promise<void> {
+    if (!this.sdkAdapter) {
+      throw new UnsupportedCapabilityError(
+        "opencode_sdk",
+        "@opencode-ai/sdk is required to start OpenCode sessions",
+      );
+    }
+    if (!(await this.hasLocalExecutable())) {
+      throw new UnsupportedCapabilityError(
+        "opencode_binary",
+        "opencode executable is required to start OpenCode sessions",
+      );
+    }
+  }
+
+  private async hasLocalExecutable(): Promise<boolean> {
+    try {
+      const result = await this.runCommand({ args: ["--version"] });
+      return result.exitCode === 0;
+    } catch (error) {
+      if (isMissingExecutableError(error)) {
+        return false;
+      }
+      throw error;
+    }
   }
 }

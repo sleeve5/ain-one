@@ -67,7 +67,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
     }
 
     let nativeTurnId: string | null = null;
-    const requiresPersistedSessionId = !(input.session.resume && input.session.nativeSessionId);
+    const requiresPersistedSessionId = input.session.nativeSessionId == null;
     let persistedSessionId = !requiresPersistedSessionId;
     let stderrText = "";
     let stderrBytes = 0;

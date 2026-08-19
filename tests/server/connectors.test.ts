@@ -310,49 +310,120 @@ describe("native agent connectors", () => {
     await expect(connector.probe()).resolves.toMatchObject({ status: "not_installed" });
   });
 
-  it("defaults opencode to not_installed and refuses to start without an SDK adapter", async () => {
+  it("requires both opencode sdk adapter and local executable", async () => {
     const ctx = createFixtureContext();
-    const connector = new OpenCodeConnector();
-    const session = await connector.createOrResumeSession({
-      projectPath: ctx.projectPath,
-      conversationId: "conversation-opencode",
-      nativeSessionId: null,
+    const withoutSdk = new OpenCodeConnector({
+      executable: fixtureBinary("fake-opencode.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
     });
 
-    await expect(connector.probe()).resolves.toMatchObject({ status: "not_installed" });
-    await expect(connector.fetchCatalog(ctx.projectPath)).resolves.toEqual({
+    await expect(withoutSdk.probe()).resolves.toMatchObject({ status: "not_installed" });
+    await expect(withoutSdk.fetchCatalog(ctx.projectPath)).resolves.toEqual({
       models: [],
       permissionModes: [],
     });
     await expect(
-      connector.startTurn(session, {
-        content: "say hello",
-        snapshot: {
-          modelId: null,
-          permissionMode: "help_me_approve",
-          pluginVersions: [],
+      withoutSdk.createOrResumeSession({
+        projectPath: ctx.projectPath,
+        conversationId: "conversation-opencode",
+        nativeSessionId: null,
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+
+    const withMissingExecutable = new OpenCodeConnector({
+      executable: "/missing/opencode",
+      sdkAdapter: createOpenCodeSdkAdapter(),
+    });
+    await expect(withMissingExecutable.probe()).resolves.toMatchObject({ status: "not_installed" });
+    await expect(
+      withMissingExecutable.createOrResumeSession({
+        projectPath: ctx.projectPath,
+        conversationId: "conversation-opencode",
+        nativeSessionId: null,
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+
+    await expect(
+      withMissingExecutable.startTurn(
+        {
+          id: "conversation-opencode",
+          nativeSessionId: null,
         },
-        turnId: "turn-opencode-start",
+        {
+          content: "say hello",
+          snapshot: {
+            modelId: null,
+            permissionMode: "help_me_approve",
+            pluginVersions: [],
+          },
+          turnId: "turn-opencode-start",
+        },
+      ),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+
+    const withBrokenExecutable = new OpenCodeConnector({
+      executable: "/usr/bin/false",
+      sdkAdapter: createOpenCodeSdkAdapter(),
+    });
+    await expect(
+      withBrokenExecutable.createOrResumeSession({
+        projectPath: ctx.projectPath,
+        conversationId: "conversation-opencode",
+        nativeSessionId: null,
       }),
     ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
   });
 
-  it("uses an injected opencode sdk adapter when provided", async () => {
+  it("opencode sdk path emits normalized turn_status and terminal callback", async () => {
     const ctx = createFixtureContext();
     const terminalCalls: TerminalCall[] = [];
     const connector = new OpenCodeConnector({
+      executable: fixtureBinary("fake-opencode.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
       sdkAdapter: createOpenCodeSdkAdapter(),
     });
     setTurnCallbacks(connector, terminalCalls);
+
+    await expect(connector.probe()).resolves.toMatchObject({ status: "available" });
 
     const started = await startTurn(connector, "opencode", ctx.projectPath, null);
     await waitForSettled(started.session);
 
     expect(started.session.nativeSessionId).toBe("sdk-session-opencode");
     expect(started.nativeTurnId).toBe("sdk-turn-opencode");
-    expect(started.events.map((event) => event.type)).toContain("assistant_message");
+    expect(started.events.map((event) => event.type)).toEqual(
+      expect.arrayContaining(["assistant_message", "turn_status"]),
+    );
     expect(terminalCalls).toHaveLength(1);
     expect(terminalCalls[0]?.status).toBe("completed");
+  });
+
+  it("claude new session can complete without session.started when uuid already exists", async () => {
+    const ctx = createFixtureContext();
+    const connector = new ClaudeConnector({
+      executable: fixtureBinary("fake-claude.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "missing-session-id",
+      },
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "claude", ctx.projectPath, null);
+
+    await expect(
+      withTimeout(connector.startTurn(harness.session, turnInput("claude", null)), 250),
+    ).resolves.toMatchObject({ nativeTurnId: "native-turn-claude" });
+
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_status",
+        payload: expect.objectContaining({ status: "completed" }),
+      }),
+    );
   });
 
   it("waits for new-session native session persistence before resolving startTurn", async () => {

@@ -45,6 +45,42 @@ describe("HTTP AinOneApi", () => {
     expect(storage.getItem("ain-one:event-sequence:conv-1")).toBe("1");
   });
 
+  it("parses CRLF-delimited SSE frames", async () => {
+    const event = normalizedEvent({ sequence: 1, id: "event-1" });
+    const api = createHttpAinOneApi({
+      token: "token",
+      reconnectBaseDelayMs: 1,
+      fetchFn: async () => {
+        const body = new ReadableStream<Uint8Array>({
+          start(controller) {
+            controller.enqueue(
+              new TextEncoder().encode(`id: 1\r\ndata: ${JSON.stringify(event)}\r\n\r\n`),
+            );
+          },
+        });
+        return new Response(body, {
+          status: 200,
+          headers: { "content-type": "text/event-stream" },
+        });
+      },
+    });
+
+    let stop: () => void = () => undefined;
+    const received = new Promise<NormalizedEvent>((resolve, reject) => {
+      const timeout = setTimeout(() => reject(new Error("CRLF SSE event was not emitted")), 50);
+      stop = api.subscribeConversationEvents("conv-1", 0, (nextEvent) => {
+        clearTimeout(timeout);
+        resolve(nextEvent);
+      });
+    });
+
+    try {
+      await expect(received).resolves.toEqual(event);
+    } finally {
+      stop();
+    }
+  });
+
   it("posts cancellation without replaying another command", async () => {
     const calls: Array<{ url: string; method: string; body: string | null }> = [];
     const api = createHttpAinOneApi({

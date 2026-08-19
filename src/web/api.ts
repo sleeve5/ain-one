@@ -655,12 +655,12 @@ async function consumeSse(
       buffer += decoder.decode(chunk.value, { stream: true });
 
       while (true) {
-        const frameIndex = buffer.indexOf("\n\n");
-        if (frameIndex === -1) {
+        const boundary = buffer.match(/(?:\r\n|\r|\n){2}/);
+        if (boundary?.index == null) {
           break;
         }
-        const frame = buffer.slice(0, frameIndex);
-        buffer = buffer.slice(frameIndex + 2);
+        const frame = buffer.slice(0, boundary.index);
+        buffer = buffer.slice(boundary.index + boundary[0].length);
         const event = parseSseFrame(frame);
         if (event) {
           onEvent(event);
@@ -673,7 +673,7 @@ async function consumeSse(
 }
 
 function parseSseFrame(frame: string): NormalizedEvent | null {
-  const lines = frame.split("\n");
+  const lines = frame.split(/\r\n|\r|\n/);
   let data = "";
   for (const line of lines) {
     if (!line || line.startsWith(":")) {

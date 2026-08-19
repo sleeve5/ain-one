@@ -87,6 +87,12 @@ export class TurnCoordinator {
         projectPath: project.path,
         conversationId,
         nativeSessionId: sessionRecord?.nativeSessionId ?? null,
+        onEvent: async (event) => {
+          this.repositories.appendEvent(conversationId, event);
+        },
+        onNativeSessionId: async (nativeSessionId) => {
+          this.repositories.upsertNativeSession(conversationId, nativeSessionId);
+        },
       });
       this.repositories.upsertNativeSession(conversationId, session.nativeSessionId);
       this.liveSessions.set(conversationId, session);

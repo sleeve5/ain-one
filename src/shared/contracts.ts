@@ -129,6 +129,8 @@ export interface SessionInput {
   projectPath: string;
   conversationId: string;
   nativeSessionId: string | null;
+  onEvent?: (event: ConnectorEvent) => Promise<void> | void;
+  onNativeSessionId?: (nativeSessionId: string | null) => Promise<void> | void;
 }
 
 export interface LiveSession {

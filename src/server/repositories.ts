@@ -17,12 +17,19 @@ import type {
 
 export interface Repositories {
   createProject(path: string, name: string): Project;
+  listProjects(): Project[];
   getProject(projectId: string): Project | null;
+  getProjectByPath(path: string): Project | null;
   createConversation(input: CreateConversationInput): Conversation;
+  listConversations(projectId: string): Conversation[];
   getConversation(conversationId: string): Conversation | null;
   setConversationQueuePaused(conversationId: string, queuePaused: boolean): void;
   enqueueMessage(conversationId: string, content: string): QueuedMessage;
   listQueuedMessages(conversationId: string): QueuedMessage[];
+  deletePendingMessage(
+    conversationId: string,
+    messageId: string,
+  ): "deleted" | "not_found" | "not_pending";
   claimNextMessage(
     conversationId: string,
     snapshot: TurnSnapshot,
@@ -69,6 +76,15 @@ class SqliteRepositories implements Repositories {
     return project;
   }
 
+  listProjects(): Project[] {
+    const rows = this.getRows<DbProjectRow>(
+      `SELECT id, path, name, created_at, updated_at
+       FROM projects
+       ORDER BY updated_at DESC, rowid DESC`,
+    );
+    return rows.map(mapProject);
+  }
+
   getProject(projectId: string): Project | null {
     const row = this.getRow<DbProjectRow>(
       `SELECT id, path, name, created_at, updated_at
@@ -77,6 +93,16 @@ class SqliteRepositories implements Repositories {
       projectId,
     );
 
+    return row ? mapProject(row) : null;
+  }
+
+  getProjectByPath(path: string): Project | null {
+    const row = this.getRow<DbProjectRow>(
+      `SELECT id, path, name, created_at, updated_at
+       FROM projects
+       WHERE path = ?`,
+      path,
+    );
     return row ? mapProject(row) : null;
   }
 
@@ -112,6 +138,26 @@ class SqliteRepositories implements Repositories {
       );
 
     return conversation;
+  }
+
+  listConversations(projectId: string): Conversation[] {
+    const rows = this.getRows<DbConversationRow>(
+      `SELECT
+         id,
+         project_id,
+         agent_product_id,
+         model_id,
+         permission_mode,
+         queue_paused,
+         created_at,
+         updated_at
+       FROM conversations
+       WHERE project_id = ?
+       ORDER BY updated_at DESC, rowid DESC`,
+      projectId,
+    );
+
+    return rows.map(mapConversation);
   }
 
   getConversation(conversationId: string): Conversation | null {
@@ -199,6 +245,36 @@ class SqliteRepositories implements Repositories {
     );
 
     return rows.map(mapQueuedMessage);
+  }
+
+  deletePendingMessage(
+    conversationId: string,
+    messageId: string,
+  ): "deleted" | "not_found" | "not_pending" {
+    const result = this.db
+      .prepare(
+        `DELETE FROM queued_messages
+         WHERE conversation_id = ? AND id = ? AND status = 'pending'`,
+      )
+      .run(conversationId, messageId) as { changes: number };
+
+    if (result.changes > 0) {
+      return "deleted";
+    }
+
+    const existing = this.getRow<{ status: string }>(
+      `SELECT status
+       FROM queued_messages
+       WHERE conversation_id = ? AND id = ?`,
+      conversationId,
+      messageId,
+    );
+
+    if (!existing) {
+      return "not_found";
+    }
+
+    return "not_pending";
   }
 
   claimNextMessage(

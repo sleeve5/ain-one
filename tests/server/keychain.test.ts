@@ -1,6 +1,11 @@
 import { EventEmitter } from "node:events";
+import { DatabaseSync } from "node:sqlite";
 import { afterEach, describe, expect, it } from "vitest";
-import { createInMemoryKeychainAdapter, createKeychain } from "../../src/server/keychain.js";
+import {
+  createInMemoryKeychainAdapter,
+  createKeychain,
+  createSecretRefStore,
+} from "../../src/server/keychain.js";
 
 type SpawnCall = {
   command: string;
@@ -116,6 +121,49 @@ describe("keychain", () => {
         const message = String(error);
         expect(message.includes(secret)).toBe(false);
       });
+  });
+
+  it("persists only opaque secret references and descriptors in SQLite", async () => {
+    const rawSecret = "database-must-not-contain-this";
+    const adapter = createInMemoryKeychainAdapter();
+    const keychain = createKeychain({ adapter });
+    await keychain.setSecret({
+      service: "ain-one.task5",
+      account: "plugin://sqlite",
+      secret: rawSecret,
+    });
+
+    const db = new DatabaseSync(":memory:");
+    try {
+      const store = createSecretRefStore(db);
+      const stored = store.put({
+        id: "secret-ref-1",
+        service: "ain-one.task5",
+        account: "plugin://sqlite",
+        descriptor: "Demo MCP API credential",
+      });
+
+      expect(stored).toMatchObject({
+        id: "secret-ref-1",
+        service: "ain-one.task5",
+        account: "plugin://sqlite",
+        descriptor: "Demo MCP API credential",
+        revision: 1,
+      });
+      expect(store.get("secret-ref-1")).toEqual(stored);
+
+      const row = db.prepare("SELECT * FROM secret_refs WHERE id = ?").get("secret-ref-1") as Record<
+        string,
+        unknown
+      >;
+      const databaseText = JSON.stringify(row);
+      expect(databaseText).toContain("secret-ref-1");
+      expect(databaseText).toContain("Demo MCP API credential");
+      expect(databaseText).not.toContain(rawSecret);
+      expect(Object.keys(row)).not.toContain("secret");
+    } finally {
+      db.close();
+    }
   });
 });
 

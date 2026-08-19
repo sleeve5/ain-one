@@ -113,6 +113,7 @@ interface ManagedTarget {
   pluginId: string;
   versionId: string;
   targetPath: string;
+  materializedPath: string;
 }
 
 interface PluginMetadata {
@@ -128,105 +129,104 @@ const EMPTY_METADATA: PluginMetadata = {
 };
 
 const MCP_FORMAT = "ain-one.mcp.v1";
+const metadataQueues = new Map<string, Promise<void>>();
 
 export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
   const dataDir = resolve(options.dataDir);
   const pluginsDir = join(dataDir, "plugins");
+  const materializedDir = join(dataDir, "materialized");
   const artifactsDir = join(dataDir, "turn-artifacts");
   const metadataPath = join(dataDir, "plugins.metadata.json");
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(pluginsDir, { recursive: true });
-  const metadata = loadMetadata(metadataPath);
 
   return {
     async installLocal(input) {
-      const source = inspectSource(input.path, input.compatibility);
-      const stored = storeVersion({ source, metadata, pluginsDir });
-      saveMetadata(metadataPath, metadata);
-      return mapInstalled(stored);
+      return withMetadataLock(metadataPath, () => {
+        const metadata = loadMetadata(metadataPath);
+        const source = inspectSource(input.path, input.compatibility);
+        const stored = storeVersion({ source, metadata, pluginsDir });
+        saveMetadata(metadataPath, metadata);
+        return mapInstalled(stored);
+      });
     },
 
     async scanNative(inputs) {
-      const candidates: PluginCandidate[] = [];
-      for (const item of inputs) {
-        const absolutePath = resolve(item.path);
-        const stats = safeLstat(absolutePath);
-        if (!stats) {
-          continue;
+      return withMetadataLock(metadataPath, () => {
+        const metadata = loadMetadata(metadataPath);
+        const candidates: PluginCandidate[] = [];
+        for (const item of inputs) {
+          const absolutePath = resolve(item.path);
+          const stats = safeLstat(absolutePath);
+          if (!stats) {
+            continue;
+          }
+
+          const source = inspectSourceForNativeScan(
+            absolutePath,
+            item.agentProductId,
+            item.compatibility ?? inferredScanCompatibility(item.agentProductId, options.skillRoots),
+            metadata,
+          );
+          if (!source) {
+            continue;
+          }
+
+          if (hasStoredVersion(metadata, source.pluginId, source.contentHash)) {
+            continue;
+          }
+
+          const existing = Object.values(metadata.candidates).find(
+            (candidate) =>
+              candidate.pluginId === source.pluginId &&
+              candidate.versionId === source.contentHash &&
+              candidate.agentProductId === item.agentProductId,
+          );
+          if (existing) {
+            candidates.push(mapCandidate(existing));
+            continue;
+          }
+
+          const id = randomUUID();
+          const candidate: StoredCandidate = {
+            id,
+            pluginId: source.pluginId,
+            versionId: source.contentHash,
+            type: source.type,
+            path: absolutePath,
+            compatibility: source.compatibility,
+            agentProductId: item.agentProductId,
+          };
+          metadata.candidates[id] = candidate;
+          candidates.push(mapCandidate(candidate));
         }
 
-        const source = inspectSourceForNativeScan(
-          absolutePath,
-          item.agentProductId,
-          item.compatibility ?? inferredScanCompatibility(item.agentProductId, options.skillRoots),
-          metadata,
-          pluginsDir,
-        );
-        if (!source) {
-          continue;
-        }
-
-        if (hasStoredVersion(metadata, source.pluginId, source.contentHash)) {
-          continue;
-        }
-
-        const existing = Object.values(metadata.candidates).find(
-          (candidate) =>
-            candidate.pluginId === source.pluginId &&
-            candidate.versionId === source.contentHash &&
-            candidate.agentProductId === item.agentProductId,
-        );
-        if (existing) {
-          candidates.push({
-            id: existing.id,
-            pluginId: existing.pluginId,
-            versionId: existing.versionId,
-            path: existing.path,
-            agentProductId: existing.agentProductId,
-          });
-          continue;
-        }
-
-        const id = randomUUID();
-        metadata.candidates[id] = {
-          id,
-          pluginId: source.pluginId,
-          versionId: source.contentHash,
-          type: source.type,
-          path: absolutePath,
-          compatibility: source.compatibility,
-          agentProductId: item.agentProductId,
-        };
-        candidates.push({
-          id,
-          pluginId: source.pluginId,
-          versionId: source.contentHash,
-          path: absolutePath,
-          agentProductId: item.agentProductId,
-        });
-      }
-
-      saveMetadata(metadataPath, metadata);
-      return candidates;
+        saveMetadata(metadataPath, metadata);
+        return candidates;
+      });
     },
 
     async acceptCandidate(candidateId) {
-      const candidate = metadata.candidates[candidateId];
-      if (!candidate) {
-        throw new Error("candidate not found");
-      }
+      return withMetadataLock(metadataPath, () => {
+        const metadata = loadMetadata(metadataPath);
+        const candidate = metadata.candidates[candidateId];
+        if (!candidate) {
+          throw new Error("candidate not found");
+        }
 
-      const source = inspectSourceForCandidate(candidate, metadata, pluginsDir);
-      if (source.contentHash !== candidate.versionId) {
-        throw new Error("stale candidate");
-      }
-      const stored = storeVersion({ source, metadata, pluginsDir });
-      delete metadata.candidates[candidateId];
-      saveMetadata(metadataPath, metadata);
-      return mapInstalled(stored);
+        const source = inspectSourceForCandidate(candidate, metadata);
+        if (source.contentHash !== candidate.versionId) {
+          throw new Error("stale candidate");
+        }
+        const stored = storeVersion({ source, metadata, pluginsDir });
+        delete metadata.candidates[candidateId];
+        saveMetadata(metadataPath, metadata);
+        return mapInstalled(stored);
+      });
     },
 
     resolveForTurn(input) {
+      const metadata = loadMetadata(metadataPath);
       const resolved = new Map<string, PluginVersion>();
       applyScope(resolved, input.global ?? [], metadata);
       applyScope(resolved, input.project ?? [], metadata);
@@ -235,69 +235,17 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
     },
 
     async materialize(agentProductId, plugins, materializeOptions) {
-      const applied: PluginVersion[] = [];
-      const mcpServers: Array<{
-        pluginId: string;
-        versionId: string;
-        target: string;
-        server: Record<string, unknown>;
-      }> = [];
-
-      for (const plugin of plugins) {
-        const version = getStoredVersion(metadata, plugin.pluginId, plugin.versionId);
-        if (!version) {
-          throw new Error("plugin version not found");
-        }
-
-        if (version.type === "skill") {
-          const compatibility = version.compatibility[agentProductId];
-          if (!isSkillCompatibility(compatibility)) {
-            throw new Error(`plugin ${plugin.pluginId} not compatible with ${agentProductId}`);
-          }
-          materializeSkill({
-            agentProductId,
-            plugin,
-            version,
-            metadata,
-            skillRoots: options.skillRoots,
-          });
-          applied.push(plugin);
-          continue;
-        }
-
-        const compatibility = version.compatibility[agentProductId];
-        if (!isMcpCompatibility(compatibility)) {
-          throw new Error(`plugin ${plugin.pluginId} not compatible with ${agentProductId}`);
-        }
-
-        mcpServers.push({
-          pluginId: plugin.pluginId,
-          versionId: plugin.versionId,
-          target: compatibility.target,
-          server: compatibility.server,
-        });
-        applied.push(plugin);
-      }
-
-      let turnArtifactPath: string | null = null;
-      if (mcpServers.length > 0) {
-        const turnId = materializeOptions?.turnId ?? randomUUID();
-        const target = join(artifactsDir, agentProductId, `${turnId}.json`);
-        mkdirSync(dirname(target), { recursive: true });
-        atomicWriteJson(target, {
-          format: "ain-one.turn.mcp.v1",
-          turnId,
+      return withMetadataLock(metadataPath, () =>
+        materializeTransaction({
           agentProductId,
-          servers: mcpServers,
-        });
-        turnArtifactPath = target;
-      }
-
-      saveMetadata(metadataPath, metadata);
-      return {
-        applied,
-        turnArtifactPath,
-      };
+          plugins,
+          turnId: materializeOptions?.turnId,
+          skillRoots: options.skillRoots,
+          materializedDir,
+          artifactsDir,
+          metadataPath,
+        }),
+      );
     },
   };
 }
@@ -356,7 +304,6 @@ function inspectSourceForNativeScan(
   agentProductId: AgentProductId,
   compatibilityInput: CompatibilityMap,
   metadata: PluginMetadata,
-  pluginsDir: string,
 ): {
   path: string;
   pluginId: string;
@@ -371,7 +318,7 @@ function inspectSourceForNativeScan(
   }
 
   if (stats.isSymbolicLink()) {
-    if (isEchoManagedSymlink(agentProductId, absolutePath, metadata, pluginsDir)) {
+    if (isEchoManagedSymlink(agentProductId, absolutePath, metadata)) {
       return null;
     }
     const real = safeRealpath(absolutePath);
@@ -392,7 +339,6 @@ function inspectSourceForNativeScan(
 function inspectSourceForCandidate(
   candidate: StoredCandidate,
   metadata: PluginMetadata,
-  pluginsDir: string,
 ): {
   path: string;
   pluginId: string;
@@ -405,7 +351,6 @@ function inspectSourceForCandidate(
     candidate.agentProductId,
     candidate.compatibility,
     metadata,
-    pluginsDir,
   );
   if (!inspected) {
     throw new Error("candidate source missing");
@@ -559,49 +504,210 @@ function hasStoredVersion(metadata: PluginMetadata, pluginId: string, hash: stri
   return getStoredVersion(metadata, pluginId, hash) !== null;
 }
 
-function materializeSkill(input: {
-  agentProductId: AgentProductId;
+interface SkillMaterializationPlan {
   plugin: PluginVersion;
   version: StoredVersion;
-  metadata: PluginMetadata;
+  targetPath: string;
+  materializedPath: string;
+  stagedCopyPath: string;
+  stagedLinkPath: string;
+  previousTargetBackup: string | null;
+  previousMaterializedBackup: string | null;
+  targetSwitched: boolean;
+  materializedSwitched: boolean;
+}
+
+function materializeTransaction(input: {
+  agentProductId: AgentProductId;
+  plugins: PluginVersion[];
+  turnId?: string;
   skillRoots: Partial<Record<AgentProductId, string>>;
-}): void {
-  const root = input.skillRoots[input.agentProductId];
-  if (!root) {
-    throw new Error(`plugin ${input.plugin.pluginId} not compatible with ${input.agentProductId}`);
-  }
+  materializedDir: string;
+  artifactsDir: string;
+  metadataPath: string;
+}): MaterializeResult {
+  const metadata = loadMetadata(input.metadataPath);
+  const skillPlans: SkillMaterializationPlan[] = [];
+  const mcpServers: Array<{
+    pluginId: string;
+    versionId: string;
+    target: string;
+    server: Record<string, unknown>;
+  }> = [];
 
-  const absoluteRoot = resolve(root);
-  mkdirSync(absoluteRoot, { recursive: true });
-  const targetPath = join(absoluteRoot, input.plugin.pluginId);
-  const managedTargets = (input.metadata.managedTargets[input.agentProductId] ??= {});
-
-  const existing = safeLstat(targetPath);
-  if (existing) {
-    const managed = managedTargets[targetPath];
-    if (!managed || managed.pluginId !== input.plugin.pluginId || !existing.isSymbolicLink()) {
-      throw new Error(`unmanaged entry: ${targetPath}`);
+  for (const plugin of input.plugins) {
+    const version = getStoredVersion(metadata, plugin.pluginId, plugin.versionId);
+    if (!version) {
+      throw new Error("plugin version not found");
     }
-    const managedVersion = getStoredVersion(
-      input.metadata,
-      managed.pluginId,
-      managed.versionId,
+
+    if (version.type === "mcp") {
+      const compatibility = version.compatibility[input.agentProductId];
+      if (!isMcpCompatibility(compatibility)) {
+        throw new Error(`plugin ${plugin.pluginId} not compatible with ${input.agentProductId}`);
+      }
+      assertNoRawSecretFields(compatibility.server, []);
+      mcpServers.push({
+        pluginId: plugin.pluginId,
+        versionId: plugin.versionId,
+        target: compatibility.target,
+        server: compatibility.server,
+      });
+      continue;
+    }
+
+    const compatibility = version.compatibility[input.agentProductId];
+    const root = input.skillRoots[input.agentProductId];
+    if (!isSkillCompatibility(compatibility) || !root) {
+      throw new Error(`plugin ${plugin.pluginId} not compatible with ${input.agentProductId}`);
+    }
+
+    const targetPath = join(resolve(root), plugin.pluginId);
+    validateManagedTarget(metadata, input.agentProductId, plugin.pluginId, targetPath);
+    const materializedPath = join(
+      input.materializedDir,
+      input.agentProductId,
+      plugin.pluginId,
+      plugin.versionId,
     );
-    const currentReal = safeRealpath(targetPath);
-    if (!managedVersion || !currentReal || currentReal !== managedVersion.canonicalPath) {
-      throw new Error(`unmanaged entry: ${targetPath}`);
-    }
+    skillPlans.push({
+      plugin,
+      version,
+      targetPath,
+      materializedPath,
+      stagedCopyPath: `${materializedPath}.stage-${randomUUID()}`,
+      stagedLinkPath: join(dirname(targetPath), `${plugin.pluginId}.stage-${randomUUID()}`),
+      previousTargetBackup: null,
+      previousMaterializedBackup: null,
+      targetSwitched: false,
+      materializedSwitched: false,
+    });
   }
 
-  const temporary = join(absoluteRoot, `${input.plugin.pluginId}.tmp-${randomUUID()}`);
-  symlinkSync(input.version.canonicalPath, temporary, "dir");
-  renameSync(temporary, targetPath);
+  const turnId = input.turnId ?? randomUUID();
+  const artifactPath =
+    mcpServers.length > 0
+      ? join(input.artifactsDir, input.agentProductId, `${turnId}.json`)
+      : null;
+  const stagedArtifactPath = artifactPath ? `${artifactPath}.stage-${randomUUID()}` : null;
+  const artifactBackupPath = artifactPath && existsSync(artifactPath)
+    ? `${artifactPath}.backup-${randomUUID()}`
+    : null;
+  let artifactSwitched = false;
 
-  managedTargets[targetPath] = {
-    pluginId: input.plugin.pluginId,
-    versionId: input.plugin.versionId,
-    targetPath,
+  try {
+    for (const plan of skillPlans) {
+      copyDirectoryWithoutSymlink(plan.version.canonicalPath, plan.stagedCopyPath);
+      mkdirSync(dirname(plan.stagedLinkPath), { recursive: true });
+      symlinkSync(plan.materializedPath, plan.stagedLinkPath, "dir");
+    }
+
+    if (artifactPath && stagedArtifactPath) {
+      atomicWriteJson(stagedArtifactPath, {
+        format: "ain-one.turn.mcp.v1",
+        turnId,
+        agentProductId: input.agentProductId,
+        servers: mcpServers,
+      });
+    }
+
+    for (const plan of skillPlans) {
+      mkdirSync(dirname(plan.materializedPath), { recursive: true });
+      if (existsSync(plan.materializedPath)) {
+        plan.previousMaterializedBackup = `${plan.materializedPath}.backup-${randomUUID()}`;
+        renameSync(plan.materializedPath, plan.previousMaterializedBackup);
+      }
+      renameSync(plan.stagedCopyPath, plan.materializedPath);
+      plan.materializedSwitched = true;
+
+      if (safeLstat(plan.targetPath)) {
+        plan.previousTargetBackup = `${plan.targetPath}.backup-${randomUUID()}`;
+        renameSync(plan.targetPath, plan.previousTargetBackup);
+      }
+      renameSync(plan.stagedLinkPath, plan.targetPath);
+      plan.targetSwitched = true;
+    }
+
+    if (artifactPath && stagedArtifactPath) {
+      mkdirSync(dirname(artifactPath), { recursive: true });
+      if (artifactBackupPath) {
+        renameSync(artifactPath, artifactBackupPath);
+      }
+      renameSync(stagedArtifactPath, artifactPath);
+      artifactSwitched = true;
+    }
+
+    const managedTargets = (metadata.managedTargets[input.agentProductId] ??= {});
+    for (const plan of skillPlans) {
+      managedTargets[plan.targetPath] = {
+        pluginId: plan.plugin.pluginId,
+        versionId: plan.plugin.versionId,
+        targetPath: plan.targetPath,
+        materializedPath: plan.materializedPath,
+      };
+    }
+    saveMetadata(input.metadataPath, metadata);
+  } catch (error) {
+    if (artifactSwitched && artifactPath) {
+      removePath(artifactPath);
+    }
+    if (artifactBackupPath && existsSync(artifactBackupPath) && artifactPath) {
+      renameSync(artifactBackupPath, artifactPath);
+    }
+    removePath(stagedArtifactPath);
+
+    for (const plan of [...skillPlans].reverse()) {
+      if (plan.targetSwitched) {
+        removePath(plan.targetPath);
+      }
+      if (plan.previousTargetBackup && existsSync(plan.previousTargetBackup)) {
+        renameSync(plan.previousTargetBackup, plan.targetPath);
+      }
+      if (plan.materializedSwitched) {
+        removePath(plan.materializedPath);
+      }
+      if (plan.previousMaterializedBackup && existsSync(plan.previousMaterializedBackup)) {
+        renameSync(plan.previousMaterializedBackup, plan.materializedPath);
+      }
+      removePath(plan.stagedLinkPath);
+      removePath(plan.stagedCopyPath);
+    }
+    throw error;
+  }
+
+  for (const plan of skillPlans) {
+    removePathBestEffort(plan.previousTargetBackup);
+    removePathBestEffort(plan.previousMaterializedBackup);
+  }
+  removePathBestEffort(artifactBackupPath);
+  return {
+    applied: input.plugins,
+    turnArtifactPath: artifactPath,
   };
+}
+
+function validateManagedTarget(
+  metadata: PluginMetadata,
+  agentProductId: AgentProductId,
+  pluginId: string,
+  targetPath: string,
+): void {
+  const existing = safeLstat(targetPath);
+  if (!existing) {
+    return;
+  }
+  const managed = metadata.managedTargets[agentProductId]?.[targetPath];
+  if (!managed || managed.pluginId !== pluginId || !existing.isSymbolicLink()) {
+    throw new Error(`unmanaged entry: ${targetPath}`);
+  }
+  const currentReal = safeRealpath(targetPath);
+  const materializedReal = safeRealpath(managed.materializedPath);
+  if (!currentReal || !materializedReal || currentReal !== materializedReal) {
+    throw new Error(`unmanaged entry: ${targetPath}`);
+  }
+  if (hashSkillDirectory(managed.materializedPath) !== managed.versionId) {
+    throw new Error(`managed target has local changes: ${targetPath}`);
+  }
 }
 
 function applyScope(
@@ -702,7 +808,6 @@ function isEchoManagedSymlink(
   agentProductId: AgentProductId,
   pathValue: string,
   metadata: PluginMetadata,
-  _pluginsDir: string,
 ): boolean {
   const stats = safeLstat(pathValue);
   if (!stats || !stats.isSymbolicLink()) {
@@ -715,9 +820,17 @@ function isEchoManagedSymlink(
     return false;
   }
 
-  const managedVersion = getStoredVersion(metadata, managed.pluginId, managed.versionId);
   const currentReal = safeRealpath(pathValue);
-  return Boolean(managedVersion && currentReal && managedVersion.canonicalPath === currentReal);
+  const materializedReal = safeRealpath(managed.materializedPath);
+  if (!currentReal || !materializedReal || currentReal !== materializedReal) {
+    return false;
+  }
+
+  try {
+    return hashSkillDirectory(managed.materializedPath) === managed.versionId;
+  } catch {
+    return false;
+  }
 }
 
 function assertNoRawSecretFields(value: unknown, pathParts: string[]): void {
@@ -732,34 +845,57 @@ function assertNoRawSecretFields(value: unknown, pathParts: string[]): void {
     return;
   }
 
-  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
-    const normalizedKey = key.toLowerCase();
-    if (isSensitiveKey(normalizedKey) && typeof child === "string") {
-      throw new Error(`raw secret value is not allowed at ${[...pathParts, key].join(".")}`);
+  if (isExactSecretRefObject(value)) {
+    if (value.secretRef.trim().length === 0) {
+      throw new Error(`invalid secretRef at ${pathParts.join(".")}`);
     }
-    if (isSensitiveKey(normalizedKey) && isSecretRefObject(child)) {
-      continue;
+    return;
+  }
+
+  for (const [key, child] of Object.entries(value as Record<string, unknown>)) {
+    const normalizedKey = key.toLowerCase().replace(/[^a-z0-9]/g, "");
+    if (isSensitiveKey(normalizedKey)) {
+      const childPath = [...pathParts, key].join(".");
+      if (typeof child === "string") {
+        throw new Error(`raw secret value is not allowed at ${childPath}`);
+      }
+      if (isExactSecretRefObject(child)) {
+        if (child.secretRef.trim().length === 0) {
+          throw new Error(`invalid secretRef at ${childPath}`);
+        }
+        continue;
+      }
+      assertNoRawSecretFields(child, [...pathParts, key]);
+      throw new Error(`sensitive field must use a non-empty secretRef at ${childPath}`);
     }
     assertNoRawSecretFields(child, [...pathParts, key]);
   }
 }
 
 function isSensitiveKey(key: string): boolean {
-  return (
-    key === "token" ||
-    key === "apikey" ||
-    key === "api_key" ||
-    key === "secret" ||
-    key === "password" ||
-    key === "cookie"
-  );
+  return new Set([
+    "authorization",
+    "proxyauthorization",
+    "accesstoken",
+    "refreshtoken",
+    "clientsecret",
+    "privatekey",
+    "password",
+    "passphrase",
+    "cookie",
+    "setcookie",
+    "apikey",
+    "token",
+    "secret",
+  ]).has(key);
 }
 
-function isSecretRefObject(value: unknown): value is { secretRef: string } {
+function isExactSecretRefObject(value: unknown): value is { secretRef: string } {
   return (
     typeof value === "object" &&
     value !== null &&
-    "secretRef" in value &&
+    Object.keys(value).length === 1 &&
+    Object.keys(value)[0] === "secretRef" &&
     typeof (value as { secretRef?: unknown }).secretRef === "string"
   );
 }
@@ -806,6 +942,27 @@ function saveMetadata(pathValue: string, metadata: PluginMetadata): void {
   atomicWriteJson(pathValue, metadata);
 }
 
+// ponytail: process-local queue; add a filesystem lock if multiple server processes share dataDir.
+async function withMetadataLock<T>(pathValue: string, operation: () => T | Promise<T>): Promise<T> {
+  const previous = metadataQueues.get(pathValue) ?? Promise.resolve();
+  let release = (): void => undefined;
+  const gate = new Promise<void>((resolvePromise) => {
+    release = resolvePromise;
+  });
+  const queued = previous.catch(() => undefined).then(() => gate);
+  metadataQueues.set(pathValue, queued);
+
+  await previous.catch(() => undefined);
+  try {
+    return await operation();
+  } finally {
+    release();
+    if (metadataQueues.get(pathValue) === queued) {
+      metadataQueues.delete(pathValue);
+    }
+  }
+}
+
 function atomicWriteJson(pathValue: string, value: unknown): void {
   mkdirSync(dirname(pathValue), { recursive: true });
   const temporary = `${pathValue}.tmp-${randomUUID()}`;
@@ -822,6 +979,9 @@ function normalizePluginId(value: string): string {
   if (normalized.length === 0) {
     throw new Error("invalid plugin id");
   }
+  if (normalized === "." || normalized === "..") {
+    throw new Error("invalid plugin id");
+  }
   return normalized;
 }
 
@@ -833,6 +993,31 @@ function mapInstalled(version: StoredVersion): InstalledPluginVersion {
     contentHash: version.contentHash,
     canonicalPath: version.canonicalPath,
   };
+}
+
+function mapCandidate(candidate: StoredCandidate): PluginCandidate {
+  return {
+    id: candidate.id,
+    pluginId: candidate.pluginId,
+    versionId: candidate.versionId,
+    path: candidate.path,
+    agentProductId: candidate.agentProductId,
+  };
+}
+
+function removePath(pathValue: string | null): void {
+  if (!pathValue) {
+    return;
+  }
+  rmSync(pathValue, { recursive: true, force: true });
+}
+
+function removePathBestEffort(pathValue: string | null): void {
+  try {
+    removePath(pathValue);
+  } catch {
+    // A committed materialization stays valid even if an obsolete backup cannot be removed.
+  }
 }
 
 function getStoredVersion(

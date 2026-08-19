@@ -1,4 +1,5 @@
 import { spawn as nodeSpawn, type SpawnOptions } from "node:child_process";
+import type { DatabaseSync } from "node:sqlite";
 
 export interface KeychainSecretRef {
   service: string;
@@ -36,6 +37,22 @@ export interface CreateKeychainOptions {
   spawn?: SpawnLike;
 }
 
+export interface SecretRefInput extends KeychainSecretRef {
+  id: string;
+  descriptor: string;
+}
+
+export interface SecretRefRecord extends SecretRefInput {
+  revision: number;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface SecretRefStore {
+  put(input: SecretRefInput): SecretRefRecord;
+  get(id: string): SecretRefRecord | null;
+}
+
 export function createKeychain(options: CreateKeychainOptions = {}): Keychain {
   const spawn: SpawnLike =
     options.spawn ??
@@ -64,6 +81,46 @@ export function createInMemoryKeychainAdapter(): KeychainAdapter {
         throw new Error("secret not found");
       }
       return value;
+    },
+  };
+}
+
+export function createSecretRefStore(db: DatabaseSync): SecretRefStore {
+  db.exec(`
+    CREATE TABLE IF NOT EXISTS secret_refs (
+      id TEXT PRIMARY KEY,
+      service TEXT NOT NULL,
+      account TEXT NOT NULL,
+      descriptor TEXT NOT NULL,
+      revision INTEGER NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    )
+  `);
+
+  return {
+    put(input) {
+      const now = new Date().toISOString();
+      db.prepare(`
+        INSERT INTO secret_refs (
+          id, service, account, descriptor, revision, created_at, updated_at
+        ) VALUES (?, ?, ?, ?, 1, ?, ?)
+        ON CONFLICT(id) DO UPDATE SET
+          service = excluded.service,
+          account = excluded.account,
+          descriptor = excluded.descriptor,
+          revision = secret_refs.revision + 1,
+          updated_at = excluded.updated_at
+      `).run(input.id, input.service, input.account, input.descriptor, now, now);
+
+      const record = getSecretRef(db, input.id);
+      if (!record) {
+        throw new Error("failed to persist secret reference");
+      }
+      return record;
+    },
+    get(id) {
+      return getSecretRef(db, id);
     },
   };
 }
@@ -98,6 +155,38 @@ function createSecurityKeychainAdapter(spawn: SpawnLike): KeychainAdapter {
       return secret;
     },
   };
+}
+
+function getSecretRef(db: DatabaseSync, id: string): SecretRefRecord | null {
+  const row = db
+    .prepare(`
+      SELECT id, service, account, descriptor, revision, created_at, updated_at
+      FROM secret_refs
+      WHERE id = ?
+    `)
+    .get(id) as
+    | {
+        id: string;
+        service: string;
+        account: string;
+        descriptor: string;
+        revision: number;
+        created_at: string;
+        updated_at: string;
+      }
+    | undefined;
+
+  return row
+    ? {
+        id: row.id,
+        service: row.service,
+        account: row.account,
+        descriptor: row.descriptor,
+        revision: row.revision,
+        createdAt: row.created_at,
+        updatedAt: row.updated_at,
+      }
+    : null;
 }
 
 async function runSecurityCommand(input: {

@@ -16,6 +16,21 @@ export type TurnStatus =
   | "interrupted"
   | "cancel_failed";
 
+export type ActiveTurnStatus = "starting" | "running" | "cancelling";
+
+export type TerminalTurnStatus = Exclude<TurnStatus, ActiveTurnStatus>;
+
+export interface NormalizedError {
+  code: string;
+  message: string;
+  details?: Record<string, unknown>;
+}
+
+export interface ConnectorEvent {
+  type: NormalizedEventType;
+  payload: Record<string, unknown>;
+}
+
 export interface PluginVersion {
   pluginId: string;
   versionId: string;
@@ -33,6 +48,23 @@ export interface Conversation {
   agentProductId: AgentProductId;
   modelId: string | null;
   permissionMode: PermissionMode;
+  queuePaused: boolean;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface Project {
+  id: string;
+  path: string;
+  name: string;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface NativeSessionRecord {
+  id: string;
+  conversationId: string;
+  nativeSessionId: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -158,6 +190,10 @@ export interface CreateConversationRequest {
   projectId: string;
   agentProductId: AgentProductId;
   modelId: string | null;
+}
+
+export interface CreateConversationInput extends CreateConversationRequest {
+  permissionMode?: PermissionMode;
 }
 
 export interface QueueMessageRequest {

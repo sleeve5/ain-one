@@ -1,3 +1,4 @@
+import { spawn } from "node:child_process";
 import {
   existsSync,
   mkdtempSync,
@@ -163,7 +164,16 @@ describe("plugin hub", () => {
       },
     });
 
-    const first = await hub.scanNative([{ agentProductId: "claude", path: claudeSkill }]);
+    const first = await hub.scanNative([
+      {
+        agentProductId: "claude",
+        path: claudeSkill,
+        compatibility: {
+          claude: { kind: "skill" },
+          codex: { kind: "skill" },
+        },
+      },
+    ]);
     expect(first).toHaveLength(1);
 
     await hub.acceptCandidate(first[0]!.id);
@@ -178,6 +188,27 @@ describe("plugin hub", () => {
     expect(readlinkSync(codexTarget).length).toBeGreaterThan(0);
 
     expect(await hub.scanNative([{ agentProductId: "codex", path: codexTarget }])).toEqual([]);
+  });
+
+  it("does not infer cross-agent compatibility from configured skill roots", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const nativeRoot = join(root, "native");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(codexSkillRoot, { recursive: true });
+    const claudeSkill = createSkillFixture(nativeRoot, "claude-only-skill");
+
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+    const [candidate] = await hub.scanNative([
+      { agentProductId: "claude", path: claudeSkill },
+    ]);
+    const installed = await hub.acceptCandidate(candidate!.id);
+
+    await expect(
+      hub.materialize("codex", [
+        { pluginId: installed.pluginId, versionId: installed.versionId },
+      ]),
+    ).rejects.toThrow("not compatible");
   });
 
   it("keeps canonical immutable when an agent edits the managed materialized copy", async () => {
@@ -422,6 +453,48 @@ describe("plugin hub", () => {
       managedTargets: { codex: Record<string, unknown> };
     };
     expect(Object.keys(metadata.managedTargets.codex)).toHaveLength(2);
+  });
+
+  it("waits for another process holding the metadata lock", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const localRoot = join(root, "local");
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(localRoot, { recursive: true });
+    const skill = createSkillFixture(localRoot, "external-lock-skill");
+    const lockPath = join(dataDir, "plugins.metadata.json.lock");
+    const lockHolder = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const fs = require("node:fs"); const path = ${JSON.stringify(lockPath)}; fs.writeFileSync(path, process.pid + ":child", { flag: "wx" }); process.stdout.write("ready\\n"); setTimeout(() => { fs.rmSync(path, { force: true }); }, 100);`,
+      ],
+      { stdio: ["ignore", "pipe", "inherit"] },
+    );
+    await new Promise<void>((resolvePromise, rejectPromise) => {
+      lockHolder.once("error", rejectPromise);
+      lockHolder.stdout.once("data", () => resolvePromise());
+    });
+
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    const install = hub.installLocal({
+      path: skill,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    const state = await Promise.race([
+      install.then(() => "settled" as const),
+      new Promise<"waiting">((resolvePromise) => {
+        setTimeout(() => resolvePromise("waiting"), 30);
+      }),
+    ]);
+
+    expect(state).toBe("waiting");
+    await expect(install).resolves.toMatchObject({ pluginId: "external-lock-skill" });
+    if (lockHolder.exitCode === null) {
+      await new Promise<void>((resolvePromise) => {
+        lockHolder.once("close", () => resolvePromise());
+      });
+    }
   });
 
   it("refuses unknown compatibility and unmanaged target conflicts", async () => {

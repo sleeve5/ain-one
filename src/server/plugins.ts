@@ -1,9 +1,11 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
+  closeSync,
   copyFileSync,
   existsSync,
   lstatSync,
   mkdirSync,
+  openSync,
   readFileSync,
   readdirSync,
   realpathSync,
@@ -129,6 +131,9 @@ const EMPTY_METADATA: PluginMetadata = {
 };
 
 const MCP_FORMAT = "ain-one.mcp.v1";
+const METADATA_LOCK_POLL_MS = 10;
+const METADATA_LOCK_TIMEOUT_MS = 10_000;
+const STALE_METADATA_LOCK_MS = 30_000;
 const metadataQueues = new Map<string, Promise<void>>();
 
 export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
@@ -165,7 +170,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
           const source = inspectSourceForNativeScan(
             absolutePath,
             item.agentProductId,
-            item.compatibility ?? inferredScanCompatibility(item.agentProductId, options.skillRoots),
+            item.compatibility ?? inferredScanCompatibility(item.agentProductId),
             metadata,
           );
           if (!source) {
@@ -490,14 +495,8 @@ function hashBytes(relativePathValue: string, bytes: Buffer): string {
 
 function inferredScanCompatibility(
   sourceAgent: AgentProductId,
-  skillRoots: Partial<Record<AgentProductId, string>>,
 ): CompatibilityMap {
-  const compatibility: CompatibilityMap = {};
-  for (const key of Object.keys(skillRoots) as AgentProductId[]) {
-    compatibility[key] = { kind: "skill" };
-  }
-  compatibility[sourceAgent] = { kind: "skill" };
-  return compatibility;
+  return { [sourceAgent]: { kind: "skill" } };
 }
 
 function hasStoredVersion(metadata: PluginMetadata, pluginId: string, hash: string): boolean {
@@ -953,13 +952,95 @@ async function withMetadataLock<T>(pathValue: string, operation: () => T | Promi
   metadataQueues.set(pathValue, queued);
 
   await previous.catch(() => undefined);
+  let releaseFileLock: (() => void) | null = null;
   try {
+    releaseFileLock = await acquireMetadataFileLock(pathValue);
     return await operation();
   } finally {
+    releaseFileLock?.();
     release();
     if (metadataQueues.get(pathValue) === queued) {
       metadataQueues.delete(pathValue);
     }
+  }
+}
+
+async function acquireMetadataFileLock(metadataPath: string): Promise<() => void> {
+  const lockPath = `${metadataPath}.lock`;
+  const token = `${process.pid}:${randomUUID()}`;
+  const startedAt = Date.now();
+
+  for (;;) {
+    let descriptor: number | null = null;
+    let created = false;
+    try {
+      descriptor = openSync(lockPath, "wx", 0o600);
+      created = true;
+      writeFileSync(descriptor, token, "utf8");
+      closeSync(descriptor);
+      descriptor = null;
+      return () => releaseMetadataFileLock(lockPath, token);
+    } catch (error) {
+      if (descriptor !== null) {
+        closeSync(descriptor);
+      }
+      if (created) {
+        rmSync(lockPath, { force: true });
+      }
+      if (!isErrno(error, "EEXIST")) {
+        throw error;
+      }
+    }
+
+    if (removeStaleMetadataFileLock(lockPath)) {
+      continue;
+    }
+    if (Date.now() - startedAt >= METADATA_LOCK_TIMEOUT_MS) {
+      throw new Error(`plugin metadata lock timeout: ${lockPath}`);
+    }
+    await new Promise<void>((resolvePromise) => {
+      setTimeout(resolvePromise, METADATA_LOCK_POLL_MS);
+    });
+  }
+}
+
+function releaseMetadataFileLock(lockPath: string, token: string): void {
+  try {
+    if (readFileSync(lockPath, "utf8") === token) {
+      rmSync(lockPath, { force: true });
+    }
+  } catch (error) {
+    if (!isErrno(error, "ENOENT")) {
+      throw error;
+    }
+  }
+}
+
+function removeStaleMetadataFileLock(lockPath: string): boolean {
+  try {
+    const stats = lstatSync(lockPath);
+    const ownerPid = Number.parseInt(readFileSync(lockPath, "utf8").split(":", 1)[0] ?? "", 10);
+    const ownerGone = Number.isInteger(ownerPid) && ownerPid > 0 && !isProcessAlive(ownerPid);
+    const invalidAndExpired = !Number.isInteger(ownerPid) && Date.now() - stats.mtimeMs > STALE_METADATA_LOCK_MS;
+    if (!ownerGone && !invalidAndExpired) {
+      return false;
+    }
+    rmSync(lockPath, { force: true });
+    return true;
+  } catch (error) {
+    if (isErrno(error, "ENOENT")) {
+      return true;
+    }
+    throw error;
+  }
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return !isErrno(error, "ESRCH");
   }
 }
 

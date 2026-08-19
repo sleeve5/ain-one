@@ -1,5 +1,5 @@
-import { startTransition, useEffect, useState } from "react";
-import type { AinOneApi, ConversationView } from "./api.js";
+import { startTransition, useEffect, useRef, useState } from "react";
+import type { AinOneApi, ConversationView, InspectorSelection } from "./api.js";
 import { CanvasSwitch } from "./components/canvas-switch.js";
 import { ConversationCanvas } from "./components/conversation-canvas.js";
 import { GraphCanvas } from "./components/graph-canvas.js";
@@ -18,6 +18,10 @@ interface AppProps {
 
 export function App(props: AppProps) {
   const [state, setState] = useState<WorkspaceUiState>(() => createInitialWorkspaceUiState());
+  const inspectorRequest = useRef(0);
+  const [narrowScreen, setNarrowScreen] = useState(
+    () => globalThis.matchMedia?.("(max-width: 960px)").matches ?? false,
+  );
 
   const loadWorkspace = async (): Promise<void> => {
     try {
@@ -42,6 +46,16 @@ export function App(props: AppProps) {
     void loadWorkspace();
   }, []);
 
+  useEffect(() => {
+    const media = globalThis.matchMedia?.("(max-width: 960px)");
+    if (!media) {
+      return;
+    }
+    const update = (): void => setNarrowScreen(media.matches);
+    media.addEventListener("change", update);
+    return () => media.removeEventListener("change", update);
+  }, []);
+
   const selectedConversation = state.workspace.conversation;
   const selectedProjectId = state.workspace.selectedProjectId;
 
@@ -50,7 +64,11 @@ export function App(props: AppProps) {
       return;
     }
 
-    return props.api.subscribeConversationEvents(selectedConversation.id, (event) => {
+    const replaySequence = selectedConversation.events.reduce(
+      (sequence, event) => Math.max(sequence, event.sequence),
+      0,
+    );
+    return props.api.subscribeConversationEvents(selectedConversation.id, replaySequence, (event) => {
       startTransition(() => {
         setState((current) => {
           if (current.workspace.selectedConversationId !== selectedConversation.id) {
@@ -79,31 +97,63 @@ export function App(props: AppProps) {
     });
   }, [props.api, selectedConversation?.id]);
 
-  const selectConversation = (conversationId: string): void => {
-    setState((current) => {
-      const conversation = current.workspace.conversations.find((item) => item.id === conversationId) ?? null;
-      if (!conversation) {
-        return current;
-      }
-
-      return {
-        ...current,
-        workspace: {
-          ...current.workspace,
-          selectedProjectId: conversation.projectId,
-          selectedConversationId: conversationId,
-          conversation,
-        },
-      };
-    });
+  const showActionError = (message: string): void => {
+    setState((current) => ({ ...current, actionError: message }));
   };
 
-  const selectProject = async (projectId: string): Promise<void> => {
+  const clearActionError = (): void => {
+    setState((current) => ({ ...current, actionError: null }));
+  };
+
+  const loadInspector = async (
+    projectId: string,
+    selection: InspectorSelection | null = null,
+  ): Promise<void> => {
+    const request = ++inspectorRequest.current;
+    try {
+      const inspector = await props.api.listProjectFiles(projectId, selection);
+      setState((current) => {
+        if (request !== inspectorRequest.current || current.workspace.selectedProjectId !== projectId) {
+          return current;
+        }
+        return {
+          ...current,
+          actionError: null,
+          workspace: { ...current.workspace, inspector },
+        };
+      });
+    } catch {
+      if (request === inspectorRequest.current) {
+        showActionError("Could not load inspector");
+      }
+    }
+  };
+
+  const selectConversation = (conversationId: string): void => {
+    const conversation = state.workspace.conversations.find((item) => item.id === conversationId);
+    if (!conversation) {
+      return;
+    }
+    setState((current) => ({
+      ...current,
+      actionError: null,
+      workspace: {
+        ...current.workspace,
+        selectedProjectId: conversation.projectId,
+        selectedConversationId: conversationId,
+        conversation,
+      },
+    }));
+    void loadInspector(conversation.projectId);
+  };
+
+  const selectProject = (projectId: string): void => {
     const conversation =
       state.workspace.conversations.find((item) => item.projectId === projectId) ?? null;
 
     setState((current) => ({
       ...current,
+      actionError: null,
       workspace: {
         ...current.workspace,
         selectedProjectId: projectId,
@@ -111,15 +161,7 @@ export function App(props: AppProps) {
         conversation,
       },
     }));
-
-    const inspector = await props.api.listProjectFiles(projectId);
-    setState((current) => ({
-      ...current,
-      workspace: {
-        ...current.workspace,
-        inspector,
-      },
-    }));
+    void loadInspector(projectId);
   };
 
   const patchConversation = (patch: (current: ConversationView) => ConversationView): void => {
@@ -143,12 +185,14 @@ export function App(props: AppProps) {
     });
   };
 
-  const persistConversationSettings = async (conversation: ConversationView): Promise<void> => {
-    await props.api.updateConversationDraftSettings(conversation.id, {
-      modelId: conversation.modelId,
-      permissionMode: conversation.permissionMode,
-      enabledPluginIds: conversation.enabledPluginIds,
-    });
+  const persistConversationSettings = (conversation: ConversationView): void => {
+    void props.api
+      .updateConversationDraftSettings(conversation.id, {
+        modelId: conversation.modelId,
+        permissionMode: conversation.permissionMode,
+        enabledPluginIds: conversation.enabledPluginIds,
+      })
+      .then(clearActionError, () => showActionError("Could not update conversation settings"));
   };
 
   const togglePlugin = (pluginId: string): void => {
@@ -160,23 +204,16 @@ export function App(props: AppProps) {
         ...conversation,
         enabledPluginIds: enabled,
       };
-      void persistConversationSettings(next);
+      persistConversationSettings(next);
       return next;
     });
   };
 
-  const selectInspectorPath = async (path: string): Promise<void> => {
+  const selectInspector = (selection: InspectorSelection): void => {
     if (!selectedProjectId) {
       return;
     }
-    const inspector = await props.api.listProjectFiles(selectedProjectId, path);
-    setState((current) => ({
-      ...current,
-      workspace: {
-        ...current.workspace,
-        inspector,
-      },
-    }));
+    void loadInspector(selectedProjectId, selection);
   };
 
   const changeCanvas = (activeCanvas: CanvasKind): void => {
@@ -199,7 +236,14 @@ export function App(props: AppProps) {
   return (
     <div className="workspace">
       <header className="workspace__header">
-        <h1>Ain One</h1>
+        <div>
+          <h1>Ain One</h1>
+          {state.actionError ? (
+            <p className="workspace__action-error" role="alert">
+              {state.actionError}
+            </p>
+          ) : null}
+        </div>
         <div className="workspace__drawer-buttons">
           <button
             type="button"
@@ -229,14 +273,19 @@ export function App(props: AppProps) {
       </header>
 
       <div className="workspace__layout">
-        <aside className="workspace__left" data-open={state.leftDrawerOpen}>
+        <aside
+          className="workspace__left"
+          data-open={state.leftDrawerOpen}
+          inert={narrowScreen && !state.leftDrawerOpen}
+          aria-hidden={narrowScreen && !state.leftDrawerOpen}
+        >
           <ProjectSidebar
             projects={state.workspace.projects}
             conversations={state.workspace.conversations}
             selectedProjectId={state.workspace.selectedProjectId}
             selectedConversationId={state.workspace.selectedConversationId}
             onSelectProject={(projectId) => {
-              void selectProject(projectId);
+              selectProject(projectId);
             }}
             onSelectConversation={selectConversation}
           />
@@ -262,7 +311,7 @@ export function App(props: AppProps) {
                       ...current,
                       modelId,
                     };
-                    void persistConversationSettings(next);
+                    persistConversationSettings(next);
                     return next;
                   });
                 }}
@@ -272,7 +321,7 @@ export function App(props: AppProps) {
                       ...current,
                       permissionMode,
                     };
-                    void persistConversationSettings(next);
+                    persistConversationSettings(next);
                     return next;
                   });
                 }}
@@ -281,18 +330,38 @@ export function App(props: AppProps) {
                   if (!conversation) {
                     return;
                   }
-                  await props.api.deletePendingMessage(conversation.id, messageId);
-                  patchConversation((current) => ({
-                    ...current,
-                    queuedMessages: current.queuedMessages.filter((message) => message.id !== messageId),
-                  }));
+                  try {
+                    await props.api.deletePendingMessage(conversation.id, messageId);
+                    clearActionError();
+                    patchConversation((current) => ({
+                      ...current,
+                      queuedMessages: current.queuedMessages.filter((message) => message.id !== messageId),
+                    }));
+                  } catch {
+                    showActionError("Could not delete pending message");
+                    throw new Error("delete failed");
+                  }
                 }}
                 onQueueMessage={async (content) => {
                   if (!conversation) {
                     return;
                   }
-                  await props.api.queueMessage(conversation.id, content);
-                  await loadWorkspace();
+                  try {
+                    await props.api.queueMessage(conversation.id, content);
+                    await loadWorkspace();
+                    clearActionError();
+                  } catch {
+                    showActionError("Could not queue message");
+                    throw new Error("queue failed");
+                  }
+                }}
+                onCancelTurn={async () => {
+                  try {
+                    await props.api.cancelActiveTurn(conversation.id);
+                    clearActionError();
+                  } catch {
+                    showActionError("Could not stop active Turn");
+                  }
                 }}
               />
             ) : (
@@ -310,12 +379,15 @@ export function App(props: AppProps) {
           </section>
         </main>
 
-        <aside className="workspace__right" data-open={state.rightDrawerOpen}>
+        <aside
+          className="workspace__right"
+          data-open={state.rightDrawerOpen}
+          inert={narrowScreen && !state.rightDrawerOpen}
+          aria-hidden={narrowScreen && !state.rightDrawerOpen}
+        >
           <Inspector
             state={state.workspace.inspector}
-            onSelectPath={(path) => {
-              void selectInspectorPath(path);
-            }}
+            onSelect={selectInspector}
           />
         </aside>
       </div>

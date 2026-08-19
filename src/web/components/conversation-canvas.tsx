@@ -10,6 +10,7 @@ interface ConversationCanvasProps {
   onTogglePlugin(pluginId: string): void;
   onDeletePendingMessage(messageId: string): Promise<void>;
   onQueueMessage(content: string): Promise<void>;
+  onCancelTurn(): Promise<void>;
 }
 
 export function ConversationCanvas(props: ConversationCanvasProps) {
@@ -23,8 +24,15 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
       aria-label="Conversation Canvas"
     >
       <header className="conversation-canvas__header">
-        <h2>{props.conversation.title}</h2>
-        <p className="conversation-canvas__agent">Agent product: {props.conversation.agentProductLabel}</p>
+        <div>
+          <h2>{props.conversation.title}</h2>
+          <p className="conversation-canvas__agent">Agent product: {props.conversation.agentProductLabel}</p>
+        </div>
+        {turnActive ? (
+          <button type="button" className="conversation-canvas__stop" onClick={props.onCancelTurn}>
+            Stop
+          </button>
+        ) : null}
       </header>
 
       <div className="conversation-canvas__controls">
@@ -126,7 +134,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
               <button
                 type="button"
                 onClick={() => {
-                  void props.onDeletePendingMessage(message.id);
+                  void props.onDeletePendingMessage(message.id).catch(() => undefined);
                 }}
               >
                 Delete

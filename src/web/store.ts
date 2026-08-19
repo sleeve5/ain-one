@@ -6,6 +6,7 @@ export type CanvasKind = "conversation" | "graph";
 export interface WorkspaceUiState {
   status: "loading" | "ready" | "error";
   errorMessage: string | null;
+  actionError: string | null;
   activeCanvas: CanvasKind;
   leftDrawerOpen: boolean;
   rightDrawerOpen: boolean;
@@ -16,6 +17,7 @@ export function createInitialWorkspaceUiState(): WorkspaceUiState {
   return {
     status: "loading",
     errorMessage: null,
+    actionError: null,
     activeCanvas: "conversation",
     leftDrawerOpen: false,
     rightDrawerOpen: false,
@@ -32,6 +34,7 @@ export function createInitialWorkspaceUiState(): WorkspaceUiState {
 
 export function emptyInspector(): InspectorState {
   return {
+    currentPath: ".",
     selectedPath: null,
     files: [],
     preview: {
@@ -54,6 +57,14 @@ export function applyConversationEvent(
   conversation: ConversationView,
   event: NormalizedEvent,
 ): ConversationView {
+  if (
+    conversation.events.some(
+      (existing) => existing.id === event.id || existing.sequence === event.sequence,
+    )
+  ) {
+    return conversation;
+  }
+
   const nextEvents = [...conversation.events, event];
 
   if (event.type !== "turn_status") {

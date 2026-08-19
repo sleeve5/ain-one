@@ -1,8 +1,8 @@
-import type { InspectorState } from "../api.js";
+import type { InspectorSelection, InspectorState } from "../api.js";
 
 interface InspectorProps {
   state: InspectorState;
-  onSelectPath(path: string): void;
+  onSelect(selection: InspectorSelection): void;
 }
 
 export function Inspector(props: InspectorProps) {
@@ -10,6 +10,22 @@ export function Inspector(props: InspectorProps) {
     <aside className="inspector" aria-label="Project inspector">
       <section className="inspector__section">
         <h2>Files</h2>
+        <div className="inspector__directory">
+          <span>Directory: {props.state.currentPath}</span>
+          {props.state.currentPath !== "." ? (
+            <button
+              type="button"
+              onClick={() =>
+                props.onSelect({
+                  path: parentPath(props.state.currentPath),
+                  type: "directory",
+                })
+              }
+            >
+              Up
+            </button>
+          ) : null}
+        </div>
         <ul className="inspector__list" aria-label="File tree">
           {props.state.files.map((entry) => (
             <li key={entry.path}>
@@ -17,8 +33,8 @@ export function Inspector(props: InspectorProps) {
                 type="button"
                 className="inspector__file"
                 data-selected={props.state.selectedPath === entry.path}
-                onClick={() => props.onSelectPath(entry.path)}
-                disabled={entry.type !== "file"}
+                onClick={() => props.onSelect(entry)}
+                disabled={entry.type === "symlink" || entry.type === "other"}
               >
                 {entry.path}
               </button>
@@ -53,4 +69,9 @@ export function Inspector(props: InspectorProps) {
       </section>
     </aside>
   );
+}
+
+function parentPath(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator === -1 ? "." : path.slice(0, separator) || ".";
 }

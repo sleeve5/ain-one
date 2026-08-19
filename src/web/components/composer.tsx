@@ -23,14 +23,15 @@ export function Composer(props: ComposerProps) {
 
         const message = draft.trim();
         setBusy(true);
-        void props
-          .onSubmit(message)
-          .then(() => {
+        void props.onSubmit(message).then(
+          () => {
             setDraft("");
-          })
-          .finally(() => {
             setBusy(false);
-          });
+          },
+          () => {
+            setBusy(false);
+          },
+        );
       }}
     >
       <label className="composer__label" htmlFor="message-input">

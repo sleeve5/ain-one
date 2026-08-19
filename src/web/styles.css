@@ -66,6 +66,12 @@ textarea {
   letter-spacing: 0.03em;
 }
 
+.workspace__action-error {
+  margin: 0.2rem 0 0;
+  color: #8a2f1f;
+  font: 0.78rem var(--mono);
+}
+
 .workspace__layout {
   display: grid;
   grid-template-columns: 300px minmax(480px, 1fr) 360px;
@@ -197,6 +203,21 @@ textarea {
 .graph-canvas__heading {
   margin: 0;
   font-family: var(--serif);
+}
+
+.conversation-canvas__header {
+  display: flex;
+  align-items: flex-start;
+  justify-content: space-between;
+  gap: 1rem;
+}
+
+.conversation-canvas__stop {
+  border: 1px solid #b57668;
+  background: #f8e7df;
+  color: #74291e;
+  border-radius: 0.45rem;
+  padding: 0.42rem 0.7rem;
 }
 
 .conversation-canvas__agent {
@@ -338,6 +359,23 @@ textarea {
 
 .inspector__file[data-selected="true"] {
   border-color: var(--accent);
+}
+
+.inspector__directory {
+  margin-bottom: 0.45rem;
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.5rem;
+  color: var(--ink-soft);
+  font: 0.77rem var(--mono);
+}
+
+.inspector__directory button {
+  border: 1px solid var(--line);
+  background: transparent;
+  border-radius: 0.35rem;
+  padding: 0.2rem 0.45rem;
 }
 
 .inspector__path,

@@ -53,6 +53,7 @@ export interface InspectorFileEntry {
 }
 
 export interface InspectorState {
+  currentPath: string;
   selectedPath: string | null;
   files: InspectorFileEntry[];
   preview: {
@@ -68,6 +69,11 @@ export interface InspectorState {
     path: string | null;
     content: string;
   };
+}
+
+export interface InspectorSelection {
+  path: string;
+  type: InspectorFileEntry["type"];
 }
 
 export interface WorkspaceState {
@@ -89,15 +95,20 @@ export interface AinOneApi {
   loadWorkspace(): Promise<WorkspaceState>;
   queueMessage(conversationId: string, content: string): Promise<void>;
   deletePendingMessage(conversationId: string, messageId: string): Promise<void>;
+  cancelActiveTurn(conversationId: string): Promise<void>;
   subscribeConversationEvents(
     conversationId: string,
+    afterSequence: number,
     onEvent: (event: NormalizedEvent) => void,
   ): () => void;
   updateConversationDraftSettings(
     conversationId: string,
     settings: ConversationDraftSettings,
   ): Promise<void>;
-  listProjectFiles(projectId: string, path?: string | null): Promise<InspectorState>;
+  listProjectFiles(
+    projectId: string,
+    selection?: InspectorSelection | null,
+  ): Promise<InspectorState>;
 }
 
 interface StorageLike {
@@ -206,31 +217,48 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         };
       }
 
-      const conversations: ConversationView[] = [];
-      const availablePlugins = await tryListPlugins(getJson);
-
-      for (const project of projects) {
-        const conversationPayload = await getJson<{ conversations: Conversation[] }>(
-          `/api/projects/${encodeURIComponent(project.id)}/conversations`,
-        );
-        for (const conversation of conversationPayload.conversations) {
-          const detail = await getJson<ConversationDetailResponse>(
-            `/api/conversations/${encodeURIComponent(conversation.id)}`,
-          );
-
-          const catalog = await tryGetCatalog(getJson, conversation.agentProductId, project.id);
-          const storedSettings = readConversationDraftSettings(storage, conversation.id);
-          conversations.push(
-            toConversationView(
+      const availablePluginsPromise = tryListPlugins(getJson);
+      const projectConversations = await Promise.all(
+        projects.map(async (project) => ({
+          project,
+          conversations: (
+            await getJson<{ conversations: Conversation[] }>(
+              `/api/projects/${encodeURIComponent(project.id)}/conversations`,
+            )
+          ).conversations,
+        })),
+      );
+      const availablePlugins = await availablePluginsPromise;
+      const catalogPromises = new Map<string, Promise<AgentCatalog | null>>();
+      const conversations = await Promise.all(
+        projectConversations.flatMap(({ project, conversations: projectItems }) =>
+          projectItems.map(async (conversation) => {
+            const catalogKey = `${project.id}:${conversation.agentProductId}`;
+            let catalogPromise = catalogPromises.get(catalogKey);
+            if (!catalogPromise) {
+              catalogPromise = tryGetCatalog(
+                getJson,
+                conversation.agentProductId,
+                project.id,
+              );
+              catalogPromises.set(catalogKey, catalogPromise);
+            }
+            const [detail, catalog] = await Promise.all([
+              getJson<ConversationDetailResponse>(
+                `/api/conversations/${encodeURIComponent(conversation.id)}`,
+              ),
+              catalogPromise,
+            ]);
+            return toConversationView(
               detail.conversation,
               detail,
               catalog,
               availablePlugins,
-              storedSettings,
-            ),
-          );
-        }
-      }
+              readConversationDraftSettings(storage, conversation.id),
+            );
+          }),
+        ),
+      );
 
       const selectedProjectId = projects[0]?.id ?? null;
       const selectedConversation =
@@ -273,17 +301,21 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       }
     },
 
-    subscribeConversationEvents(conversationId, onEvent): () => void {
+    async cancelActiveTurn(conversationId): Promise<void> {
+      await postJson(`/api/conversations/${encodeURIComponent(conversationId)}/cancel`, {});
+    },
+
+    subscribeConversationEvents(conversationId, afterSequence, onEvent): () => void {
       const controller = new AbortController();
       let stopped = false;
+      let lastSequence = Math.max(afterSequence, 0);
 
       void (async () => {
         let attempt = 0;
         while (!stopped) {
-          const after = readStoredEventSequence(storage, conversationId);
           try {
             const response = await fetchFn(
-              `${baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/events?after=${after}`,
+              `${baseUrl}/api/conversations/${encodeURIComponent(conversationId)}/events?after=${lastSequence}`,
               {
                 method: "GET",
                 headers: {
@@ -299,8 +331,9 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
 
             attempt = 0;
             await consumeSse(response.body, controller.signal, (event) => {
-              storeEventSequence(storage, conversationId, event.sequence);
               onEvent(event);
+              lastSequence = Math.max(lastSequence, event.sequence);
+              storeEventSequence(storage, conversationId, event.sequence);
             });
           } catch {
             if (stopped || controller.signal.aborted) {
@@ -331,15 +364,31 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       writeConversationDraftSettings(storage, conversationId, settings);
     },
 
-    async listProjectFiles(projectId, selectedPath = null): Promise<InspectorState> {
-      const tree = await getJson<FileTreeResponse>(
-        `/api/projects/${encodeURIComponent(projectId)}/files`,
-      );
+    async listProjectFiles(projectId, selection = null): Promise<InspectorState> {
+      const requestedDirectory =
+        selection?.type === "directory"
+          ? selection.path
+          : selection?.type === "file"
+            ? parentPath(selection.path)
+            : ".";
+      const treePath = requestedDirectory === "."
+        ? ""
+        : `?path=${encodeURIComponent(requestedDirectory)}`;
+      const [tree, gitStatusResponse] = await Promise.all([
+        getJson<FileTreeResponse>(
+          `/api/projects/${encodeURIComponent(projectId)}/files${treePath}`,
+        ),
+        getJson<GitCommandResponse>(
+          `/api/projects/${encodeURIComponent(projectId)}/git/status`,
+        ),
+      ]);
 
       const selected =
-        selectedPath && tree.entries.some((entry) => entry.path === selectedPath)
-          ? selectedPath
-          : tree.entries.find((entry) => entry.type === "file")?.path ?? null;
+        selection?.type === "file"
+          ? selection.path
+          : selection?.type === "directory"
+            ? null
+            : tree.entries.find((entry) => entry.type === "file")?.path ?? null;
 
       let previewPath: string | null = null;
       let previewContent = "Select a file to preview.";
@@ -363,16 +412,15 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         }
       }
 
-      const gitStatusResponse = await getJson<GitCommandResponse>(
-        `/api/projects/${encodeURIComponent(projectId)}/git/status`,
-      );
       const gitStatus = parseGitStatus(gitStatusResponse.output);
-
-      const gitDiffResponse = await getJson<GitCommandResponse>(
-        `/api/projects/${encodeURIComponent(projectId)}/git/diff${selected ? `?path=${encodeURIComponent(selected)}` : ""}`,
-      );
+      const gitDiffResponse = selected
+        ? await getJson<GitCommandResponse>(
+            `/api/projects/${encodeURIComponent(projectId)}/git/diff?path=${encodeURIComponent(selected)}`,
+          )
+        : { output: "" };
 
       return {
+        currentPath: tree.path,
         selectedPath: selected,
         files: tree.entries.map((entry) => ({
           path: entry.path,
@@ -502,6 +550,7 @@ function detectLanguage(path: string): string {
 
 function emptyInspectorState(): InspectorState {
   return {
+    currentPath: ".",
     selectedPath: null,
     files: [],
     preview: {
@@ -681,25 +730,17 @@ async function wait(ms: number, signal: AbortSignal): Promise<void> {
   });
 }
 
-function readStoredEventSequence(storage: StorageLike, conversationId: string): number {
-  try {
-    const raw = storage.getItem(eventSequenceStorageKey(conversationId));
-    if (!raw) {
-      return 0;
-    }
-    const parsed = Number.parseInt(raw, 10);
-    return Number.isFinite(parsed) && parsed >= 0 ? parsed : 0;
-  } catch {
-    return 0;
-  }
-}
-
 function storeEventSequence(storage: StorageLike, conversationId: string, sequence: number): void {
   try {
     storage.setItem(eventSequenceStorageKey(conversationId), String(Math.max(sequence, 0)));
   } catch {
     // Ignore storage errors; live updates still continue in-memory.
   }
+}
+
+function parentPath(path: string): string {
+  const separator = path.lastIndexOf("/");
+  return separator === -1 ? "." : path.slice(0, separator) || ".";
 }
 
 function readConversationDraftSettings(

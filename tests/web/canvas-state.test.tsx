@@ -46,6 +46,9 @@ function fakeApi(): AinOneApi {
     async deletePendingMessage() {
       return undefined;
     },
+    async cancelActiveTurn() {
+      return undefined;
+    },
     subscribeConversationEvents() {
       return () => undefined;
     },
@@ -79,6 +82,7 @@ function createWorkspaceState(): WorkspaceState {
   };
 
   const inspector: InspectorState = {
+    currentPath: ".",
     selectedPath: "src/index.ts",
     files: [{ path: "src/index.ts", type: "file" }],
     preview: {

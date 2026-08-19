@@ -1,5 +1,6 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync } from "node:fs";
+import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { Agent, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
@@ -21,12 +22,71 @@ async function readJson(response: Response): Promise<unknown> {
   return JSON.parse(await response.text()) as unknown;
 }
 
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolve) => setTimeout(resolve, ms));
+}
+
+async function makeHttpRequest(input: {
+  url: URL;
+  method: string;
+  token: string;
+  body?: string;
+  agent?: Agent;
+}): Promise<{
+  statusCode: number;
+  headers: Record<string, string | string[]>;
+  body: string;
+  socketKey: string;
+}> {
+  return new Promise((resolvePromise, rejectPromise) => {
+    const req = httpRequest(
+      {
+        protocol: input.url.protocol,
+        hostname: input.url.hostname,
+        port: input.url.port,
+        path: `${input.url.pathname}${input.url.search}`,
+        method: input.method,
+        agent: input.agent,
+        headers: {
+          authorization: `Bearer ${input.token}`,
+          "content-type": "application/json",
+          ...(input.body
+            ? {
+                "content-length": Buffer.byteLength(input.body),
+              }
+            : {}),
+        },
+      },
+      (response) => {
+        const chunks: Buffer[] = [];
+        response.on("data", (chunk: Buffer) => chunks.push(chunk));
+        response.on("end", () => {
+          const socket = response.socket;
+          resolvePromise({
+            statusCode: response.statusCode ?? 0,
+            headers: response.headers as Record<string, string | string[]>,
+            body: Buffer.concat(chunks).toString("utf8"),
+            socketKey: socket ? `${socket.remoteAddress}:${socket.remotePort}->${socket.localPort}` : "none",
+          });
+        });
+      },
+    );
+
+    req.on("error", rejectPromise);
+    if (input.body) {
+      req.write(input.body);
+    }
+    req.end();
+  });
+}
+
 async function createFixture(input?: {
   permissionResponder?: (args: {
     conversationId: string;
     requestId: string;
     decision: "allow_once" | "deny_once";
   }) => Promise<void>;
+  bodyLimitBytes?: number;
 }) {
   const projectPath = mkdtempSync(join(tmpdir(), "ain-one-task3-api-"));
   tempDirs.push(projectPath);
@@ -55,6 +115,7 @@ async function createFixture(input?: {
       cancelActiveTurn: async () => false,
     },
     permissionResponder: input?.permissionResponder,
+    bodyLimitBytes: input?.bodyLimitBytes,
     ssePollMs: 5,
     sseHeartbeatMs: 50,
   });
@@ -326,12 +387,136 @@ describe("loopback api", () => {
       expect(pluginMutation.status).toBe(501);
 
       const pluginsRead = await fixture.request("/api/plugins");
-      expect(pluginsRead.status).toBe(200);
+      expect(pluginsRead.status).toBe(501);
       expect(await readJson(pluginsRead)).toEqual({
-        plugins: [],
-        source: "ain_one",
-        note: "no installed plugins",
+        error: {
+          code: "plugins_unsupported",
+          message: "Plugin listing is not supported",
+        },
       });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("stops cleanly with a connected SSE stream", async () => {
+    const fixture = await createFixture();
+    try {
+      const stream = await fixture.request(`/api/conversations/${fixture.conversation.id}/events`);
+      expect(stream.status).toBe(200);
+      const reader = stream.body?.getReader();
+      if (!reader) {
+        throw new Error("expected stream reader");
+      }
+
+      await sleep(20);
+      await expect(
+        Promise.race([
+          fixture.stop(),
+          new Promise<never>((_, reject) => setTimeout(() => reject(new Error("stop timeout")), 1000)),
+        ]),
+      ).resolves.toBeUndefined();
+
+      const deadline = Date.now() + 1000;
+      let ended = false;
+      while (Date.now() < deadline) {
+        const next = await Promise.race([
+          reader.read(),
+          new Promise<null>((resolve) => setTimeout(() => resolve(null), 100)),
+        ]);
+        if (next === null) {
+          continue;
+        }
+        if (next.done) {
+          ended = true;
+          break;
+        }
+      }
+      expect(ended).toBe(true);
+    } catch (error) {
+      await fixture.stop().catch(() => undefined);
+      throw error;
+    }
+  });
+
+  it("closes keep-alive connection after oversize body and does not poison next request", async () => {
+    const fixture = await createFixture({ bodyLimitBytes: 512 });
+    const keepAliveAgent = new Agent({ keepAlive: true, maxSockets: 1 });
+    try {
+      const oversizedBody = JSON.stringify({ content: "x".repeat(5000) });
+      const oversize = await makeHttpRequest({
+        url: new URL(`${fixture.api.url}/api/conversations/${fixture.conversation.id}/messages`),
+        method: "POST",
+        token: TOKEN,
+        body: oversizedBody,
+        agent: keepAliveAgent,
+      });
+
+      expect(oversize.statusCode).toBe(413);
+      expect(oversize.headers.connection).toBe("close");
+
+      const followup = await makeHttpRequest({
+        url: new URL(`${fixture.api.url}/api/projects`),
+        method: "GET",
+        token: TOKEN,
+        agent: keepAliveAgent,
+      });
+
+      expect(followup.statusCode).toBe(200);
+      expect(followup.socketKey).not.toBe(oversize.socketKey);
+    } finally {
+      keepAliveAgent.destroy();
+      await fixture.stop();
+    }
+  });
+
+  it("rejects malformed percent-encoding in file query paths", async () => {
+    const fixture = await createFixture();
+    try {
+      const filesResponse = await fixture.request(
+        `/api/projects/${fixture.project.id}/files?path=%E0%A4%A`,
+      );
+      expect(filesResponse.status).toBe(400);
+      expect(await readJson(filesResponse)).toEqual({
+        error: {
+          code: "invalid_path_encoding",
+          message: "Query parameter path must be valid URL encoding",
+        },
+      });
+
+      const previewResponse = await fixture.request(
+        `/api/projects/${fixture.project.id}/preview?path=%E0%A4%A`,
+      );
+      expect(previewResponse.status).toBe(400);
+
+      const diffResponse = await fixture.request(
+        `/api/projects/${fixture.project.id}/git/diff?path=%E0%A4%A`,
+      );
+      expect(diffResponse.status).toBe(400);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("supports valid percent-encoded file query paths", async () => {
+    const fixture = await createFixture();
+    try {
+      const nestedDir = join(fixture.project.path, "nested");
+      mkdirSync(nestedDir);
+      const filePath = join(nestedDir, "hello world.txt");
+      writeFileSync(filePath, "hi");
+
+      const encoded = encodeURIComponent("nested/hello world.txt");
+      const previewResponse = await fixture.request(
+        `/api/projects/${fixture.project.id}/preview?path=${encoded}`,
+      );
+      expect(previewResponse.status).toBe(200);
+      expect(await readJson(previewResponse)).toEqual(
+        expect.objectContaining({
+          path: "nested/hello world.txt",
+          content: "hi",
+        }),
+      );
     } finally {
       await fixture.stop();
     }

@@ -90,10 +90,24 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
   let started = false;
   let currentPort = options.port;
+  const activeSseClosers = new Set<() => void>();
 
   const server = createServer((request, response) => {
     void handleRequest(request, response).catch((error) => {
       const classified = classifyError(error);
+      if (classified.status === 413) {
+        response.shouldKeepAlive = false;
+        sendError(response, classified.status, classified.code, classified.message, {
+          connection: "close",
+        });
+        response.once("finish", () => {
+          request.resume();
+          if (!request.destroyed) {
+            request.destroy();
+          }
+        });
+        return;
+      }
       sendError(response, classified.status, classified.code, classified.message);
     });
   });
@@ -121,6 +135,10 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
   async function stop(): Promise<void> {
     if (!started) {
       return;
+    }
+
+    for (const closeSse of [...activeSseClosers]) {
+      closeSse();
     }
 
     await new Promise<void>((resolvePromise, rejectPromise) => {
@@ -363,6 +381,14 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         }
       }, heartbeatMs);
 
+      const closeSse = (): void => {
+        cleanup();
+        if (!response.writableEnded) {
+          response.end();
+        }
+      };
+      activeSseClosers.add(closeSse);
+
       const cleanup = (): void => {
         if (closed) {
           return;
@@ -370,6 +396,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         closed = true;
         clearInterval(pollTimer);
         clearInterval(heartbeatTimer);
+        activeSseClosers.delete(closeSse);
         request.off("close", cleanup);
         response.off("close", cleanup);
       };
@@ -437,11 +464,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         return;
       }
 
-      sendJson(response, 200, {
-        plugins: [],
-        source: "ain_one",
-        note: "no installed plugins",
-      });
+      sendError(response, 501, "plugins_unsupported", "Plugin listing is not supported");
       return;
     }
 
@@ -468,7 +491,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         sendError(response, 404, "project_not_found", "Project not found");
         return;
       }
-      const path = requestUrl.searchParams.get("path");
+      const path = readPathQuery(request.url);
       const files = await options.files.list(project.path, path);
       sendJson(response, 200, files);
       return;
@@ -481,7 +504,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         sendError(response, 404, "project_not_found", "Project not found");
         return;
       }
-      const path = requestUrl.searchParams.get("path");
+      const path = readPathQuery(request.url);
       const preview = await options.files.preview(project.path, path);
       sendJson(response, 200, preview);
       return;
@@ -506,7 +529,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         sendError(response, 404, "project_not_found", "Project not found");
         return;
       }
-      const path = requestUrl.searchParams.get("path");
+      const path = readPathQuery(request.url);
       const diff = await options.files.gitDiff(project.path, path);
       sendJson(response, 200, diff);
       return;
@@ -607,9 +630,14 @@ function sendError(
   status: number,
   code: string,
   message: string,
+  headers: Record<string, string> = {},
 ): void {
   if (response.writableEnded) {
     return;
+  }
+
+  for (const [key, value] of Object.entries(headers)) {
+    response.setHeader(key, value);
   }
 
   sendJson(response, status, {
@@ -653,6 +681,50 @@ async function readJsonBody(request: IncomingMessage, maxBytes: number): Promise
   } catch {
     throw new InputError(400, "invalid_json", "Request body must be valid JSON");
   }
+}
+
+function readPathQuery(rawUrl: string | undefined): string | null {
+  const rawValue = readRawQueryValue(rawUrl, "path");
+  if (rawValue === null) {
+    return null;
+  }
+
+  try {
+    return decodeURIComponent(rawValue.replace(/\+/g, "%20"));
+  } catch {
+    throw new InputError(
+      400,
+      "invalid_path_encoding",
+      "Query parameter path must be valid URL encoding",
+    );
+  }
+}
+
+function readRawQueryValue(rawUrl: string | undefined, key: string): string | null {
+  if (!rawUrl) {
+    return null;
+  }
+
+  const queryIndex = rawUrl.indexOf("?");
+  if (queryIndex === -1) {
+    return null;
+  }
+
+  const query = rawUrl.slice(queryIndex + 1);
+  if (query.length === 0) {
+    return null;
+  }
+
+  for (const part of query.split("&")) {
+    const equalsIndex = part.indexOf("=");
+    const rawKey = equalsIndex === -1 ? part : part.slice(0, equalsIndex);
+    if (rawKey !== key) {
+      continue;
+    }
+    return equalsIndex === -1 ? "" : part.slice(equalsIndex + 1);
+  }
+
+  return null;
 }
 
 function isAuthorized(request: IncomingMessage, token: string): boolean {

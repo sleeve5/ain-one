@@ -1,5 +1,10 @@
 import type { ChildProcess } from "node:child_process";
-import type { ConnectorEvent, StartTurnInput, TerminalTurnStatus } from "../../shared/contracts.js";
+import type {
+  ConnectorEvent,
+  LiveSession,
+  StartTurnInput,
+  TerminalTurnStatus,
+} from "../../shared/contracts.js";
 import { BaseConnector, redactSecrets, truncateText, type RuntimeSession } from "./base.js";
 
 type TurnError = { code: string; message: string; details?: Record<string, unknown> };
@@ -19,11 +24,12 @@ interface StartCliJsonlTurnInput {
 }
 
 export abstract class CliJsonlConnector extends BaseConnector {
-  async startTurn(session: RuntimeSession, input: StartTurnInput): Promise<{ nativeTurnId: string | null }> {
+  async startTurn(session: LiveSession, input: StartTurnInput): Promise<{ nativeTurnId: string | null }> {
+    const runtime = this.asRuntimeSession(session);
     return this.startCliJsonlTurn({
-      session,
+      session: runtime,
       turn: input,
-      args: this.buildStartArgs(session, input),
+      args: this.buildStartArgs(runtime, input),
       mapEvent: async (event, context) => {
         await this.mapEvent(event, context);
       },
@@ -61,6 +67,8 @@ export abstract class CliJsonlConnector extends BaseConnector {
     }
 
     let nativeTurnId: string | null = null;
+    const requiresPersistedSessionId = !(input.session.resume && input.session.nativeSessionId);
+    let persistedSessionId = !requiresPersistedSessionId;
     let stderrText = "";
     let stderrBytes = 0;
     let cancelled = false;
@@ -87,36 +95,68 @@ export abstract class CliJsonlConnector extends BaseConnector {
       }
       terminalSent = true;
 
+      const startReady = Boolean(nativeTurnId) && persistedSessionId;
+      const effectiveStatus =
+        (status === "completed" || status === "cancelled") && !startReady
+          ? "interrupted"
+          : status;
+      const effectiveError =
+        effectiveStatus === "interrupted" && !error && !startReady
+          ? {
+              code: "missing_native_identity",
+              message: "Native process exited before session and turn identifiers were persisted",
+            }
+          : error;
+
       if (!startSettled) {
         startSettled = true;
-        if (status === "failed" || status === "interrupted" || status === "start_failed") {
-          rejectStart(new Error(error?.message ?? "Native turn failed before start"));
+        if (
+          effectiveStatus === "failed" ||
+          effectiveStatus === "interrupted" ||
+          effectiveStatus === "start_failed"
+        ) {
+          rejectStart(new Error(effectiveError?.message ?? "Native turn failed before start"));
         } else {
           resolveStart({ nativeTurnId });
         }
       }
-
-      await this.emitEvent(input.session, {
-        type: "turn_status",
-        payload: {
-          turnId: input.turn.turnId ?? null,
+      try {
+        await this.emitEvent(input.session, {
+          type: "turn_status",
+          payload: {
+            turnId: input.turn.turnId ?? null,
+            nativeTurnId,
+            status: effectiveStatus,
+            error: effectiveError,
+          },
+        });
+        await this.emitTerminal(input.session, {
+          turnId: input.turn.turnId,
           nativeTurnId,
-          status,
-          error,
-        },
-      });
-      await this.emitTerminal(input.session, {
-        turnId: input.turn.turnId,
-        nativeTurnId,
-        status,
-        error,
-      });
-
-      if (input.session.activeTurn?.settled === settled) {
-        delete input.session.activeTurn;
+          status: effectiveStatus,
+          error: effectiveError,
+        });
+      } finally {
+        if (input.session.activeTurn?.settled === settled) {
+          delete input.session.activeTurn;
+        }
+        input.session.settled = settled;
+        settledResolve();
       }
-      input.session.settled = settled;
-      settledResolve();
+    };
+
+    const maybeResolveStart = (): void => {
+      if (startSettled) {
+        return;
+      }
+      if (!nativeTurnId) {
+        return;
+      }
+      if (!persistedSessionId) {
+        return;
+      }
+      startSettled = true;
+      resolveStart({ nativeTurnId });
     };
 
     const closeTurn = async (): Promise<void> => {
@@ -165,17 +205,23 @@ export abstract class CliJsonlConnector extends BaseConnector {
         await this.emitEvent(input.session, event);
       },
       setNativeSessionId: async (nextNativeSessionId) => {
-        await this.syncNativeSessionId(input.session, nextNativeSessionId);
+        try {
+          await this.syncNativeSessionId(input.session, nextNativeSessionId);
+          persistedSessionId = true;
+          maybeResolveStart();
+        } catch (error) {
+          await finalize("interrupted", {
+            code: "session_persist_failed",
+            message: error instanceof Error ? error.message : "Failed to persist native session id",
+          });
+        }
       },
       setNativeTurnId: (nextNativeTurnId) => {
         nativeTurnId = nextNativeTurnId;
         if (input.session.activeTurn) {
           input.session.activeTurn.nativeTurnId = nextNativeTurnId;
         }
-        if (!startSettled && nextNativeTurnId) {
-          startSettled = true;
-          resolveStart({ nativeTurnId: nextNativeTurnId });
-        }
+        maybeResolveStart();
       },
       terminal: async (status, error) => {
         await finalize(status, error);
@@ -269,6 +315,14 @@ export abstract class CliJsonlConnector extends BaseConnector {
             code: "process_signal",
             message: `Process closed with signal ${signal}`,
             details: { signal },
+          });
+          return;
+        }
+
+        if (!startSettled) {
+          await finalize("interrupted", {
+            code: "missing_native_identity",
+            message: "Native process exited before session and turn identifiers were persisted",
           });
           return;
         }
@@ -394,4 +448,3 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
 function stringValue(value: unknown): string | null {
   return typeof value === "string" ? value : null;
 }
-

@@ -26,6 +26,7 @@ type SpawnCall = {
   command: string;
   args: string[];
   shell: boolean | undefined;
+  killSignals: Array<NodeJS.Signals | number | undefined>;
 };
 
 type TerminalCall = {
@@ -82,7 +83,14 @@ describe("native agent connectors", () => {
         permissionModes: ["request_approval", "help_me_approve", "full_access"],
       },
       startArgs: ["exec", "--json", "--approve-for-me"],
-      resumeArgs: ["exec", "resume", "native-session-codex", "--json", "--approve-for-me"],
+      resumeArgs: [
+        "exec",
+        "resume",
+        "native-session-codex",
+        "--json",
+        "-c",
+        'approvals_reviewer="auto_review"',
+      ],
     },
     {
       id: "claude",
@@ -139,30 +147,6 @@ describe("native agent connectors", () => {
         "exec",
         "resume",
         "native-session-trae",
-        "--json",
-        "--permission-mode",
-        "auto",
-      ],
-    },
-    {
-      id: "opencode",
-      factory: (ctx, env) =>
-        new OpenCodeConnector({
-          executable: fixtureBinary("fake-opencode.mjs"),
-          spawn: spawnRecorder(ctx.spawnCalls),
-          env: env ?? fixtureEnv(ctx.recordPath),
-          killTimeoutMs: 50,
-        }),
-      probeStatus: "capability_limited",
-      catalog: {
-        models: [],
-        permissionModes: ["request_approval", "help_me_approve", "full_access"],
-      },
-      startArgs: ["exec", "--json", "--permission-mode", "auto"],
-      resumeArgs: [
-        "exec",
-        "resume",
-        "native-session-opencode",
         "--json",
         "--permission-mode",
         "auto",
@@ -297,9 +281,234 @@ describe("native agent connectors", () => {
     expect(JSON.stringify(terminal?.payload)).not.toContain("Bearer abc123");
   });
 
+  it("recursively redacts nested event payload strings", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "nested-secret-event",
+      },
+      killTimeoutMs: 50,
+    });
+
+    const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    await waitForSettled(started.session);
+
+    const toolEvent = started.events.find((event) => event.type === "tool");
+    expect(JSON.stringify(toolEvent?.payload)).toContain("[REDACTED]");
+    expect(JSON.stringify(toolEvent?.payload)).not.toContain("sk-live-secret");
+    expect(JSON.stringify(toolEvent?.payload)).not.toContain("Bearer abc123");
+    expect(JSON.stringify(toolEvent?.payload)).not.toContain("cookie=abc");
+    expect(JSON.stringify(toolEvent?.payload)).not.toContain("token=def");
+  });
+
   it("reports missing executables truthfully", async () => {
     const connector = new CodexConnector({ executable: "/missing/codex" });
     await expect(connector.probe()).resolves.toMatchObject({ status: "not_installed" });
+  });
+
+  it("defaults opencode to not_installed and refuses to start without an SDK adapter", async () => {
+    const ctx = createFixtureContext();
+    const connector = new OpenCodeConnector();
+    const session = await connector.createOrResumeSession({
+      projectPath: ctx.projectPath,
+      conversationId: "conversation-opencode",
+      nativeSessionId: null,
+    });
+
+    await expect(connector.probe()).resolves.toMatchObject({ status: "not_installed" });
+    await expect(connector.fetchCatalog(ctx.projectPath)).resolves.toEqual({
+      models: [],
+      permissionModes: [],
+    });
+    await expect(
+      connector.startTurn(session, {
+        content: "say hello",
+        snapshot: {
+          modelId: null,
+          permissionMode: "help_me_approve",
+          pluginVersions: [],
+        },
+        turnId: "turn-opencode-start",
+      }),
+    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
+  });
+
+  it("uses an injected opencode sdk adapter when provided", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new OpenCodeConnector({
+      sdkAdapter: createOpenCodeSdkAdapter(),
+    });
+    setTurnCallbacks(connector, terminalCalls);
+
+    const started = await startTurn(connector, "opencode", ctx.projectPath, null);
+    await waitForSettled(started.session);
+
+    expect(started.session.nativeSessionId).toBe("sdk-session-opencode");
+    expect(started.nativeTurnId).toBe("sdk-turn-opencode");
+    expect(started.events.map((event) => event.type)).toContain("assistant_message");
+    expect(terminalCalls).toHaveLength(1);
+    expect(terminalCalls[0]?.status).toBe("completed");
+  });
+
+  it("waits for new-session native session persistence before resolving startTurn", async () => {
+    const ctx = createFixtureContext();
+    const deferred = createDeferred<void>();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "turn-before-session",
+      },
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onNativeSessionId: async (value) => {
+        harness.nativeSessionIds.push(value);
+        await deferred.promise;
+      },
+    });
+
+    let resolved = false;
+    const startPromise = connector.startTurn(harness.session, turnInput("codex", null)).then((turn) => {
+      resolved = true;
+      return turn;
+    });
+
+    await sleep(50);
+    expect(resolved).toBe(false);
+    deferred.resolve();
+
+    await expect(startPromise).resolves.toMatchObject({ nativeTurnId: "native-turn-codex" });
+  });
+
+  it("interrupts a new session if the process exits before a native session id is persisted", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "missing-session-id",
+      },
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+
+    await expect(
+      withTimeout(connector.startTurn(harness.session, turnInput("codex", null)), 250),
+    ).rejects.toThrow();
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(getActiveTurn(harness.session)).toBeUndefined();
+    expect(harness.events).toContainEqual(
+      expect.objectContaining({
+        type: "turn_status",
+        payload: expect.objectContaining({ status: "interrupted" }),
+      }),
+    );
+  });
+
+  it("cleans up and settles when onEvent throws", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onEvent: async (event) => {
+        harness.events.push(event);
+        if (event.type === "assistant_message") {
+          throw new Error("event sink failed");
+        }
+      },
+    });
+
+    await connector.startTurn(harness.session, turnInput("codex", null));
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(getActiveTurn(harness.session)).toBeUndefined();
+  });
+
+  it("cleans up and settles when onNativeSessionId throws", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onNativeSessionId: async () => {
+        throw new Error("persist failed");
+      },
+    });
+
+    await expect(
+      withTimeout(connector.startTurn(harness.session, turnInput("codex", null)), 250),
+    ).rejects.toThrow(/persist failed|interrupted/i);
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(getActiveTurn(harness.session)).toBeUndefined();
+  });
+
+  it("cleans up and settles when onTerminal throws", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      killTimeoutMs: 50,
+    });
+    const callbackCapable = connector as AgentConnector & {
+      setTurnCallbacks?: (callbacks: {
+        onTerminal: (input: TerminalCall) => Promise<void>;
+      }) => void;
+    };
+    callbackCapable.setTurnCallbacks?.({
+      onTerminal: async () => {
+        throw new Error("terminal sink failed");
+      },
+    });
+
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+    await connector.startTurn(harness.session, turnInput("codex", null));
+
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(getActiveTurn(harness.session)).toBeUndefined();
+  });
+
+  it("escalates to SIGKILL when SIGTERM is ignored", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "ignore-sigterm",
+      },
+      killTimeoutMs: 50,
+    });
+
+    const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    expect(await connector.cancelTurn(started.session, started.nativeTurnId)).toEqual({
+      confirmed: true,
+    });
+    await waitForSettled(started.session);
+
+    const execCall = ctx.spawnCalls.find((call) => call.args[0] === "exec");
+    expect(execCall?.killSignals).toContain(undefined);
+    expect(execCall?.killSignals).toContain("SIGKILL");
   });
 
   it("throws UnsupportedCapabilityError for permission responses", async () => {
@@ -340,9 +549,7 @@ describe("native agent connectors", () => {
         env: fixtureEnv(ctx.recordPath),
       },
       opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: fixtureEnv(ctx.recordPath),
+        sdkAdapter: createOpenCodeSdkAdapter(),
       },
     });
 
@@ -386,12 +593,20 @@ function fixtureEnv(recordPath: string): NodeJS.ProcessEnv {
 
 function spawnRecorder(calls: SpawnCall[]) {
   return (command: string, args: string[], options: SpawnOptions): ChildProcess => {
+    const killSignals: Array<NodeJS.Signals | number | undefined> = [];
     calls.push({
       command,
       args: [...args],
       shell: options.shell === undefined ? undefined : Boolean(options.shell),
+      killSignals,
     });
-    return nodeSpawn(command, args, options);
+    const child = nodeSpawn(command, args, options);
+    const originalKill = child.kill.bind(child);
+    child.kill = ((signal?: NodeJS.Signals | number) => {
+      killSignals.push(signal);
+      return originalKill(signal);
+    }) as typeof child.kill;
+    return child;
   };
 }
 
@@ -419,31 +634,55 @@ async function startTurn(
   nativeSessionIds: Array<string | null>;
   nativeTurnId: string | null;
 }> {
+  const harness = await createSessionHarness(connector, id, projectPath, nativeSessionId);
+  const turn = await connector.startTurn(harness.session, turnInput(id, nativeSessionId));
+
+  return {
+    session: harness.session,
+    events: harness.events,
+    nativeSessionIds: harness.nativeSessionIds,
+    nativeTurnId: turn.nativeTurnId,
+  };
+}
+
+async function createSessionHarness(
+  connector: AgentConnector,
+  id: AgentProductId,
+  projectPath: string,
+  nativeSessionId: string | null,
+  overrides?: Pick<SessionInput, "onEvent" | "onNativeSessionId">,
+): Promise<{
+  session: LiveSession;
+  events: ConnectorEvent[];
+  nativeSessionIds: Array<string | null>;
+}> {
   const events: ConnectorEvent[] = [];
   const nativeSessionIds: Array<string | null> = [];
-  const sessionInput: SessionInput = {
+  const session = await connector.createOrResumeSession({
     projectPath,
     conversationId: `conversation-${id}`,
     nativeSessionId,
-    onEvent: async (event) => {
+    onEvent: overrides?.onEvent ?? (async (event) => {
       events.push(event);
-    },
-    onNativeSessionId: async (value) => {
+    }),
+    onNativeSessionId: overrides?.onNativeSessionId ?? (async (value) => {
       nativeSessionIds.push(value);
-    },
-  };
-  const session = await connector.createOrResumeSession(sessionInput);
-  const turn = await connector.startTurn(session, {
+    }),
+  });
+
+  return { session, events, nativeSessionIds };
+}
+
+function turnInput(id: AgentProductId, nativeSessionId: string | null) {
+  return {
     content: "say hello",
     snapshot: {
       modelId: null,
-      permissionMode: "help_me_approve",
+      permissionMode: "help_me_approve" as PermissionMode,
       pluginVersions: [],
     },
     turnId: `turn-${id}-${nativeSessionId ? "resume" : "start"}`,
-  });
-
-  return { session, events, nativeSessionIds, nativeTurnId: turn.nativeTurnId };
+  };
 }
 
 async function waitForSettled(session: LiveSession): Promise<void> {
@@ -464,4 +703,91 @@ function assertArgs(actual: string[], expected: string[] | ((args: string[]) => 
     return;
   }
   expect(actual).toEqual(expected);
+}
+
+function createDeferred<T>() {
+  let resolve!: (value: T | PromiseLike<T>) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}
+
+function sleep(ms: number): Promise<void> {
+  return new Promise((resolvePromise) => {
+    setTimeout(resolvePromise, ms);
+  });
+}
+
+async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
+  return Promise.race([
+    promise,
+    new Promise<T>((_resolvePromise, rejectPromise) => {
+      setTimeout(() => {
+        rejectPromise(new Error(`Timed out after ${ms}ms`));
+      }, ms);
+    }),
+  ]);
+}
+
+function getActiveTurn(session: LiveSession): unknown {
+  return (session as LiveSession & { activeTurn?: unknown }).activeTurn;
+}
+
+function createOpenCodeSdkAdapter() {
+  return {
+    async probe() {
+      return { status: "available" as const, version: "sdk-test" };
+    },
+    async fetchCatalog() {
+      return {
+        models: ["opencode-sdk-model"],
+        permissionModes: ["request_approval", "help_me_approve", "full_access"] as PermissionMode[],
+      };
+    },
+    async createOrResumeSession(input: SessionInput) {
+      return {
+        nativeSessionId: input.nativeSessionId ?? "sdk-session-opencode",
+      };
+    },
+    async startTurn(
+      _session: LiveSession,
+      _input: ReturnType<typeof turnInput>,
+      sink: {
+        emitEvent: (event: ConnectorEvent) => Promise<void>;
+        syncNativeSessionId: (nativeSessionId: string | null) => Promise<void>;
+        emitTerminal: (input: {
+          turnId: string | undefined;
+          nativeTurnId: string | null;
+          status: TerminalTurnStatus;
+          error?: NormalizedError;
+        }) => Promise<void>;
+      },
+    ) {
+      await sink.syncNativeSessionId("sdk-session-opencode");
+      await sink.emitEvent({
+        type: "assistant_message",
+        payload: { content: "hello from opencode sdk" },
+      });
+      const settled = (async () => {
+        await sink.emitTerminal({
+          turnId: "turn-opencode-start",
+          nativeTurnId: "sdk-turn-opencode",
+          status: "completed",
+        });
+      })();
+      return {
+        nativeTurnId: "sdk-turn-opencode",
+        settled,
+        async cancel() {
+          return true;
+        },
+        async close() {
+          await settled;
+        },
+      };
+    },
+  };
 }

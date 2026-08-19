@@ -59,7 +59,11 @@ export class CodexConnector extends CliJsonlConnector {
       args.push("--model", input.snapshot.modelId);
     }
     if (input.snapshot.permissionMode === "help_me_approve") {
-      args.push("--approve-for-me");
+      if (runtime.resume) {
+        args.push("-c", 'approvals_reviewer="auto_review"');
+      } else {
+        args.push("--approve-for-me");
+      }
     }
     if (input.snapshot.permissionMode === "full_access") {
       args.push("--dangerously-bypass-approvals-and-sandbox");
@@ -67,4 +71,3 @@ export class CodexConnector extends CliJsonlConnector {
     return args;
   }
 }
-

@@ -41,8 +41,19 @@ process.exit(0);
 async function runExec(productId, argv) {
   const scenario = process.env.AIN_FIXTURE_SCENARIO ?? "normal";
   const sessionId = sessionIdFor(productId, argv);
-  writeLine({ type: "session.started", session_id: sessionId });
-  writeLine({ type: "turn.started", turn_id: `native-turn-${productId}` });
+
+  if (scenario === "turn-before-session") {
+    writeLine({ type: "turn.started", turn_id: `native-turn-${productId}` });
+    await sleep(10);
+    writeLine({ type: "session.started", session_id: sessionId });
+  } else if (scenario === "missing-session-id") {
+    writeLine({ type: "turn.started", turn_id: `native-turn-${productId}` });
+  } else if (scenario === "missing-turn-id") {
+    writeLine({ type: "session.started", session_id: sessionId });
+  } else {
+    writeLine({ type: "session.started", session_id: sessionId });
+    writeLine({ type: "turn.started", turn_id: `native-turn-${productId}` });
+  }
 
   if (scenario === "cancel") {
     await new Promise((resolvePromise) => {
@@ -56,13 +67,39 @@ async function runExec(productId, argv) {
     return;
   }
 
+  if (scenario === "ignore-sigterm") {
+    await new Promise((resolvePromise) => {
+      process.on("SIGTERM", () => {
+        recordInvocation({ product: productId, commandType: "signal", signal: "SIGTERM" });
+      });
+      process.on("SIGINT", () => {
+        recordInvocation({ product: productId, commandType: "signal", signal: "SIGINT" });
+      });
+      setTimeout(resolvePromise, 5_000);
+    });
+    return;
+  }
+
   if (scenario === "malformed-json") {
     process.stdout.write('{"type":"message"\n');
   }
 
   writeLine({ type: "message", role: "assistant", content: `hello from ${productId}` });
   writeLine({ type: "reasoning", summary: `reasoning from ${productId}` });
-  writeLine({ type: "tool", tool_name: "search", status: "ok" });
+  writeLine(
+    scenario === "nested-secret-event"
+      ? {
+          type: "tool",
+          tool_name: "search",
+          status: "ok",
+          nested: {
+            bearer: "Bearer abc123",
+            apiKey: "sk-live-secret",
+            deeper: ["cookie=abc", { token: "token=def" }],
+          },
+        }
+      : { type: "tool", tool_name: "search", status: "ok" },
+  );
   writeLine({ type: "shell", command: "ls -la", exit_code: 0 });
   writeLine({ type: "file", path: "README.md", action: "write" });
   writeLine({ type: "usage", input_tokens: 10, output_tokens: 20 });
@@ -74,6 +111,12 @@ async function runExec(productId, argv) {
   }
 
   writeLine({ type: "turn.completed" });
+}
+
+function sleep(ms) {
+  return new Promise((resolvePromise) => {
+    setTimeout(resolvePromise, ms);
+  });
 }
 
 function versionFor(productId) {

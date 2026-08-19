@@ -2,10 +2,15 @@ import type { AgentProductId } from "../../shared/contracts.js";
 import { type BaseConnectorOptions } from "./base.js";
 import { ClaudeConnector } from "./claude.js";
 import { CodexConnector } from "./codex.js";
-import { OpenCodeConnector } from "./opencode.js";
+import { OpenCodeConnector, type OpenCodeConnectorOptions } from "./opencode.js";
 import { TraeConnector } from "./trae.js";
 
-export type ConnectorRegistryOptions = Partial<Record<AgentProductId, BaseConnectorOptions>>;
+export interface ConnectorRegistryOptions {
+  codex?: BaseConnectorOptions;
+  claude?: BaseConnectorOptions;
+  trae?: BaseConnectorOptions;
+  opencode?: OpenCodeConnectorOptions;
+}
 
 export function createConnectorRegistry(options: ConnectorRegistryOptions = {}) {
   return {
@@ -15,4 +20,3 @@ export function createConnectorRegistry(options: ConnectorRegistryOptions = {}) 
     opencode: new OpenCodeConnector(options.opencode),
   };
 }
-

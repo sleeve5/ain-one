@@ -1,67 +1,125 @@
-import type { AgentCatalog, AgentProbe, LiveSession, SessionInput, StartTurnInput } from "../../shared/contracts.js";
-import { BaseConnectorOptions, isMissingExecutableError, parseVersion } from "./base.js";
-import { CliJsonlConnector } from "./cli-jsonl.js";
+import type {
+  AgentCatalog,
+  AgentProbe,
+  ConnectorEvent,
+  LiveSession,
+  NormalizedError,
+  SessionInput,
+  StartTurnInput,
+  TerminalTurnStatus,
+} from "../../shared/contracts.js";
+import {
+  BaseConnector,
+  type ActiveTurnController,
+  type BaseConnectorOptions,
+  type RuntimeSession,
+  UnsupportedCapabilityError,
+} from "./base.js";
 
-export class OpenCodeConnector extends CliJsonlConnector {
+export interface OpenCodeSdkTurn extends ActiveTurnController {}
+
+export interface OpenCodeSdkAdapter {
+  probe(): Promise<AgentProbe>;
+  fetchCatalog(projectPath: string): Promise<AgentCatalog>;
+  createOrResumeSession(input: SessionInput): Promise<{ nativeSessionId: string | null }>;
+  startTurn(
+    session: LiveSession,
+    input: StartTurnInput,
+    sink: {
+      emitEvent: (event: ConnectorEvent) => Promise<void>;
+      syncNativeSessionId: (nativeSessionId: string | null) => Promise<void>;
+      emitTerminal: (input: {
+        turnId: string | undefined;
+        nativeTurnId: string | null;
+        status: TerminalTurnStatus;
+        error?: NormalizedError;
+      }) => Promise<void>;
+    },
+  ): Promise<OpenCodeSdkTurn>;
+}
+
+export interface OpenCodeConnectorOptions extends BaseConnectorOptions {
+  sdkAdapter?: OpenCodeSdkAdapter;
+}
+
+export class OpenCodeConnector extends BaseConnector {
   readonly id = "opencode" as const;
+  private readonly sdkAdapter?: OpenCodeSdkAdapter;
+
+  constructor(options: OpenCodeConnectorOptions = {}) {
+    super(options);
+    this.sdkAdapter = options.sdkAdapter;
+  }
 
   protected defaultExecutable(): string {
     return "opencode";
   }
 
   async probe(): Promise<AgentProbe> {
-    try {
-      const result = await this.runCommand({ args: ["--version"] });
-      if (result.exitCode !== 0) {
-        return { status: "runtime_error", diagnostic: result.stderr.trim() || result.stdout.trim() };
-      }
+    if (!this.sdkAdapter) {
       return {
-        status: "capability_limited",
-        version: parseVersion(result.stdout),
-        diagnostic: "OpenCode CLI transport is available, but permission replies and plugin workflows are not implemented",
-      };
-    } catch (error) {
-      if (isMissingExecutableError(error)) {
-        return { status: "not_installed" };
-      }
-      return {
-        status: "runtime_error",
-        diagnostic: error instanceof Error ? error.message : "Failed to probe opencode",
+        status: "not_installed",
+        diagnostic: "@opencode-ai/sdk is not installed",
       };
     }
+    return this.sdkAdapter.probe();
   }
 
-  async fetchCatalog(_projectPath: string): Promise<AgentCatalog> {
-    return {
-      models: [],
-      permissionModes: ["request_approval", "help_me_approve", "full_access"],
-    };
+  async fetchCatalog(projectPath: string): Promise<AgentCatalog> {
+    if (!this.sdkAdapter) {
+      return {
+        models: [],
+        permissionModes: [],
+      };
+    }
+    return this.sdkAdapter.fetchCatalog(projectPath);
   }
 
   async createOrResumeSession(input: SessionInput): Promise<LiveSession> {
-    return this.createRuntimeSession(input);
+    const runtime = this.createRuntimeSession(input);
+    if (!this.sdkAdapter) {
+      return runtime;
+    }
+
+    const session = await this.sdkAdapter.createOrResumeSession(input);
+    runtime.nativeSessionId = session.nativeSessionId;
+    return runtime;
   }
 
-  protected buildStartArgs(session: LiveSession, input: StartTurnInput): string[] {
+  async startTurn(session: LiveSession, input: StartTurnInput): Promise<{ nativeTurnId: string | null }> {
+    if (!this.sdkAdapter) {
+      throw new UnsupportedCapabilityError(
+        "opencode_sdk",
+        "@opencode-ai/sdk is required to start OpenCode sessions",
+      );
+    }
+
     const runtime = this.asRuntimeSession(session);
-    const args = runtime.nativeSessionId
-      ? ["exec", "resume", runtime.nativeSessionId, "--json"]
-      : ["exec", "--json"];
-
-    if (input.snapshot.modelId) {
-      args.push("--model", input.snapshot.modelId);
-    }
-    if (input.snapshot.permissionMode === "help_me_approve") {
-      args.push("--permission-mode", "auto");
-    }
-    if (input.snapshot.permissionMode === "request_approval") {
-      args.push("--permission-mode", "default");
-    }
-    if (input.snapshot.permissionMode === "full_access") {
-      args.push("--permission-mode", "bypass_permissions");
+    if (runtime.activeTurn) {
+      const error = new Error("Turn already active") as Error & { definiteStartRejection?: boolean };
+      error.definiteStartRejection = true;
+      throw error;
     }
 
-    return args;
+    const activeTurn = await this.sdkAdapter.startTurn(session, input, {
+      emitEvent: async (event) => {
+        await this.emitEvent(runtime, event);
+      },
+      syncNativeSessionId: async (nativeSessionId) => {
+        await this.syncNativeSessionId(runtime, nativeSessionId);
+      },
+      emitTerminal: async (terminal) => {
+        await this.emitTerminal(runtime, terminal);
+      },
+    });
+
+    runtime.activeTurn = activeTurn;
+    runtime.settled = activeTurn.settled.finally(() => {
+      if (runtime.activeTurn?.settled === activeTurn.settled) {
+        delete runtime.activeTurn;
+      }
+    });
+
+    return { nativeTurnId: activeTurn.nativeTurnId };
   }
 }
-

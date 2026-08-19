@@ -59,6 +59,8 @@ export interface RuntimeSession extends LiveSession {
   closePromise?: Promise<void>;
 }
 
+type JsonLike = null | boolean | number | string | JsonLike[] | { [key: string]: JsonLike };
+
 export class UnsupportedCapabilityError extends Error {
   readonly code = "UNSUPPORTED_CAPABILITY";
 
@@ -171,7 +173,17 @@ export abstract class BaseConnector implements AgentConnector {
   }
 
   protected async emitEvent(session: RuntimeSession, event: ConnectorEvent): Promise<void> {
-    await session.onEvent?.(event);
+    if (!session.onEvent) {
+      return;
+    }
+    try {
+      await session.onEvent({
+        type: event.type,
+        payload: deepRedactStrings(event.payload) as Record<string, unknown>,
+      });
+    } catch {
+      return;
+    }
   }
 
   protected async emitTerminal(
@@ -186,13 +198,24 @@ export abstract class BaseConnector implements AgentConnector {
     if (!this.callbacks || !input.turnId) {
       return;
     }
-    await this.callbacks.onTerminal({
-      conversationId: session.id,
-      turnId: input.turnId,
-      nativeTurnId: input.nativeTurnId,
-      status: input.status,
-      error: input.error,
-    });
+    try {
+      const sanitizedError = input.error
+        ? (deepRedactStrings(input.error as JsonLike) as {
+            code: string;
+            message: string;
+            details?: Record<string, unknown>;
+          })
+        : undefined;
+      await this.callbacks.onTerminal({
+        conversationId: redactSecrets(session.id),
+        turnId: redactSecrets(input.turnId),
+        nativeTurnId: input.nativeTurnId ? redactSecrets(input.nativeTurnId) : null,
+        status: input.status,
+        error: sanitizedError,
+      });
+    } catch {
+      return;
+    }
   }
 
   protected async syncNativeSessionId(
@@ -329,4 +352,19 @@ export function truncateText(input: string, maxChars: number): string {
     return input;
   }
   return `${input.slice(0, maxChars)}...`;
+}
+
+export function deepRedactStrings<T>(value: T): T {
+  if (typeof value === "string") {
+    return redactSecrets(value) as T;
+  }
+  if (Array.isArray(value)) {
+    return value.map((entry) => deepRedactStrings(entry)) as T;
+  }
+  if (value && typeof value === "object") {
+    return Object.fromEntries(
+      Object.entries(value).map(([key, entry]) => [key, deepRedactStrings(entry)]),
+    ) as T;
+  }
+  return value;
 }

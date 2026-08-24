@@ -1,4 +1,4 @@
-import { mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
+import { existsSync, mkdtempSync, mkdirSync, readFileSync, rmSync, writeFileSync } from "node:fs";
 import { spawn as nodeSpawn, type ChildProcess, type SpawnOptions } from "node:child_process";
 import { EventEmitter } from "node:events";
 import { tmpdir } from "node:os";
@@ -39,6 +39,7 @@ type SpawnCall = {
   command: string;
   args: string[];
   shell: boolean | undefined;
+  detached: boolean | undefined;
   killSignals: Array<NodeJS.Signals | number | undefined>;
 };
 
@@ -1337,8 +1338,9 @@ describe("native agent connectors", () => {
     );
   });
 
-  it("cleans up and settles when onEvent throws", async () => {
+  it("fails the Turn when event persistence throws", async () => {
     const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
     const connector = new CodexConnector({
       executable: fixtureBinary("fake-codex.mjs"),
       spawn: spawnRecorder(ctx.spawnCalls),
@@ -1346,10 +1348,13 @@ describe("native agent connectors", () => {
       env: fixtureEnv(ctx.recordPath),
       killTimeoutMs: 50,
     });
+    setTurnCallbacks(connector, terminalCalls);
+    let failed = false;
     const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
       onEvent: async (event) => {
         harness.events.push(event);
-        if (event.type === "assistant_message") {
+        if (!failed && event.type === "assistant_message") {
+          failed = true;
           throw new Error("event sink failed");
         }
       },
@@ -1358,6 +1363,21 @@ describe("native agent connectors", () => {
     await connector.startTurn(harness.session, turnInput("codex", null));
     await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
     expect(getActiveTurn(harness.session)).toBeUndefined();
+    expect(terminalCalls).toEqual([
+      expect.objectContaining({
+        status: "interrupted",
+        error: expect.objectContaining({
+          code: "event_processing_failed",
+          message: "event sink failed",
+        }),
+      }),
+    ]);
+    expect(harness.events).not.toContainEqual(
+      expect.objectContaining({
+        type: "warning",
+        payload: expect.objectContaining({ code: "malformed_json" }),
+      }),
+    );
   });
 
   it("cleans up and settles when onNativeSessionId throws", async () => {
@@ -1384,10 +1404,10 @@ describe("native agent connectors", () => {
     await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
     expect(getActiveTurn(harness.session)).toBeUndefined();
     const execCall = ctx.spawnCalls.find((call) => call.args[0] === "exec");
-    expect(execCall?.killSignals).toContain(undefined);
+    expect(execCall?.detached).toBe(process.platform !== "win32");
   });
 
-  it("retries terminal persistence before publishing status or settling", async () => {
+  it("publishes terminal status before invoking the terminal callback", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({
       executable: fixtureBinary("fake-codex.mjs"),
@@ -1406,7 +1426,7 @@ describe("native agent connectors", () => {
     callbackCapable.setTurnCallbacks?.({
       onTerminal: async () => {
         attempts += 1;
-        expect(publishedEvents.some((event) => event.type === "turn_status")).toBe(false);
+        expect(publishedEvents.some((event) => event.type === "turn_status")).toBe(true);
         if (attempts === 1) {
           throw new Error("terminal sink failed once");
         }
@@ -1449,7 +1469,7 @@ describe("native agent connectors", () => {
       "terminal persistence unavailable",
     );
     expect(getActiveTurn(harness.session)).toBeDefined();
-    expect(harness.events.some((event) => event.type === "turn_status")).toBe(false);
+    expect(harness.events.filter((event) => event.type === "turn_status")).toHaveLength(1);
   });
 
   it("reports a non-zero exit before native identity only as interrupted", async () => {
@@ -1493,14 +1513,49 @@ describe("native agent connectors", () => {
     });
 
     const started = await startTurn(connector, "codex", ctx.projectPath, null);
-    expect(await connector.cancelTurn(started.session, started.nativeTurnId)).toEqual({
-      confirmed: true,
-    });
+    await waitForRecord(ctx.recordPath, "signal-ready", 250);
+    await expect(
+      withTimeout(connector.cancelTurn(started.session, started.nativeTurnId), 500),
+    ).resolves.toEqual({ confirmed: true });
     await waitForSettled(started.session);
 
     const execCall = ctx.spawnCalls.find((call) => call.args[0] === "exec");
-    expect(execCall?.killSignals).toContain(undefined);
-    expect(execCall?.killSignals).toContain("SIGKILL");
+    expect(execCall?.detached).toBe(process.platform !== "win32");
+    expect(readRecords(ctx.recordPath)).toContainEqual(
+      expect.objectContaining({ commandType: "signal", signal: "SIGTERM" }),
+    );
+  });
+
+  it("terminates CLI descendants when cancelling", async () => {
+    const ctx = createFixtureContext();
+    const descendantPidPath = join(ctx.root, "descendant.pid");
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "descendant",
+        AIN_FIXTURE_DESCENDANT_PID_PATH: descendantPidPath,
+      },
+      killTimeoutMs: 50,
+    });
+
+    const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    await waitForFile(descendantPidPath, 250);
+    const descendantPid = Number(readFileSync(descendantPidPath, "utf8"));
+
+    try {
+      await expect(
+        withTimeout(connector.cancelTurn(started.session, started.nativeTurnId), 500),
+      ).resolves.toEqual({ confirmed: true });
+      await waitForSettled(started.session);
+      expect(await waitForProcessExit(descendantPid, 250)).toBe(true);
+    } finally {
+      if (isProcessAlive(descendantPid)) {
+        process.kill(descendantPid, "SIGKILL");
+      }
+    }
   });
 
   it("escalates graceful CLI shutdown to SIGKILL when SIGTERM is ignored", async () => {
@@ -1516,10 +1571,14 @@ describe("native agent connectors", () => {
       killTimeoutMs: 50,
     });
     const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    await waitForRecord(ctx.recordPath, "signal-ready", 250);
 
     await expect(withTimeout(connector.closeSession(started.session), 500)).resolves.toBeUndefined();
-    expect(ctx.spawnCalls.find((call) => call.args[0] === "exec")?.killSignals).toEqual(
-      expect.arrayContaining([undefined, "SIGKILL"]),
+    expect(ctx.spawnCalls.find((call) => call.args[0] === "exec")?.detached).toBe(
+      process.platform !== "win32",
+    );
+    expect(readRecords(ctx.recordPath)).toContainEqual(
+      expect.objectContaining({ commandType: "signal", signal: "SIGTERM" }),
     );
   });
 
@@ -1550,8 +1609,9 @@ describe("native agent connectors", () => {
     );
   });
 
-  it("keeps a completed native process cancellable until it actually exits", async () => {
+  it("does not let late cancellation overwrite native completion", async () => {
     const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
     const connector = new CodexConnector({
       executable: fixtureBinary("fake-codex.mjs"),
       spawn: spawnRecorder(ctx.spawnCalls),
@@ -1562,16 +1622,18 @@ describe("native agent connectors", () => {
       },
       killTimeoutMs: 50,
     });
+    setTurnCallbacks(connector, terminalCalls);
 
     const started = await startTurn(connector, "codex", ctx.projectPath, null);
     await sleep(50);
     expect(getActiveTurn(started.session)).toBeDefined();
 
     expect(await connector.cancelTurn(started.session, started.nativeTurnId)).toEqual({
-      confirmed: true,
+      confirmed: false,
     });
     await waitForSettled(started.session);
     expect(getActiveTurn(started.session)).toBeUndefined();
+    expect(terminalCalls).toEqual([expect.objectContaining({ status: "completed" })]);
   });
 
   it("throws UnsupportedCapabilityError for permission responses", async () => {
@@ -1661,6 +1723,7 @@ function spawnRecorder(calls: SpawnCall[]) {
       command,
       args: [...args],
       shell: options.shell === undefined ? undefined : Boolean(options.shell),
+      detached: options.detached === undefined ? undefined : Boolean(options.detached),
       killSignals,
     });
     const child = nodeSpawn(command, args, options);
@@ -1804,6 +1867,43 @@ function sleep(ms: number): Promise<void> {
   return new Promise((resolvePromise) => {
     setTimeout(resolvePromise, ms);
   });
+}
+
+async function waitForFile(path: string, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!existsSync(path)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${path}`);
+    }
+    await sleep(10);
+  }
+}
+
+async function waitForRecord(path: string, commandType: string, ms: number): Promise<void> {
+  const deadline = Date.now() + ms;
+  while (!readRecords(path).some((record) => record.commandType === commandType)) {
+    if (Date.now() >= deadline) {
+      throw new Error(`Timed out waiting for ${commandType}`);
+    }
+    await sleep(10);
+  }
+}
+
+async function waitForProcessExit(pid: number, ms: number): Promise<boolean> {
+  const deadline = Date.now() + ms;
+  while (isProcessAlive(pid) && Date.now() < deadline) {
+    await sleep(10);
+  }
+  return !isProcessAlive(pid);
+}
+
+function isProcessAlive(pid: number): boolean {
+  try {
+    process.kill(pid, 0);
+    return true;
+  } catch (error) {
+    return (error as NodeJS.ErrnoException).code === "EPERM";
+  }
 }
 
 async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {

@@ -68,6 +68,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
       child = this.spawn(this.executable, input.args, {
         cwd: input.session.projectPath,
         env: { ...process.env, ...this.env },
+        detached: process.platform !== "win32",
         shell: false,
         stdio: ["pipe", "pipe", "pipe"],
       });
@@ -145,12 +146,6 @@ export abstract class CliJsonlConnector extends BaseConnector {
         error: effectiveError,
       };
       try {
-        try {
-          await this.emitTerminal(input.session, terminal);
-        } catch {
-          await this.emitTerminal(input.session, terminal);
-        }
-        terminalSent = true;
         await this.emitEvent(input.session, {
           type: "turn_status",
           payload: {
@@ -160,6 +155,12 @@ export abstract class CliJsonlConnector extends BaseConnector {
             error: effectiveError,
           },
         });
+        try {
+          await this.emitTerminal(input.session, terminal);
+        } catch {
+          await this.emitTerminal(input.session, terminal);
+        }
+        terminalSent = true;
       } catch (error) {
         settledReject(error);
         return;
@@ -200,10 +201,10 @@ export abstract class CliJsonlConnector extends BaseConnector {
       if (child.exitCode !== null || child.signalCode !== null) {
         return;
       }
-      child.kill();
+      this.killProcessTree(child);
       killTimer ??= setTimeout(() => {
         if (!terminalSent) {
-          child.kill("SIGKILL");
+          this.killProcessTree(child, "SIGKILL");
         }
       }, this.killTimeoutMs);
     };
@@ -221,6 +222,11 @@ export abstract class CliJsonlConnector extends BaseConnector {
 
     const cancelTurn = async (): Promise<boolean> => {
       if (terminalSent) {
+        await settled;
+        return false;
+      }
+      if (nativeTerminal) {
+        stopChild();
         await settled;
         return false;
       }
@@ -296,9 +302,9 @@ export abstract class CliJsonlConnector extends BaseConnector {
           continue;
         }
         queue(async () => {
+          let event: unknown;
           try {
-            const event = JSON.parse(line) as unknown;
-            await input.mapEvent(event, context);
+            event = JSON.parse(line) as unknown;
           } catch {
             await context.emit({
               type: "warning",
@@ -307,7 +313,9 @@ export abstract class CliJsonlConnector extends BaseConnector {
                 line: truncateText(redactSecrets(line), 200),
               },
             });
+            return;
           }
+          await input.mapEvent(event, context);
         });
       }
     });
@@ -350,13 +358,13 @@ export abstract class CliJsonlConnector extends BaseConnector {
           return;
         }
 
-        if (cancelled) {
-          await finalize("cancelled");
+        if (nativeTerminal) {
+          await finalize(nativeTerminal.status, nativeTerminal.error);
           return;
         }
 
-        if (nativeTerminal) {
-          await finalize(nativeTerminal.status, nativeTerminal.error);
+        if (cancelled) {
+          await finalize("cancelled");
           return;
         }
 

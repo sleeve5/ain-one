@@ -179,14 +179,10 @@ export abstract class BaseConnector implements AgentConnector {
     if (!session.onEvent) {
       return;
     }
-    try {
-      await session.onEvent({
-        type: event.type,
-        payload: deepRedactStrings(event.payload) as Record<string, unknown>,
-      });
-    } catch {
-      return;
-    }
+    await session.onEvent({
+      type: event.type,
+      payload: deepRedactStrings(event.payload) as Record<string, unknown>,
+    });
   }
 
   protected async emitTerminal(
@@ -236,6 +232,23 @@ export abstract class BaseConnector implements AgentConnector {
     await session.onNativeSessionId?.(nextNativeSessionId);
   }
 
+  protected killProcessTree(
+    child: ChildProcess,
+    signal: NodeJS.Signals = "SIGTERM",
+  ): boolean {
+    if (process.platform !== "win32" && child.pid) {
+      try {
+        process.kill(-child.pid, signal);
+        return true;
+      } catch (error) {
+        if ((error as NodeJS.ErrnoException).code === "ESRCH") {
+          return true;
+        }
+      }
+    }
+    return child.kill(signal);
+  }
+
   protected newSessionUuid(): string {
     return randomUUID();
   }
@@ -250,6 +263,7 @@ export abstract class BaseConnector implements AgentConnector {
     const child = this.spawn(this.executable, input.args, {
       cwd: input.cwd,
       env: { ...process.env, ...this.env },
+      detached: process.platform !== "win32",
       shell: false,
       stdio: ["pipe", "pipe", "pipe"],
     });
@@ -266,7 +280,7 @@ export abstract class BaseConnector implements AgentConnector {
       const remaining = maxBytes - totalBytes;
       if (remaining <= 0) {
         truncated = true;
-        child.kill();
+        this.killProcessTree(child);
         return;
       }
       const portion = chunk.subarray(0, remaining);
@@ -274,7 +288,7 @@ export abstract class BaseConnector implements AgentConnector {
       totalBytes += portion.length;
       if (portion.length < chunk.length) {
         truncated = true;
-        child.kill();
+        this.killProcessTree(child);
       }
     };
 
@@ -285,8 +299,8 @@ export abstract class BaseConnector implements AgentConnector {
     let killTimer: NodeJS.Timeout | null = null;
     const timeout = setTimeout(() => {
       timeoutError = new Error(`Command timed out after ${this.commandTimeoutMs}ms`);
-      child.kill("SIGTERM");
-      killTimer = setTimeout(() => child.kill("SIGKILL"), this.killTimeoutMs);
+      this.killProcessTree(child);
+      killTimer = setTimeout(() => this.killProcessTree(child, "SIGKILL"), this.killTimeoutMs);
     }, this.commandTimeoutMs);
     const close = new Promise<number>((resolvePromise, rejectPromise) => {
       child.once("error", (error) => {

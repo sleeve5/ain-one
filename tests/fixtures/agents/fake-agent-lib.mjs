@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
 import { appendFileSync, existsSync } from "node:fs";
+import { spawn } from "node:child_process";
 import { createServer } from "node:http";
 import { basename } from "node:path";
 
@@ -196,7 +197,24 @@ async function runExec(productId, argv) {
     return;
   }
 
+  if (scenario === "descendant") {
+    const pidPath = process.env.AIN_FIXTURE_DESCENDANT_PID_PATH;
+    if (!pidPath) {
+      throw new Error("AIN_FIXTURE_DESCENDANT_PID_PATH is required for descendant");
+    }
+    const descendant = spawn(process.execPath, ["-e", "setInterval(() => {}, 1000)"], {
+      stdio: "ignore",
+    });
+    appendFileSync(pidPath, String(descendant.pid));
+    await new Promise((resolvePromise) => {
+      process.on("SIGTERM", resolvePromise);
+      process.on("SIGINT", resolvePromise);
+    });
+    return;
+  }
+
   if (scenario === "ignore-sigterm") {
+    recordInvocation({ product: productId, commandType: "signal-ready" });
     await new Promise((resolvePromise) => {
       process.on("SIGTERM", () => {
         recordInvocation({ product: productId, commandType: "signal", signal: "SIGTERM" });

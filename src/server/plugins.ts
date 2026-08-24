@@ -258,6 +258,9 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
           ...mapInstalled(version),
           compatibleAgents: Object.keys(version.compatibility)
             .filter(isAgentProductId)
+            .filter((agentProductId) =>
+              isDispatchableCompatibility(version.compatibility[agentProductId]),
+            )
             .sort(),
           materializations: materializationStatuses(version, metadata, options.skillRoots),
         }))
@@ -351,7 +354,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
         .filter((plugin) => {
           const version = getStoredVersion(metadata, plugin.pluginId, plugin.versionId);
           const compatibility = version?.compatibility[input.agentProductId];
-          return isSkillCompatibility(compatibility) || isMcpCompatibility(compatibility);
+          return isDispatchableCompatibility(compatibility);
         })
         .sort((left, right) => left.pluginId.localeCompare(right.pluginId));
     },
@@ -772,6 +775,9 @@ function materializeTransaction(input: {
       if (!isMcpCompatibility(compatibility)) {
         throw new Error(`plugin ${plugin.pluginId} not compatible with ${input.agentProductId}`);
       }
+      if (!isDispatchableCompatibility(compatibility)) {
+        throw new Error("MCP secret configuration is not available in Phase 1");
+      }
       assertNoRawSecretFields(compatibility.server, []);
       mcpServers.push({
         pluginId: plugin.pluginId,
@@ -1173,6 +1179,9 @@ function materializationStatuses(
 ): PluginMaterializationStatus[] {
   return Object.keys(version.compatibility)
     .filter(isAgentProductId)
+    .filter((agentProductId) =>
+      isDispatchableCompatibility(version.compatibility[agentProductId]),
+    )
     .sort()
     .map((agentProductId) => {
       const compatibility = version.compatibility[agentProductId];
@@ -1318,6 +1327,23 @@ function isMcpCompatibility(
   );
 }
 
+function isDispatchableCompatibility(
+  compatibility: CompatibilitySpec | undefined,
+): boolean {
+  return isSkillCompatibility(compatibility) ||
+    (isMcpCompatibility(compatibility) && !containsSecretRef(compatibility.server));
+}
+
+function containsSecretRef(value: unknown): boolean {
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  if (isExactSecretRefObject(value)) {
+    return true;
+  }
+  return (Array.isArray(value) ? value : Object.values(value)).some(containsSecretRef);
+}
+
 function isEchoManagedSymlink(
   agentProductId: AgentProductId,
   pathValue: string,
@@ -1387,9 +1413,10 @@ function assertNoRawSecretFields(value: unknown, pathParts: string[]): void {
 }
 
 function isSensitiveKey(key: string): boolean {
-  return new Set([
+  return [
     "authorization",
     "proxyauthorization",
+    "accesskey",
     "accesstoken",
     "refreshtoken",
     "clientsecret",
@@ -1401,7 +1428,7 @@ function isSensitiveKey(key: string): boolean {
     "apikey",
     "token",
     "secret",
-  ]).has(key);
+  ].some((suffix) => key.endsWith(suffix));
 }
 
 function isExactSecretRefObject(value: unknown): value is { secretRef: string } {
@@ -1562,7 +1589,10 @@ function isProcessAlive(pid: number): boolean {
 function atomicWriteJson(pathValue: string, value: unknown, durable = false): void {
   mkdirSync(dirname(pathValue), { recursive: true });
   const temporary = `${pathValue}.tmp-${randomUUID()}`;
-  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, {
+    encoding: "utf8",
+    mode: 0o600,
+  });
   if (durable) {
     const descriptor = openSync(temporary, constants.O_RDONLY);
     try {

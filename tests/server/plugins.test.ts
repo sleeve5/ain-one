@@ -10,6 +10,7 @@ import {
   realpathSync,
   renameSync,
   rmSync,
+  statSync,
   symlinkSync,
   writeFileSync,
 } from "node:fs";
@@ -1205,6 +1206,30 @@ describe("plugin hub", () => {
     await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("raw secret");
   });
 
+  it("rejects raw vendor-prefixed API keys", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const mcpPath = join(root, "prefixed-secret-mcp.json");
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({
+        format: "ain-one.mcp.v1",
+        pluginId: "prefixed-secret-mcp",
+        compatibility: {
+          codex: {
+            kind: "mcp",
+            target: "codex.mcp.v1",
+            server: { command: "node", env: { OPENAI_API_KEY: "RAW-SECRET" } },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("raw secret");
+  });
+
   it("recurses through non-exact secretRef objects and rejects nested fallback secrets", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
@@ -1306,7 +1331,7 @@ describe("plugin hub", () => {
     await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("invalid secretRef");
   });
 
-  it("allows secretRef objects and never persists raw secret strings", async () => {
+  it("stores secretRef metadata but keeps the version unavailable until secrets can resolve", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
     const localRoot = join(root, "local");
@@ -1342,15 +1367,60 @@ describe("plugin hub", () => {
 
     const hub = createPluginHub({ dataDir, skillRoots: {} });
     const installed = await hub.installLocal({ path: mcpPath });
+    expect(hub.listInstalled()).toEqual([
+      expect.objectContaining({
+        pluginId: installed.pluginId,
+        compatibleAgents: [],
+      }),
+    ]);
+    await expect(
+      hub.materialize(
+        "codex",
+        [{ pluginId: installed.pluginId, versionId: installed.versionId }],
+        { turnId: "no-raw-secret-turn" },
+      ),
+    ).rejects.toThrow("secret configuration is not available");
+
+    expect(
+      hub.resolveForTurn({
+        agentProductId: "codex",
+        global: [{ pluginId: installed.pluginId, versionId: installed.versionId }],
+      }),
+    ).toEqual([]);
+
+    const metadataText = readFileSync(join(dataDir, "plugins.metadata.json"), "utf8");
+    expect(metadataText.includes("opaque-ref-1")).toBe(true);
+    expect(metadataText.includes("RAW-SECRET")).toBe(false);
+  });
+
+  it("writes ordinary per-Turn MCP artifacts with owner-only permissions", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const mcpPath = join(root, "plain-mcp.json");
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({
+        format: "ain-one.mcp.v1",
+        pluginId: "plain-mcp",
+        compatibility: {
+          codex: {
+            kind: "mcp",
+            target: "codex.mcp.v1",
+            server: { command: "node", args: ["server.js"] },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    const installed = await hub.installLocal({ path: mcpPath });
     const materialized = await hub.materialize(
       "codex",
       [{ pluginId: installed.pluginId, versionId: installed.versionId }],
-      { turnId: "no-raw-secret-turn" },
+      { turnId: "owner-only-turn" },
     );
 
-    const metadataText = readFileSync(join(dataDir, "plugins.metadata.json"), "utf8");
-    const artifactText = readFileSync(materialized.turnArtifactPath!, "utf8");
-    expect(metadataText.includes("RAW-SECRET")).toBe(false);
-    expect(artifactText.includes("RAW-SECRET")).toBe(false);
+    expect(statSync(materialized.turnArtifactPath!).mode & 0o777).toBe(0o600);
   });
 });

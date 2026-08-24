@@ -312,6 +312,7 @@ export function App(props: AppProps) {
     if (!conversation) {
       return;
     }
+    pendingWorkspaceSelection.current = null;
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
@@ -330,6 +331,7 @@ export function App(props: AppProps) {
     const conversation =
       state.workspace.conversations.find((item) => item.projectId === projectId) ?? null;
 
+    pendingWorkspaceSelection.current = null;
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,

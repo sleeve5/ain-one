@@ -489,6 +489,72 @@ describe("web app", () => {
     );
   });
 
+  it("does not restore a pending target after the user selects another Conversation", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ twoProjects: true });
+    const initial = await api.loadWorkspace();
+    const created: Conversation = {
+      id: "conv-new",
+      projectId: "project-1",
+      agentProductId: "codex",
+      modelId: "gpt-5",
+      permissionMode: "request_approval",
+      queuePaused: false,
+      createdAt: "2026-08-24T00:00:00.000Z",
+      updatedAt: "2026-08-24T00:00:00.000Z",
+    };
+    const refreshed: WorkspaceState = {
+      ...initial,
+      conversations: [
+        ...initial.conversations,
+        {
+          ...initial.conversation!,
+          id: created.id,
+          title: "New Conversation",
+          events: [],
+          queuedMessages: [],
+        },
+      ],
+    };
+    const targetedRefresh = deferred<WorkspaceState>();
+    const terminalRefresh = deferred<WorkspaceState>();
+    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
+    api.createConversation = async () => created;
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockImplementationOnce(async () => targetedRefresh.promise)
+      .mockImplementationOnce(async () => terminalRefresh.promise);
+    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
+      onEvent = callback;
+      return () => undefined;
+    };
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Create Conversation" }));
+    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "Conversation Two" }));
+    onEvent({
+      id: "event-background-terminal-after-navigation",
+      conversationId: "conv-1",
+      sequence: 1,
+      type: "turn_status",
+      payload: { turnId: "turn-background", status: "completed" },
+      createdAt: "2026-08-24T00:00:00.000Z",
+    });
+    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(3));
+
+    await act(async () => terminalRefresh.resolve(refreshed));
+    expect(screen.getByRole("button", { name: "Conversation Two" })).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+    await act(async () => targetedRefresh.resolve(refreshed));
+    expect(screen.getByRole("button", { name: "Conversation Two" })).toHaveAttribute(
+      "data-active",
+      "true",
+    );
+  });
+
   it("submits Conversation creation only once while the request is in flight", async () => {
     const user = userEvent.setup();
     const created = deferred<Conversation>();

@@ -515,9 +515,12 @@ export function App(props: AppProps) {
             selectedProjectId={state.workspace.selectedProjectId}
             selectedConversationId={state.workspace.selectedConversationId}
             agents={state.workspace.agents}
-            onOpenProject={async (path) => {
+            onOpenProject={async () => {
               try {
-                const project = await props.api.openProject(path);
+                const project = await props.api.pickProject();
+                if (!project) {
+                  return;
+                }
                 if (await loadWorkspace({ projectId: project.id })) {
                   await loadInspector(project.id);
                   clearActionError();

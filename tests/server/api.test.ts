@@ -1,5 +1,5 @@
 import { randomUUID } from "node:crypto";
-import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, realpathSync, rmSync, writeFileSync } from "node:fs";
 import { Agent, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
@@ -102,6 +102,7 @@ async function createFixture(input?: {
     models: string[];
     permissionModes: Array<"request_approval" | "help_me_approve" | "full_access">;
   };
+  pickProjectDirectory?: () => Promise<string | null>;
 }) {
   const projectPath = mkdtempSync(join(tmpdir(), "ain-one-task3-api-"));
   tempDirs.push(projectPath);
@@ -150,6 +151,7 @@ async function createFixture(input?: {
         throw new InputError(400, "plugin_version_not_found", "Plugin version not found");
       }
     },
+    pickProjectDirectory: input?.pickProjectDirectory,
     bodyLimitBytes: input?.bodyLimitBytes,
     ssePollMs: 5,
     sseHeartbeatMs: 50,
@@ -302,6 +304,36 @@ describe("loopback api", () => {
     } finally {
       await api.stop();
       db.close();
+    }
+  });
+
+  it("opens a Project selected by the native folder picker and treats cancellation as a no-op", async () => {
+    const selectedPath = mkdtempSync(join(tmpdir(), "ain-one-picked-project-"));
+    tempDirs.push(selectedPath);
+    const selections = [selectedPath, null];
+    const fixture = await createFixture({
+      pickProjectDirectory: async () => selections.shift() ?? null,
+    });
+    try {
+      const opened = await fixture.request("/api/projects/pick", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(opened.status).toBe(201);
+      expect(await readJson(opened)).toMatchObject({
+        project: { path: realpathSync(selectedPath) },
+      });
+
+      const cancelled = await fixture.request("/api/projects/pick", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(cancelled.status).toBe(200);
+      expect(await readJson(cancelled)).toEqual({ project: null });
+    } finally {
+      await fixture.stop();
     }
   });
 

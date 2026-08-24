@@ -247,7 +247,7 @@ Expected: FAIL because API and file services do not exist.
 
 - [ ] **Step 3: Implement loopback API and SSE**
 
-Use `node:http`. Reject non-loopback binding, missing/incorrect bearer tokens, and disallowed `Origin` values. Implement Projects, Conversations, queue submit/delete, permission response, Turn cancel, settings/catalog, events, plugins, file tree, preview, Git status, and Git diff routes. Serve SSE with `id: <sequence>` and heartbeat comments.
+Use `node:http`. Reject non-loopback binding, missing/incorrect bearer tokens, and disallowed `Origin` values. Implement Projects, a macOS native folder-picker command, Conversations, queue submit/delete, permission response, Turn cancel, settings/catalog, events, plugins, file tree, preview, Git status, and Git diff routes. Serve SSE with `id: <sequence>` and heartbeat comments.
 
 - [ ] **Step 4: Implement safe file and Git inspection**
 
@@ -424,7 +424,7 @@ Use a warm neutral palette, expressive serif headings with a compact monospace a
 
 - [ ] **Step 5: Implement Conversation and inspector behavior**
 
-Render messages, reasoning, tools, shell, file changes, approval requests, errors, and Turn state. The composer queues during active work. Show pending messages with delete actions. Disable Agent/model/permission/plugin controls while active. Inspector shows file tree, read-only preview, Git status, and diff.
+Render messages, reasoning, tools, shell, file changes, approval requests, errors, and Turn state. Open Projects through a native folder-picker button rather than a typed path. The composer queues during active work. Show pending messages with delete actions. Disable Agent/model/permission/plugin controls while active. Inspector shows file tree, read-only preview, Git status, and diff.
 
 - [ ] **Step 6: Run Web tests, accessibility checks, and build**
 

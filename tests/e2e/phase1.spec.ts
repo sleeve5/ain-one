@@ -37,10 +37,11 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
   try {
     dev = await startDev({ dataDir, apiPort, webPort, token, gatePath, recordPath });
     await updateCodexExecutable(apiUrl, token);
+    await openProject(apiUrl, token, projectDir);
 
     await page.goto(webUrl);
-    await page.getByLabel("Project path").fill(projectDir);
-    await page.getByRole("button", { name: "Open Project" }).click();
+    await expect(page.getByRole("button", { name: "Open Project Folder" })).toBeVisible();
+    await expect(page.getByLabel("Project path")).toHaveCount(0);
     await expect(page.getByRole("button", { name: basename(projectDir) })).toBeVisible();
     await expect(page.getByRole("option", { name: "OpenCode" })).toHaveCount(0);
 
@@ -249,6 +250,18 @@ async function updateCodexExecutable(apiUrl: string, token: string): Promise<voi
     body: JSON.stringify({ executablePath: fakeCodex }),
   });
   expect(response.status).toBe(200);
+}
+
+async function openProject(apiUrl: string, token: string, path: string): Promise<void> {
+  const response = await fetch(`${apiUrl}/api/projects`, {
+    method: "POST",
+    headers: {
+      authorization: `Bearer ${token}`,
+      "content-type": "application/json",
+    },
+    body: JSON.stringify({ path }),
+  });
+  expect(response.status).toBe(201);
 }
 
 function execPrompts(recordPath: string): string[] {

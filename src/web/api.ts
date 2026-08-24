@@ -125,6 +125,7 @@ export interface WorkspaceState {
 export interface AinOneApi {
   loadWorkspace(): Promise<WorkspaceState>;
   openProject(path: string): Promise<Project>;
+  pickProject(): Promise<Project | null>;
   createConversation(input: CreateConversationInput): Promise<Conversation>;
   queueMessage(conversationId: string, content: string): Promise<void>;
   deletePendingMessage(conversationId: string, messageId: string): Promise<void>;
@@ -400,6 +401,11 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
 
     async openProject(path): Promise<Project> {
       const payload = await postJson<{ project: Project }>("/api/projects", { path, name: null });
+      return payload.project;
+    },
+
+    async pickProject(): Promise<Project | null> {
+      const payload = await postJson<{ project: Project | null }>("/api/projects/pick", {});
       return payload.project;
     },
 

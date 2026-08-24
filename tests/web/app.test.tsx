@@ -304,20 +304,34 @@ describe("web app", () => {
       ...initial,
       projects: [...initial.projects, { id: opened.id, path: opened.path, name: opened.name }],
     };
-    api.openProject = (async () => opened) as unknown as AinOneApi["openProject"];
+    api.pickProject = (async () => opened) as AinOneApi["pickProject"];
     api.loadWorkspace = vi.fn()
       .mockResolvedValueOnce(initial)
       .mockResolvedValueOnce(refreshed);
     render(<App api={api} />);
 
-    await user.type(await screen.findByLabelText("Project path"), opened.path);
-    await user.click(screen.getByRole("button", { name: "Open Project" }));
+    await user.click(await screen.findByRole("button", { name: "Open Project Folder" }));
 
     expect(await screen.findByRole("button", { name: "New Project" })).toHaveAttribute(
       "data-active",
       "true",
     );
     expect(screen.getByText("Create a conversation to start.")).toBeVisible();
+  });
+
+  it("keeps the current workspace when the native folder picker is cancelled", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ pickProject: async () => null });
+    const loadWorkspace = vi.spyOn(api, "loadWorkspace");
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Open Project Folder" }));
+
+    expect(loadWorkspace).toHaveBeenCalledOnce();
+    expect(screen.getByRole("button", { name: "Ain One" })).toHaveAttribute(
+      "aria-pressed",
+      "true",
+    );
   });
 
   it("selects a newly created Conversation instead of retaining the previous one", async () => {
@@ -570,7 +584,7 @@ describe("web app", () => {
 
   it("opens a Project and creates a Conversation with one immutable Agent Product", async () => {
     const user = userEvent.setup();
-    const openProject = vi.fn(async (): Promise<Project> => ({
+    const pickProject = vi.fn(async (): Promise<Project> => ({
       id: "project-2",
       path: "/tmp/new-project",
       name: "new-project",
@@ -587,11 +601,12 @@ describe("web app", () => {
       createdAt: "2026-08-23T00:00:00.000Z",
       updatedAt: "2026-08-23T00:00:00.000Z",
     }));
-    render(<App api={fakeApi({ openProject, createConversation })} />);
+    render(<App api={fakeApi({ pickProject, createConversation })} />);
 
-    await user.type(await screen.findByLabelText("Project path"), "/tmp/new-project");
-    await user.click(screen.getByRole("button", { name: "Open Project" }));
-    expect(openProject).toHaveBeenCalledWith("/tmp/new-project");
+    const openButton = await screen.findByRole("button", { name: "Open Project Folder" });
+    expect(screen.queryByLabelText("Project path")).not.toBeInTheDocument();
+    await user.click(openButton);
+    expect(pickProject).toHaveBeenCalledOnce();
 
     await user.selectOptions(screen.getByLabelText("New conversation Agent Product"), "claude");
     await user.selectOptions(screen.getByLabelText("New conversation model"), "sonnet");
@@ -1142,7 +1157,7 @@ function fakeApi(
     initialInspector?: InspectorState;
     inspectorByProject?: Record<string, InspectorState | Promise<InspectorState>>;
     listProjectFiles?: AinOneApi["listProjectFiles"];
-    openProject?: AinOneApi["openProject"];
+    pickProject?: AinOneApi["pickProject"];
     createConversation?: AinOneApi["createConversation"];
     queueMessage?: AinOneApi["queueMessage"];
     updateConversationSettings?: AinOneApi["updateConversationSettings"];
@@ -1215,9 +1230,6 @@ function fakeApi(
       await input.retryInterruptedTurn?.(conversationId, turnId);
     },
     async openProject(path) {
-      if (input.openProject) {
-        return await input.openProject(path);
-      }
       return {
         id: "project-opened",
         path,
@@ -1225,6 +1237,9 @@ function fakeApi(
         createdAt: "2026-08-23T00:00:00.000Z",
         updatedAt: "2026-08-23T00:00:00.000Z",
       };
+    },
+    async pickProject() {
+      return await input.pickProject?.() ?? null;
     },
     async createConversation(settings) {
       if (input.createConversation) {

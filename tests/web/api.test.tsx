@@ -173,7 +173,7 @@ describe("HTTP AinOneApi", () => {
     expect(storage.getItem("ain-one:draft-settings:conv-1")).toBeNull();
   });
 
-  it("opens a Project and creates a Conversation through the control API", async () => {
+  it("opens or picks a Project and creates a Conversation through the control API", async () => {
     const calls: Array<{ url: string; body: unknown }> = [];
     const api = createHttpAinOneApi({
       token: "token",
@@ -182,13 +182,14 @@ describe("HTTP AinOneApi", () => {
           url: String(input),
           body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
         });
-        return String(input).endsWith("/api/projects")
+        return String(input).endsWith("/api/projects") || String(input).endsWith("/api/projects/pick")
           ? jsonResponse({ project: project("project-1", "One") })
           : jsonResponse({ conversation: conversation("conv-1", "project-1") });
       },
     });
 
     const opened = await api.openProject("/tmp/one");
+    const picked = await api.pickProject();
     const created = await api.createConversation({
       projectId: "project-1",
       agentProductId: "codex",
@@ -197,10 +198,12 @@ describe("HTTP AinOneApi", () => {
     });
 
     expect(opened.id).toBe("project-1");
+    expect(picked?.id).toBe("project-1");
     expect(created.id).toBe("conv-1");
 
     expect(calls).toEqual([
       { url: "/api/projects", body: { path: "/tmp/one", name: null } },
+      { url: "/api/projects/pick", body: {} },
       {
         url: "/api/conversations",
         body: {

@@ -8,13 +8,14 @@ interface ProjectSidebarProps {
   selectedProjectId: string | null;
   selectedConversationId: string | null;
   agents: AgentSettingsView[];
-  onOpenProject(path: string): Promise<void>;
+  onOpenProject(): Promise<void>;
   onCreateConversation(input: CreateConversationInput): Promise<void>;
   onSelectProject(projectId: string): void;
   onSelectConversation(conversationId: string): void;
 }
 
 export function ProjectSidebar(props: ProjectSidebarProps) {
+  const [openingProject, setOpeningProject] = useState(false);
   const [agentProductId, setAgentProductId] = useState<AgentProductId>(
     props.agents.find(isRunnableAgent)?.id ?? "codex",
   );
@@ -26,20 +27,20 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
   return (
     <nav className="project-sidebar" aria-label="Projects and conversations">
       <h2 className="project-sidebar__heading">Projects</h2>
-      <form
-        className="project-sidebar__form"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const path = new FormData(event.currentTarget).get("projectPath");
-          if (typeof path === "string" && path.trim()) {
-            void props.onOpenProject(path.trim());
-          }
-        }}
-      >
-        <label htmlFor="project-path">Project path</label>
-        <input id="project-path" name="projectPath" required />
-        <button type="submit">Open Project</button>
-      </form>
+      <div className="project-sidebar__form">
+        <button
+          type="button"
+          disabled={openingProject}
+          onClick={() => {
+            setOpeningProject(true);
+            void props.onOpenProject()
+              .catch(() => undefined)
+              .finally(() => setOpeningProject(false));
+          }}
+        >
+          {openingProject ? "Opening Folder..." : "Open Project Folder"}
+        </button>
+      </div>
 
       <form
         className="project-sidebar__form"

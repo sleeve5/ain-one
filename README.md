@@ -54,7 +54,7 @@ Environment variables:
 
 ## Using Ain One
 
-1. Enter a local directory in **Project path** and choose **Open Project**.
+1. Choose **Open Project Folder** and select a local directory in the macOS folder picker.
 2. Select an available Agent Product and one of its reported models, then create a Conversation.
 3. Send messages from Conversation Canvas. The Agent Product is fixed for the lifetime of that Conversation; create another Conversation to use a different product.
 4. Change the model, permission mode, or compatible plugin versions only while no Turn is active. Each Turn persists the exact settings snapshot used for dispatch.

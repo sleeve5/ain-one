@@ -64,6 +64,7 @@ interface ApiServerOptions {
   repositories: Repositories;
   turnCoordinator: TurnCoordinatorLike;
   files: ProjectFilesService;
+  pickProjectDirectory?: () => Promise<string | null>;
   allowedOrigins?: string[];
   bodyLimitBytes?: number;
   ssePollMs?: number;
@@ -138,6 +139,21 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     });
   });
 
+  const registerProject = async (path: string, name: string | null) => {
+    const canonicalPath = await canonicalProjectPath(path);
+    const existing = options.repositories.getProjectByPath(canonicalPath);
+    if (existing) {
+      return { status: 200, project: existing } as const;
+    }
+    return {
+      status: 201,
+      project: options.repositories.createProject(
+        canonicalPath,
+        name ?? basename(canonicalPath),
+      ),
+    } as const;
+  };
+
   async function start(): Promise<void> {
     if (started) {
       return;
@@ -205,18 +221,23 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
     if (request.method === "POST" && pathname === "/api/projects") {
       const body = parseCreateProject(await readJsonBody(request, bodyLimitBytes));
-      const canonicalPath = await canonicalProjectPath(body.path);
-      const existing = options.repositories.getProjectByPath(canonicalPath);
-      if (existing) {
-        sendJson(response, 200, { project: existing });
+      const result = await registerProject(body.path, body.name);
+      sendJson(response, result.status, { project: result.project });
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/projects/pick") {
+      if (!options.pickProjectDirectory) {
+        sendError(response, 501, "folder_picker_unsupported", "Folder picker is not available");
         return;
       }
-
-      const project = options.repositories.createProject(
-        canonicalPath,
-        body.name ?? basename(canonicalPath),
-      );
-      sendJson(response, 201, { project });
+      const selectedPath = await options.pickProjectDirectory();
+      if (selectedPath === null) {
+        sendJson(response, 200, { project: null });
+        return;
+      }
+      const result = await registerProject(selectedPath, null);
+      sendJson(response, result.status, { project: result.project });
       return;
     }
 

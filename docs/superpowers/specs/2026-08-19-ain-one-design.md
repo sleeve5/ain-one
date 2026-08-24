@@ -429,7 +429,7 @@ The Phase 1 interface follows Paseo's broad three-column composition without cop
 
 ### 13.1 Left Column
 
-- Project list and open-directory action.
+- Project list and a native macOS folder-picker action; the Web UI does not require manual path entry.
 - Conversation list grouped by Project.
 - Agent Product indicator and current status.
 - Running, queued, failed, and interrupted badges.

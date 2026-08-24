@@ -67,6 +67,9 @@ function fakeApi(): AinOneApi {
         updatedAt: "2026-08-23T00:00:00.000Z",
       };
     },
+    async pickProject() {
+      return null;
+    },
     async createConversation() {
       return {
         id: "conv-2",

@@ -7,7 +7,7 @@ import type { AgentConnector, AgentProductId } from "../shared/contracts.js";
 import { createServerConfig, type ServerConfig } from "./config.js";
 import { createConnectorRegistry } from "./connectors/registry.js";
 import { createDatabase } from "./db.js";
-import { createProjectFilesService } from "./files.js";
+import { createProjectFilesService, pickProjectDirectory } from "./files.js";
 import {
   createPluginHub,
   type InstallLocalInput,
@@ -119,6 +119,7 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       }
     },
     files: createProjectFilesService(),
+    pickProjectDirectory,
     allowedOrigins: [
       `http://127.0.0.1:${config.port}`,
       `http://localhost:${config.port}`,

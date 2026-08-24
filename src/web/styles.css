@@ -94,6 +94,7 @@ textarea {
 }
 
 .workspace__center {
+  min-width: 0;
   min-height: 0;
   display: grid;
   grid-template-rows: auto 1fr;
@@ -493,6 +494,12 @@ textarea {
   white-space: pre-wrap;
   word-break: break-word;
   margin: 0.45rem 0 0;
+}
+
+@media (min-width: 961px) and (max-width: 1139px) {
+  .workspace__layout {
+    grid-template-columns: 260px minmax(0, 1fr) 300px;
+  }
 }
 
 @media (max-width: 960px) {

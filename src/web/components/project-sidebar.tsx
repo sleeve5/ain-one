@@ -1,4 +1,4 @@
-import { useState } from "react";
+import { useRef, useState } from "react";
 import type { AgentProductId, CreateConversationInput } from "../../shared/contracts.js";
 import type { AgentSettingsView, ConversationView, ProjectView } from "../api.js";
 
@@ -16,6 +16,8 @@ interface ProjectSidebarProps {
 
 export function ProjectSidebar(props: ProjectSidebarProps) {
   const [openingProject, setOpeningProject] = useState(false);
+  const [creatingConversation, setCreatingConversation] = useState(false);
+  const creatingConversationRef = useRef(false);
   const [agentProductId, setAgentProductId] = useState<AgentProductId>(
     props.agents.find(isRunnableAgent)?.id ?? "codex",
   );
@@ -46,17 +48,29 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
         className="project-sidebar__form"
         onSubmit={(event) => {
           event.preventDefault();
-          if (!props.selectedProjectId || !selectedAgent || !isRunnableAgent(selectedAgent)) {
+          if (
+            creatingConversationRef.current ||
+            !props.selectedProjectId ||
+            !selectedAgent ||
+            !isRunnableAgent(selectedAgent)
+          ) {
             return;
           }
           const data = new FormData(event.currentTarget);
           const model = data.get("modelId");
+          creatingConversationRef.current = true;
+          setCreatingConversation(true);
           void props.onCreateConversation({
-            projectId: props.selectedProjectId,
-            agentProductId,
-            modelId: typeof model === "string" && model ? model : null,
-            permissionMode: selectedCatalog?.permissionModes[0] ?? "request_approval",
-          });
+              projectId: props.selectedProjectId,
+              agentProductId,
+              modelId: typeof model === "string" && model ? model : null,
+              permissionMode: selectedCatalog?.permissionModes[0] ?? "request_approval",
+            })
+            .catch(() => undefined)
+            .finally(() => {
+              creatingConversationRef.current = false;
+              setCreatingConversation(false);
+            });
         }}
       >
         <label htmlFor="new-conversation-agent">New conversation Agent Product</label>
@@ -80,9 +94,14 @@ export function ProjectSidebar(props: ProjectSidebarProps) {
         </select>
         <button
           type="submit"
-          disabled={!props.selectedProjectId || !selectedAgent || !isRunnableAgent(selectedAgent)}
+          disabled={
+            creatingConversation ||
+            !props.selectedProjectId ||
+            !selectedAgent ||
+            !isRunnableAgent(selectedAgent)
+          }
         >
-          Create Conversation
+          {creatingConversation ? "Creating Conversation..." : "Create Conversation"}
         </button>
       </form>
 

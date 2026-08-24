@@ -1,4 +1,5 @@
-import { fireEvent, render, screen, within } from "@testing-library/react";
+import { readFileSync } from "node:fs";
+import { act, fireEvent, render, screen, within } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../../src/web/app.js";
@@ -373,6 +374,36 @@ describe("web app", () => {
     );
   });
 
+  it("submits Conversation creation only once while the request is in flight", async () => {
+    const user = userEvent.setup();
+    const created = deferred<Conversation>();
+    const createConversation = vi.fn(async () => created.promise);
+    render(<App api={fakeApi({ createConversation })} />);
+
+    const createButton = await screen.findByRole("button", { name: "Create Conversation" });
+    await user.click(createButton);
+    await user.click(createButton);
+
+    expect(createConversation).toHaveBeenCalledOnce();
+    expect(createButton).toBeDisabled();
+  });
+
+  it("shows Conversation creation failures without an unhandled rejection", async () => {
+    const user = userEvent.setup();
+    const createConversation = vi.fn(async () => {
+      throw new Error("creation unavailable");
+    });
+    render(<App api={fakeApi({ createConversation })} />);
+
+    const createButton = await screen.findByRole("button", { name: "Create Conversation" });
+    await user.click(createButton);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not create Conversation: creation unavailable",
+    );
+    expect(createButton).toBeEnabled();
+  });
+
   it("ignores an older workspace refresh that finishes after a newer one", async () => {
     const user = userEvent.setup();
     const api = fakeApi({
@@ -409,6 +440,80 @@ describe("web app", () => {
     first.resolve(older);
     await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Older Project" })).toBeNull());
     expect(screen.getByRole("button", { name: "Newer Project" })).toBeVisible();
+  });
+
+  it("serializes executable path saves for the same Agent so the newest value wins", async () => {
+    const user = userEvent.setup();
+    const firstSave = deferred<void>();
+    const updateAgentExecutablePath = vi.fn(async (_agentId, executablePath) => {
+      if (executablePath === "/old/codex") {
+        await firstSave.promise;
+      }
+    });
+    render(
+      <App
+        api={fakeApi({
+          agents: [agent("codex", "Codex", "available")],
+          updateAgentExecutablePath,
+        })}
+      />,
+    );
+
+    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
+    const input = screen.getByLabelText("Codex executable path override");
+    await user.type(input, "/old/codex");
+    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
+    await user.clear(input);
+    await user.type(input, "/new/codex");
+    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
+
+    expect(updateAgentExecutablePath).toHaveBeenCalledOnce();
+    firstSave.resolve();
+    await vi.waitFor(() => expect(updateAgentExecutablePath).toHaveBeenCalledTimes(2));
+    expect(updateAgentExecutablePath).toHaveBeenNthCalledWith(2, "codex", "/new/codex");
+  });
+
+  it("does not let an in-flight workspace refresh overwrite newer local Conversation state", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({
+      initialQueuedMessages: ["keep deleted"],
+      agents: [agent("codex", "Codex", "available")],
+    });
+    const initial = await api.loadWorkspace();
+    const staleRefresh = deferred<WorkspaceState>();
+    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockImplementationOnce(async () => staleRefresh.promise);
+    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
+      onEvent = callback;
+      return () => undefined;
+    };
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
+    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
+    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "Workspace" }));
+    await user.selectOptions(screen.getByLabelText("Model"), "gpt-5-mini");
+    await user.click(
+      screen.getByRole("button", { name: "Delete pending message 1: keep deleted" }),
+    );
+    onEvent({
+      id: "event-newer-running",
+      conversationId: "conv-1",
+      sequence: 1,
+      type: "turn_status",
+      payload: { turnId: "turn-newer", status: "running" },
+      createdAt: "2026-08-24T00:00:00.000Z",
+    });
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeVisible();
+
+    await act(async () => staleRefresh.resolve(initial));
+
+    expect(screen.getByLabelText("Model")).toHaveValue("gpt-5-mini");
+    expect(screen.queryByText("keep deleted")).toBeNull();
+    expect(screen.getByRole("button", { name: "Stop" })).toBeVisible();
   });
 
   it("surfaces inspector failures and preserves the selected project", async () => {
@@ -499,6 +604,14 @@ describe("web app", () => {
     expect(inspectorDrawer).toHaveAttribute("aria-hidden", "true");
   });
 
+  it("uses shrinkable columns between 961px and 1139px", () => {
+    const css = readFileSync("src/web/styles.css", "utf8");
+
+    expect(css).toContain("@media (min-width: 961px) and (max-width: 1139px)");
+    expect(css).toContain("grid-template-columns: 260px minmax(0, 1fr) 300px;");
+    expect(css).toMatch(/\.workspace__center\s*\{[^}]*min-width:\s*0;/s);
+  });
+
   it("renders all normalized event types in timeline", async () => {
     render(<App api={fakeApi({ includeAllEventTypes: true })} />);
 
@@ -519,8 +632,43 @@ describe("web app", () => {
     render(<App api={fakeApi({ initialQueuedMessages: ["delete me"] })} />);
 
     expect(await screen.findByText("delete me")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Delete" }));
+    await user.click(screen.getByRole("button", { name: "Delete pending message 1: delete me" }));
     expect(screen.queryByText("delete me")).toBeNull();
+  });
+
+  it("applies a delayed pending-message deletion to its original Conversation", async () => {
+    const user = userEvent.setup();
+    const deletion = deferred<void>();
+    render(
+      <App
+        api={fakeApi({
+          twoProjects: true,
+          initialQueuedMessages: ["shared pending"],
+          deletePendingMessage: async () => deletion.promise,
+        })}
+      />,
+    );
+
+    await user.click(
+      await screen.findByRole("button", { name: "Delete pending message 1: shared pending" }),
+    );
+    await user.click(screen.getByRole("button", { name: /Conversation Two/ }));
+    await act(async () => deletion.resolve());
+
+    expect(screen.getByText("shared pending")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: /Main Conversation/ }));
+    expect(screen.queryByText("shared pending")).toBeNull();
+  });
+
+  it("gives every pending-message Delete button a unique accessible name", async () => {
+    render(<App api={fakeApi({ initialQueuedMessages: ["duplicate", "duplicate"] })} />);
+
+    expect(
+      await screen.findByRole("button", { name: "Delete pending message 1: duplicate" }),
+    ).toBeVisible();
+    expect(
+      screen.getByRole("button", { name: "Delete pending message 2: duplicate" }),
+    ).toBeVisible();
   });
 
   it("shows immutable agent identity and permission popover with catalog-limited choices", async () => {
@@ -1160,7 +1308,9 @@ function fakeApi(
     pickProject?: AinOneApi["pickProject"];
     createConversation?: AinOneApi["createConversation"];
     queueMessage?: AinOneApi["queueMessage"];
+    deletePendingMessage?: AinOneApi["deletePendingMessage"];
     updateConversationSettings?: AinOneApi["updateConversationSettings"];
+    updateAgentExecutablePath?: AinOneApi["updateAgentExecutablePath"];
     setPluginEnablements?: AinOneApi["setPluginEnablements"];
     getPluginEnablements?: AinOneApi["getPluginEnablements"];
     pluginState?: Pick<ConversationView, "enabledPluginIds" | "availablePlugins">;
@@ -1211,7 +1361,8 @@ function fakeApi(
         createdAt: new Date().toISOString(),
       });
     },
-    async deletePendingMessage(_, messageId) {
+    async deletePendingMessage(conversationId, messageId) {
+      await input.deletePendingMessage?.(conversationId, messageId);
       const index = queued.findIndex((message) => message.id === messageId);
       if (index >= 0) {
         queued.splice(index, 1);
@@ -1259,8 +1410,8 @@ function fakeApi(
     async updateConversationSettings(conversationId, settings) {
       await input.updateConversationSettings?.(conversationId, settings);
     },
-    async updateAgentExecutablePath() {
-      return undefined;
+    async updateAgentExecutablePath(agentProductId, executablePath) {
+      await input.updateAgentExecutablePath?.(agentProductId, executablePath);
     },
     async installPlugin() {
       return undefined;

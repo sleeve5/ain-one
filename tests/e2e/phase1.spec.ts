@@ -36,12 +36,31 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
 
   try {
     dev = await startDev({ dataDir, apiPort, webPort, token, gatePath, recordPath });
-    await updateCodexExecutable(apiUrl, token);
-    await openProject(apiUrl, token, projectDir);
-
     await page.goto(webUrl);
+    await page.getByRole("button", { name: "Agent Settings" }).click();
+    await page.getByLabel("Codex executable path override").fill(fakeCodex);
+    await page.getByRole("button", { name: "Save Codex path" }).click();
+    await expect(page.getByText("Version: 0.147.0")).toBeVisible();
+    await page.getByRole("button", { name: "Workspace" }).click();
+
+    await page.route("**/api/projects/pick", async (route) => {
+      const opened = await fetch(`${apiUrl}/api/projects`, {
+        method: "POST",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ path: projectDir }),
+      });
+      await route.fulfill({
+        status: opened.status,
+        contentType: "application/json",
+        body: await opened.text(),
+      });
+    });
     await expect(page.getByRole("button", { name: "Open Project Folder" })).toBeVisible();
     await expect(page.getByLabel("Project path")).toHaveCount(0);
+    await page.getByRole("button", { name: "Open Project Folder" }).click();
     await expect(page.getByRole("button", { name: basename(projectDir) })).toBeVisible();
     await expect(page.getByRole("option", { name: "OpenCode" })).toHaveCount(0);
 
@@ -238,30 +257,6 @@ async function isPortOpen(port: number): Promise<boolean> {
   } catch {
     return false;
   }
-}
-
-async function updateCodexExecutable(apiUrl: string, token: string): Promise<void> {
-  const response = await fetch(`${apiUrl}/api/agents/codex/settings`, {
-    method: "PUT",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ executablePath: fakeCodex }),
-  });
-  expect(response.status).toBe(200);
-}
-
-async function openProject(apiUrl: string, token: string, path: string): Promise<void> {
-  const response = await fetch(`${apiUrl}/api/projects`, {
-    method: "POST",
-    headers: {
-      authorization: `Bearer ${token}`,
-      "content-type": "application/json",
-    },
-    body: JSON.stringify({ path }),
-  });
-  expect(response.status).toBe(201);
 }
 
 function execPrompts(recordPath: string): string[] {

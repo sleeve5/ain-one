@@ -38,11 +38,13 @@ export function App(props: AppProps) {
   const [enabledPluginVersions, setEnabledPluginVersions] = useState<PluginVersion[]>([]);
   const [pluginEnablementsLoading, setPluginEnablementsLoading] = useState(false);
   const workspaceRequest = useRef(0);
+  const workspaceGeneration = useRef(0);
   const inspectorRequest = useRef(0);
   const pluginRequest = useRef(0);
   const pluginScopeRef = useRef<PluginScopeKind>("global");
   const configurationWriteQueue = useRef<Promise<void> | null>(null);
   const configurationFailures = useRef<Record<ConfigurationWriteKey, string>>({});
+  const agentExecutableWrites = useRef(new Map<AgentProductId, Promise<void>>());
   const enabledPluginVersionsRef = useRef<PluginVersion[]>([]);
   const [narrowScreen, setNarrowScreen] = useState(
     () => globalThis.matchMedia?.("(max-width: 960px)").matches ?? false,
@@ -53,9 +55,10 @@ export function App(props: AppProps) {
     conversationId?: string;
   }): Promise<boolean> => {
     const request = ++workspaceRequest.current;
+    const generation = workspaceGeneration.current;
     try {
       const loadedWorkspace = await props.api.loadWorkspace();
-      if (request !== workspaceRequest.current) {
+      if (request !== workspaceRequest.current || generation !== workspaceGeneration.current) {
         return false;
       }
       setState((current) => {
@@ -217,6 +220,7 @@ export function App(props: AppProps) {
         0,
       );
       return props.api.subscribeConversationEvents(conversation.id, replaySequence, (event) => {
+        workspaceGeneration.current += 1;
         startTransition(() => {
           setState((current) => {
             const existing = current.workspace.conversations.find(
@@ -292,6 +296,7 @@ export function App(props: AppProps) {
     if (!conversation) {
       return;
     }
+    workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
       actionError: null,
@@ -309,6 +314,7 @@ export function App(props: AppProps) {
     const conversation =
       state.workspace.conversations.find((item) => item.projectId === projectId) ?? null;
 
+    workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
       actionError: null,
@@ -322,19 +328,29 @@ export function App(props: AppProps) {
     void loadInspector(projectId);
   };
 
-  const patchConversation = (patch: (current: ConversationView) => ConversationView): void => {
+  const patchConversation = (
+    patch: (current: ConversationView) => ConversationView,
+    conversationId = state.workspace.selectedConversationId,
+  ): void => {
+    if (!conversationId) {
+      return;
+    }
+    workspaceGeneration.current += 1;
     setState((current) => {
-      const selected = current.workspace.conversation;
-      if (!selected) {
+      const target = current.workspace.conversations.find((item) => item.id === conversationId);
+      if (!target) {
         return current;
       }
 
-      const nextConversation = patch(selected);
+      const nextConversation = patch(target);
       return {
         ...current,
         workspace: {
           ...current.workspace,
-          conversation: nextConversation,
+          conversation:
+            current.workspace.selectedConversationId === conversationId
+              ? nextConversation
+              : current.workspace.conversation,
           conversations: current.workspace.conversations.map((item) =>
             item.id === nextConversation.id ? nextConversation : item,
           ),
@@ -442,10 +458,22 @@ export function App(props: AppProps) {
     agentProductId: AgentProductId,
     executablePath: string | null,
   ): Promise<void> => {
-    await reloadAfter(
-      () => props.api.updateAgentExecutablePath(agentProductId, executablePath),
-      "Could not update Agent Product settings",
-    );
+    const previous = agentExecutableWrites.current.get(agentProductId);
+    const operation = (async () => {
+      await previous?.catch(() => undefined);
+      await reloadAfter(
+        () => props.api.updateAgentExecutablePath(agentProductId, executablePath),
+        "Could not update Agent Product settings",
+      );
+    })();
+    agentExecutableWrites.current.set(agentProductId, operation);
+    try {
+      await operation;
+    } finally {
+      if (agentExecutableWrites.current.get(agentProductId) === operation) {
+        agentExecutableWrites.current.delete(agentProductId);
+      }
+    }
   };
 
   if (state.status === "loading") {
@@ -615,13 +643,14 @@ export function App(props: AppProps) {
                   if (!conversation) {
                     return;
                   }
+                  const conversationId = conversation.id;
                   try {
-                    await props.api.deletePendingMessage(conversation.id, messageId);
+                    await props.api.deletePendingMessage(conversationId, messageId);
                     clearActionError();
                     patchConversation((current) => ({
                       ...current,
                       queuedMessages: current.queuedMessages.filter((message) => message.id !== messageId),
-                    }));
+                    }), conversationId);
                   } catch {
                     showActionError("Could not delete pending message");
                     throw new Error("delete failed");

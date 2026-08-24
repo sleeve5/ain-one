@@ -169,11 +169,12 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
       <section className="conversation-canvas__pending" aria-label="Pending messages">
         <h3>Pending queue</h3>
         <ul>
-          {conversation.queuedMessages.map((message) => (
+          {conversation.queuedMessages.map((message, index) => (
             <li key={message.id}>
               <span>{message.content}</span>
               <button
                 type="button"
+                aria-label={`Delete pending message ${index + 1}: ${message.content}`}
                 onClick={() => {
                   void props.onDeletePendingMessage(message.id).catch(() => undefined);
                 }}

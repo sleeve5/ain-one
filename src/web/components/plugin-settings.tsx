@@ -122,6 +122,7 @@ export function PluginSettings(props: PluginSettingsProps) {
         <h2>Installed versions</h2>
         <ul className="plugin-settings__versions">
           {props.installedVersions.map((version) => {
+            const unavailable = !version.compatibleAgents.some(isPhaseOneAgentProductId);
             const incompatible =
               props.scope === "conversation" &&
               props.conversationAgentProductId != null &&
@@ -157,7 +158,12 @@ export function PluginSettings(props: PluginSettingsProps) {
                   <input
                     type="checkbox"
                     aria-label={`Enable ${version.pluginId} ${version.versionId}`}
-                    disabled={props.enablementsLoading || props.enablementsLocked || incompatible}
+                    disabled={
+                      props.enablementsLoading ||
+                      props.enablementsLocked ||
+                      unavailable ||
+                      incompatible
+                    }
                     checked={props.enabledVersions.some(
                       (enabled) =>
                         enabled.pluginId === version.pluginId &&
@@ -176,6 +182,7 @@ export function PluginSettings(props: PluginSettingsProps) {
                 {incompatible ? (
                   <p>Incompatible with {agentLabels[props.conversationAgentProductId!]}</p>
                 ) : null}
+                {unavailable ? <p>Unavailable in Phase 1</p> : null}
               </article>
             </li>
             );

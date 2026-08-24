@@ -132,6 +132,8 @@ describe("PluginSettings", () => {
     expect(screen.getAllByText("Type: skill")).toHaveLength(2);
     expect(screen.getByText("Compatible agents: Codex, Claude Code")).toBeVisible();
     expect(screen.getByText("Compatible agents: None declared")).toBeVisible();
+    expect(screen.getByLabelText("Enable local-mcp sha-2")).toBeDisabled();
+    expect(screen.getByText("Unavailable in Phase 1")).toBeVisible();
     expect(screen.getByText("Codex: Materialized")).toBeVisible();
     expect(screen.getByText("Claude Code: Not materialized")).toBeVisible();
     expect(screen.getByRole("button", { name: "Repair formatter v2 for Claude Code" })).toBeVisible();

@@ -328,6 +328,54 @@ describe("TurnCoordinator", () => {
     expect(replacement.prompts).toEqual(["second"]);
   });
 
+  it("serializes between-Turn changes behind dispatch preparation", async () => {
+    const runtime = new ControlledConnector();
+    const db = createDatabase(":memory:");
+    const repositories = createRepositories(db);
+    const project = repositories.createProject(`/tmp/project-${randomUUID()}`, "test");
+    const conversation = repositories.createConversation({
+      projectId: project.id,
+      agentProductId: "codex",
+      modelId: "gpt-test",
+    });
+    let releaseMaterialization!: () => void;
+    let markMaterializationStarted!: () => void;
+    const materializationStarted = new Promise<void>((resolvePromise) => {
+      markMaterializationStarted = resolvePromise;
+    });
+    const materializationGate = new Promise<void>((resolvePromise) => {
+      releaseMaterialization = resolvePromise;
+    });
+    const coordinator = new TurnCoordinator({
+      repositories,
+      connectors: { codex: runtime },
+      materializePlugins: async () => {
+        markMaterializationStarted();
+        await materializationGate;
+        return { turnArtifactPath: null };
+      },
+    });
+    repositories.enqueueMessage(conversation.id, "claim before repair");
+
+    const dispatching = coordinator.dispatchNext(conversation.id);
+    await materializationStarted;
+    const operation = vi.fn(async () => undefined);
+    let changing: Promise<"updated" | "turn_active">;
+    try {
+      changing = coordinator.runBetweenTurns("codex", operation);
+      await Promise.resolve();
+      expect(operation).not.toHaveBeenCalled();
+    } finally {
+      releaseMaterialization();
+    }
+
+    await expect(changing!).resolves.toBe("turn_active");
+    await dispatching;
+    expect(operation).not.toHaveBeenCalled();
+    expect(repositories.getActiveTurn(conversation.id)).not.toBeNull();
+    db.close();
+  });
+
   it("freezes current settings and materialized plugins into the Turn snapshot", async () => {
     const runtime = new ControlledConnector();
     const db = createDatabase(":memory:");
@@ -413,6 +461,44 @@ describe("TurnCoordinator", () => {
     expect(repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
     expect(runtime.createSessionCalls).toBe(0);
     expect(runtime.startAttempts).toBe(0);
+    db.close();
+  });
+
+  it("acknowledges a durable message when dispatch preparation fails", async () => {
+    const runtime = new ControlledConnector();
+    const db = createDatabase(":memory:");
+    const repositories = createRepositories(db);
+    const project = repositories.createProject(`/tmp/project-${randomUUID()}`, "test");
+    const conversation = repositories.createConversation({
+      projectId: project.id,
+      agentProductId: "codex",
+      modelId: "gpt-test",
+    });
+    const coordinator = new TurnCoordinator({
+      repositories,
+      connectors: { codex: runtime },
+      resolvePluginVersions: () => {
+        throw new Error("broken plugin settings");
+      },
+    });
+
+    await expect(
+      coordinator.enqueueMessage(conversation.id, "keep exactly once"),
+    ).resolves.toBeUndefined();
+
+    expect(repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "keep exactly once" }),
+    ]);
+    expect(repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+    expect(repositories.eventsAfter(conversation.id, 0)).toEqual([
+      expect.objectContaining({
+        type: "warning",
+        payload: {
+          code: "queue_dispatch_failed",
+          message: "broken plugin settings",
+        },
+      }),
+    ]);
     db.close();
   });
 
@@ -641,6 +727,11 @@ describe("TurnCoordinator", () => {
     }
 
     expect(app.repositories.getTurn(firstTurnId)?.status).toBe("completed");
+    expect(
+      app.db
+        .prepare("SELECT status FROM queued_messages WHERE claimed_turn_id = ?")
+        .get(firstTurnId),
+    ).toEqual({ status: "consumed" });
     expect(app.repositories.getTurn(secondTurn.id)?.status).toBe("running");
     expect(runtime.prompts).toEqual(["first", "second"]);
     expect(runtime.startAttempts).toBe(2);

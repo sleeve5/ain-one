@@ -111,9 +111,30 @@ export class TurnCoordinator {
     });
   }
 
+  async runBetweenTurns(
+    agentProductId: AgentProductId,
+    operation: () => Promise<void>,
+  ): Promise<"updated" | "turn_active"> {
+    return this.withAgentPreparation(agentProductId, async () => {
+      if (this.repositories.hasActiveTurnForAgent(agentProductId)) {
+        return "turn_active";
+      }
+      await operation();
+      return "updated";
+    });
+  }
+
   async enqueueMessage(conversationId: string, content: string): Promise<void> {
     this.repositories.enqueueMessage(conversationId, content);
-    await this.dispatchNext(conversationId);
+    try {
+      await this.dispatchNext(conversationId);
+    } catch (error) {
+      try {
+        this.repositories.recordQueueDispatchFailure(conversationId, normalizeError(error));
+      } catch {
+        // The message is already durable; a later explicit action can resume dispatch.
+      }
+    }
   }
 
   async dispatchNext(conversationId: string): Promise<void> {

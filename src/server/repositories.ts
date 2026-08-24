@@ -37,6 +37,7 @@ export interface Repositories {
   listPluginEnablements(scope: PluginScope): PluginVersion[];
   resolvePluginVersions(projectId: string, conversationId: string): PluginVersion[];
   setConversationQueuePaused(conversationId: string, queuePaused: boolean): void;
+  recordQueueDispatchFailure(conversationId: string, error: NormalizedError): void;
   enqueueMessage(conversationId: string, content: string): QueuedMessage;
   enqueueInterruptedTurnRetry(
     conversationId: string,
@@ -335,6 +336,22 @@ class SqliteRepositories implements Repositories {
          WHERE id = ?`,
       )
       .run(queuePaused ? 1 : 0, isoNow(), conversationId);
+  }
+
+  recordQueueDispatchFailure(conversationId: string, error: NormalizedError): void {
+    this.immediateTransaction(() => {
+      this.db
+        .prepare(
+          `UPDATE conversations
+           SET queue_paused = 1, updated_at = ?
+           WHERE id = ?`,
+        )
+        .run(isoNow(), conversationId);
+      this.insertEvent(conversationId, {
+        type: "warning",
+        payload: { code: "queue_dispatch_failed", message: error.message },
+      });
+    });
   }
 
   enqueueMessage(conversationId: string, content: string): QueuedMessage {
@@ -662,6 +679,15 @@ class SqliteRepositories implements Repositories {
             input.turnId,
           );
       }
+      if (input.status === "completed" || input.status === "cancelled") {
+        this.db
+          .prepare(
+            `UPDATE queued_messages
+             SET status = 'consumed', updated_at = ?
+             WHERE claimed_turn_id = ? AND status = 'claimed'`,
+          )
+          .run(now, input.turnId);
+      }
       if (input.requeueMessage) {
         this.db
           .prepare(
@@ -807,44 +833,7 @@ class SqliteRepositories implements Repositories {
   }
 
   appendEvent(conversationId: string, event: ConnectorEvent): NormalizedEvent {
-    return this.immediateTransaction(() => {
-      const nextSequenceRow = this.getRow<{ sequence: number }>(
-        `SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
-         FROM events
-         WHERE conversation_id = ?`,
-        conversationId,
-      );
-      if (!nextSequenceRow) {
-        throw new Error("Failed to allocate event sequence");
-      }
-
-      const now = isoNow();
-      const normalized: NormalizedEvent = {
-        id: randomUUID(),
-        conversationId,
-        sequence: nextSequenceRow.sequence,
-        type: event.type,
-        payload: event.payload,
-        createdAt: now,
-      };
-
-      this.db
-        .prepare(
-          `INSERT INTO events (
-            id, conversation_id, sequence, type, payload_json, created_at
-          ) VALUES (?, ?, ?, ?, ?, ?)`,
-        )
-        .run(
-          normalized.id,
-          normalized.conversationId,
-          normalized.sequence,
-          normalized.type,
-          JSON.stringify(normalized.payload),
-          normalized.createdAt,
-        );
-
-      return normalized;
-    });
+    return this.immediateTransaction(() => this.insertEvent(conversationId, event));
   }
 
   eventsAfter(conversationId: string, sequence: number, limit?: number): NormalizedEvent[] {
@@ -873,6 +862,42 @@ class SqliteRepositories implements Repositories {
       this.db.exec("ROLLBACK");
       throw error;
     }
+  }
+
+  private insertEvent(conversationId: string, event: ConnectorEvent): NormalizedEvent {
+    const nextSequenceRow = this.getRow<{ sequence: number }>(
+      `SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+       FROM events
+       WHERE conversation_id = ?`,
+      conversationId,
+    );
+    if (!nextSequenceRow) {
+      throw new Error("Failed to allocate event sequence");
+    }
+
+    const normalized: NormalizedEvent = {
+      id: randomUUID(),
+      conversationId,
+      sequence: nextSequenceRow.sequence,
+      type: event.type,
+      payload: event.payload,
+      createdAt: isoNow(),
+    };
+    this.db
+      .prepare(
+        `INSERT INTO events (
+          id, conversation_id, sequence, type, payload_json, created_at
+        ) VALUES (?, ?, ?, ?, ?, ?)`,
+      )
+      .run(
+        normalized.id,
+        normalized.conversationId,
+        normalized.sequence,
+        normalized.type,
+        JSON.stringify(normalized.payload),
+        normalized.createdAt,
+      );
+    return normalized;
   }
 
   private replacePluginEnablements(scope: PluginScope, plugins: PluginVersion[]): void {

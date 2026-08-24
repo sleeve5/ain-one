@@ -3,13 +3,11 @@ import { createOpencodeClient } from "@opencode-ai/sdk/v2";
 import type { PermissionRuleset } from "@opencode-ai/sdk/v2";
 import type {
   AgentCatalog,
-  ConnectorEvent,
   LiveSession,
   SessionInput,
-  StartTurnInput,
 } from "../../shared/contracts.js";
 import { redactSecrets, type BaseConnectorOptions } from "./base.js";
-import type { OpenCodeSdkAdapter, OpenCodeSdkTurn } from "./opencode.js";
+import type { OpenCodeSdkAdapter } from "./opencode.js";
 
 interface OfficialRuntime {
   client: ReturnType<typeof createOpencodeClient>;
@@ -43,7 +41,10 @@ export function createOfficialOpenCodeSdkAdapter(
 
   return {
     async probe() {
-      return { status: "available" };
+      return {
+        status: "capability_limited",
+        diagnostic: "Ain One does not yet stream native OpenCode SDK events; Turn execution is disabled",
+      };
     },
 
     async fetchCatalog(projectPath): Promise<AgentCatalog> {
@@ -90,89 +91,16 @@ export function createOfficialOpenCodeSdkAdapter(
       }
     },
 
-    async startTurn(session, input, sink): Promise<OpenCodeSdkTurn> {
+    async startTurn(session) {
       const runtime = runtimes.get(session.id);
       if (!runtime || !session.nativeSessionId) {
         throw definiteStartError("OpenCode session is not initialized");
       }
-      if (input.snapshot.permissionMode !== "full_access") {
-        throw definiteStartError("OpenCode headless transport supports only full access");
-      }
-
-      let cancelled = false;
-      let closing = false;
-      const cancellation: { confirmation: Promise<boolean> | null } = { confirmation: null };
-      const request = new AbortController();
-      const settled = (async () => {
-        try {
-          await runtime.client.session.update(
-            {
-              sessionID: session.nativeSessionId!,
-              directory: runtime.projectPath,
-              permission: permissionRules(),
-            },
-            { throwOnError: true, signal: request.signal },
-          );
-          const response = await runtime.client.session.prompt(
-            {
-              sessionID: session.nativeSessionId!,
-              directory: runtime.projectPath,
-              ...(input.snapshot.modelId ? { model: parseModel(input.snapshot.modelId) } : {}),
-              parts: [{ type: "text", text: input.content }],
-            },
-            { throwOnError: true, signal: request.signal },
-          );
-          for (const event of normalizePrompt(response.data)) {
-            await sink.emitEvent(event);
-          }
-          await sink.emitTerminal({
-            turnId: input.turnId,
-            nativeTurnId: null,
-            status: cancelled ? "cancelled" : "completed",
-          });
-        } catch (error) {
-          if (cancellation.confirmation) {
-            cancelled = await cancellation.confirmation.catch(() => false);
-          }
-          const status = cancelled ? "cancelled" : closing ? "interrupted" : "failed";
-          await sink.emitTerminal({
-            turnId: input.turnId,
-            nativeTurnId: null,
-            status,
-            ...(status !== "failed"
-              ? {}
-              : {
-                  error: {
-                    code: "opencode_sdk_error",
-                    message: error instanceof Error ? error.message : "OpenCode SDK request failed",
-                  },
-                }),
-          });
-        }
-      })();
-
-      return {
-        nativeTurnId: null,
-        settled,
-        async cancel() {
-          cancellation.confirmation ??= runtime.client.session.abort(
-            { sessionID: session.nativeSessionId!, directory: runtime.projectPath },
-            { throwOnError: true },
-          ).then((response) => response.data === true);
-          cancelled = await cancellation.confirmation;
-          if (!cancelled) {
-            return false;
-          }
-          await settled;
-          return true;
-        },
-        async close() {
-          closing = true;
-          request.abort(new Error("OpenCode session closed"));
-          await runtime.server.close();
-          await settled;
-        },
-      };
+      runtimes.delete(session.id);
+      await runtime.server.close();
+      throw definiteStartError(
+        "Ain One OpenCode Turn execution is disabled until native SDK events are streamed",
+      );
     },
 
     async closeSession(session: LiveSession) {
@@ -279,60 +207,6 @@ function stopServer(child: ChildProcess, killTimeoutMs: number): Promise<void> {
     });
     child.kill();
   });
-}
-
-function parseModel(modelId: string): { providerID: string; modelID: string } {
-  const separator = modelId.indexOf("/");
-  if (separator <= 0 || separator === modelId.length - 1) {
-    throw definiteStartError("OpenCode model must use provider/model format");
-  }
-  return {
-    providerID: modelId.slice(0, separator),
-    modelID: modelId.slice(separator + 1),
-  };
-}
-
-function normalizePrompt(value: unknown): ConnectorEvent[] {
-  const record = objectValue(value);
-  const info = objectValue(record?.info);
-  const events: ConnectorEvent[] = [];
-  for (const rawPart of Array.isArray(record?.parts) ? record.parts : []) {
-    const part = objectValue(rawPart);
-    if (part?.type === "text" && typeof part.text === "string") {
-      events.push({ type: "assistant_message", payload: { text: part.text, role: "assistant" } });
-    } else if (part?.type === "reasoning" && typeof part.text === "string") {
-      events.push({ type: "reasoning", payload: { summary: part.text } });
-    } else if (part?.type === "tool") {
-      const state = objectValue(part.state);
-      events.push({
-        type: "tool",
-        payload: {
-          name: typeof part.tool === "string" ? part.tool : "tool",
-          status: state?.status ?? "unknown",
-          input: state?.input,
-          output: state?.output,
-          error: state?.error,
-        },
-      });
-    }
-  }
-  const tokens = objectValue(info?.tokens);
-  if (typeof tokens?.input === "number" && typeof tokens.output === "number") {
-    events.push({
-      type: "usage",
-      payload: {
-        ...tokens,
-        summary: `${tokens.input} input / ${tokens.output} output tokens`,
-      },
-    });
-  }
-  return events;
-}
-
-function objectValue(value: unknown): Record<string, unknown> | null {
-  return value && typeof value === "object" && !Array.isArray(value)
-    ? value as Record<string, unknown>
-    : null;
 }
 
 function definiteStartError(message: string): Error {

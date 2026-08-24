@@ -882,36 +882,14 @@ describe("native agent connectors", () => {
     expect(terminalCalls[0]?.status).toBe("completed");
   });
 
-  it("uses the configured OpenCode executable with the official SDK client", async () => {
+  it("reports the official OpenCode adapter as limited until native events are streamed", async () => {
     const ctx = createFixtureContext();
-    const terminalCalls: TerminalCall[] = [];
-    const create = vi.fn().mockResolvedValue({
-      data: { id: "sdk-session-opencode" },
-    });
-    const prompt = vi.fn().mockResolvedValue({
-      data: {
-        info: {
-          id: "sdk-message-opencode",
-          role: "assistant",
-          tokens: { input: 8, output: 5, reasoning: 2, cache: { read: 0, write: 0 } },
-        },
-        parts: [
-          { type: "reasoning", text: "checking the project" },
-          { type: "text", text: "hello from official opencode sdk" },
-          {
-            type: "tool",
-            tool: "read",
-            state: { status: "completed", input: { path: "README.md" }, output: "# Ain One" },
-          },
-        ],
-      },
-    });
+    const create = vi.fn().mockResolvedValue({ data: { id: "sdk-session-opencode" } });
+    const prompt = vi.fn();
     opencodeSdk.createOpencodeClient.mockReturnValue({
       session: {
         create,
         prompt,
-        abort: vi.fn().mockResolvedValue({ data: true }),
-        update: vi.fn().mockResolvedValue({ data: {} }),
       },
     });
     const connector = createConnectorRegistry({
@@ -919,15 +897,15 @@ describe("native agent connectors", () => {
         executable: fixtureBinary("fake-opencode.mjs"),
         spawn: spawnRecorder(ctx.spawnCalls),
         env: fixtureEnv(ctx.recordPath),
+        killTimeoutMs: 50,
       },
     }).opencode;
-    setTurnCallbacks(connector, terminalCalls);
 
-    await expect(connector.probe()).resolves.toMatchObject({ status: "available" });
-    const started = await startTurn(connector, "opencode", ctx.projectPath, null);
-    await waitForSettled(started.session);
-
-    expect(opencodeSdk.createOpencode).not.toHaveBeenCalled();
+    await expect(connector.probe()).resolves.toMatchObject({
+      status: "capability_limited",
+      diagnostic: expect.stringContaining("stream"),
+    });
+    const harness = await createSessionHarness(connector, "opencode", ctx.projectPath, null);
     expect(opencodeSdk.createOpencodeClient).toHaveBeenCalledWith({
       baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/),
     });
@@ -942,46 +920,15 @@ describe("native agent connectors", () => {
       expect.objectContaining({ directory: ctx.projectPath }),
       { throwOnError: true },
     );
-    expect(prompt).toHaveBeenCalledWith(
-      expect.objectContaining({
-        sessionID: "sdk-session-opencode",
-        directory: ctx.projectPath,
-        parts: [{ type: "text", text: "say hello" }],
+    await expect(
+      connector.startTurn(harness.session, {
+        ...turnInput("opencode", null),
+        snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
       }),
-      expect.objectContaining({ throwOnError: true, signal: expect.any(AbortSignal) }),
-    );
-    expect(started.session.nativeSessionId).toBe("sdk-session-opencode");
-    expect(started.nativeTurnId).toBeNull();
-    expect(started.events).toEqual(
-      expect.arrayContaining([
-        expect.objectContaining({
-          type: "reasoning",
-          payload: expect.objectContaining({ summary: "checking the project" }),
-        }),
-        expect.objectContaining({
-          type: "assistant_message",
-          payload: expect.objectContaining({ text: "hello from official opencode sdk" }),
-        }),
-        expect.objectContaining({
-          type: "tool",
-          payload: expect.objectContaining({ name: "read", status: "completed" }),
-        }),
-        expect.objectContaining({
-          type: "usage",
-          payload: expect.objectContaining({ summary: "8 input / 5 output tokens" }),
-        }),
-        expect.objectContaining({
-          type: "turn_status",
-          payload: expect.objectContaining({ status: "completed" }),
-        }),
-      ]),
-    );
-    expect(terminalCalls).toEqual([
-      expect.objectContaining({ status: "completed", nativeTurnId: null }),
-    ]);
+    ).rejects.toMatchObject({ definiteStartRejection: true });
+    expect(prompt).not.toHaveBeenCalled();
 
-    await connector.closeSession(started.session);
-    expect(ctx.spawnCalls.find((call) => call.args[0] === "serve")?.killSignals).toContain(undefined);
+    await connector.closeSession(harness.session);
   });
 
   it("advertises only full access for the official OpenCode transport", async () => {
@@ -1009,125 +956,6 @@ describe("native agent connectors", () => {
       models: ["openai/gpt-5"],
       permissionModes: ["full_access"],
     });
-  });
-
-  it("does not report OpenCode cancelled when abort is not confirmed", async () => {
-    const ctx = createFixtureContext();
-    const prompt = createDeferred<{
-      data: { info: { tokens: { input: number; output: number } }; parts: unknown[] };
-    }>();
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      session: {
-        create: vi.fn().mockResolvedValue({ data: { id: "sdk-session-opencode" } }),
-        update: vi.fn().mockResolvedValue({ data: {} }),
-        prompt: vi.fn().mockImplementation(async () => prompt.promise),
-        abort: vi.fn().mockResolvedValue({ data: false }),
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: fixtureEnv(ctx.recordPath),
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-    const terminalCalls: TerminalCall[] = [];
-    setTurnCallbacks(connector, terminalCalls);
-    const harness = await createSessionHarness(connector, "opencode", ctx.projectPath, null);
-    await connector.startTurn(harness.session, {
-      ...turnInput("opencode", null),
-      snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
-    });
-
-    await expect(withTimeout(connector.cancelTurn(harness.session, null), 250)).resolves.toEqual({
-      confirmed: false,
-    });
-    prompt.resolve({ data: { info: { tokens: { input: 1, output: 1 } }, parts: [] } });
-    await waitForSettled(harness.session);
-    expect(terminalCalls).toEqual([expect.objectContaining({ status: "completed" })]);
-    await connector.closeSession(harness.session);
-  });
-
-  it("waits for OpenCode abort confirmation before reporting a prompt failure", async () => {
-    const ctx = createFixtureContext();
-    const prompt = createDeferred<never>();
-    const abort = createDeferred<{ data: boolean }>();
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      session: {
-        create: vi.fn().mockResolvedValue({ data: { id: "sdk-session-opencode" } }),
-        update: vi.fn().mockResolvedValue({ data: {} }),
-        prompt: vi.fn().mockImplementation(async () => prompt.promise),
-        abort: vi.fn().mockImplementation(async () => abort.promise),
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: fixtureEnv(ctx.recordPath),
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-    const terminalCalls: TerminalCall[] = [];
-    setTurnCallbacks(connector, terminalCalls);
-    const harness = await createSessionHarness(connector, "opencode", ctx.projectPath, null);
-    await connector.startTurn(harness.session, {
-      ...turnInput("opencode", null),
-      snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
-    });
-
-    const cancellation = connector.cancelTurn(harness.session, null);
-    prompt.reject(new Error("native prompt aborted"));
-    await Promise.resolve();
-    expect(terminalCalls).toEqual([]);
-
-    abort.resolve({ data: true });
-    await expect(withTimeout(cancellation, 250)).resolves.toEqual({ confirmed: true });
-    expect(terminalCalls).toEqual([expect.objectContaining({ status: "cancelled" })]);
-    await connector.closeSession(harness.session);
-  });
-
-  it("closes an active OpenCode request and escalates its server to SIGKILL", async () => {
-    const ctx = createFixtureContext();
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      session: {
-        create: vi.fn().mockResolvedValue({ data: { id: "sdk-session-opencode" } }),
-        update: vi.fn().mockResolvedValue({ data: {} }),
-        prompt: vi.fn().mockImplementation(
-          async (_input: unknown, options: { signal?: AbortSignal }) =>
-            new Promise((_resolvePromise, rejectPromise) => {
-              options.signal?.addEventListener(
-                "abort",
-                () => rejectPromise(options.signal?.reason ?? new Error("aborted")),
-                { once: true },
-              );
-            }),
-        ),
-        abort: vi.fn().mockResolvedValue({ data: true }),
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "ignore-sigterm" },
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-    const terminalCalls: TerminalCall[] = [];
-    setTurnCallbacks(connector, terminalCalls);
-    const harness = await createSessionHarness(connector, "opencode", ctx.projectPath, null);
-    await connector.startTurn(harness.session, {
-      ...turnInput("opencode", null),
-      snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
-    });
-
-    await expect(withTimeout(connector.closeSession(harness.session), 500)).resolves.toBeUndefined();
-    expect(ctx.spawnCalls.find((call) => call.args[0] === "serve")?.killSignals).toEqual(
-      expect.arrayContaining([undefined, "SIGKILL"]),
-    );
-    expect(terminalCalls).toEqual([expect.objectContaining({ status: "interrupted" })]);
   });
 
   it("escalates OpenCode server cleanup when startup URL detection times out", async () => {
@@ -1304,9 +1132,9 @@ describe("native agent connectors", () => {
     }
 
     await expect(
-      withTimeout(connector.startTurn(harness.session, input), 250),
+      withTimeout(connector.startTurn(harness.session, input), 500),
     ).rejects.toThrow(/native session id/i);
-    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    await expect(withTimeout(waitForSettled(harness.session), 500)).resolves.toBeUndefined();
     expect(harness.session.nativeSessionId).toBe(expectedSessionId);
     expect(harness.nativeSessionIds).toEqual([]);
   });

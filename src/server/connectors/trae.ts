@@ -1,5 +1,5 @@
 import type { AgentCatalog, AgentProbe, LiveSession, SessionInput, StartTurnInput } from "../../shared/contracts.js";
-import { BaseConnectorOptions, isMissingExecutableError, parseVersion, UnsupportedCapabilityError } from "./base.js";
+import { BaseConnectorOptions, isMissingExecutableError, parseVersion } from "./base.js";
 import { CliJsonlConnector, readMcpArtifact, renderTomlMcpOverride } from "./cli-jsonl.js";
 
 export class TraeConnector extends CliJsonlConnector {
@@ -45,7 +45,10 @@ export class TraeConnector extends CliJsonlConnector {
     try {
       const result = await this.runCommand({ args: ["models", "--json"] });
       if (result.exitCode !== 0) {
-        return { models: [], permissionModes: ["request_approval", "full_access"] };
+        return {
+          models: [],
+          permissionModes: ["request_approval", "help_me_approve", "full_access"],
+        };
       }
       const parsed = JSON.parse(result.stdout) as unknown;
       const items = Array.isArray(parsed)
@@ -69,10 +72,13 @@ export class TraeConnector extends CliJsonlConnector {
                   : null;
           })
           .filter((value): value is string => Boolean(value)),
-        permissionModes: ["request_approval", "full_access"],
+        permissionModes: ["request_approval", "help_me_approve", "full_access"],
       };
     } catch {
-      return { models: [], permissionModes: ["request_approval", "full_access"] };
+      return {
+        models: [],
+        permissionModes: ["request_approval", "help_me_approve", "full_access"],
+      };
     }
   }
 
@@ -90,11 +96,11 @@ export class TraeConnector extends CliJsonlConnector {
     if (input.snapshot.modelId) {
       args.push("--model", input.snapshot.modelId);
     }
+    if (input.snapshot.permissionMode === "request_approval") {
+      args.push("--permission-mode", "default");
+    }
     if (input.snapshot.permissionMode === "help_me_approve") {
-      throw new UnsupportedCapabilityError(
-        "help_me_approve",
-        "Trae assisted approval is not supported in non-interactive exec mode",
-      );
+      args.push("--permission-mode", "auto");
     }
     if (input.snapshot.permissionMode === "full_access") {
       args.push("--permission-mode", "bypass_permissions", "--dangerously-bypass-approvals-and-sandbox");

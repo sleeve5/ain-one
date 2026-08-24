@@ -38,6 +38,7 @@ export interface BaseConnectorOptions {
   spawn?: SpawnLike;
   env?: NodeJS.ProcessEnv;
   killTimeoutMs?: number;
+  commandTimeoutMs?: number;
   maxStderrBytes?: number;
   modelsCachePath?: string;
 }
@@ -77,6 +78,7 @@ export abstract class BaseConnector implements AgentConnector {
   protected readonly spawn: SpawnLike;
   protected readonly env: NodeJS.ProcessEnv;
   protected readonly killTimeoutMs: number;
+  protected readonly commandTimeoutMs: number;
   protected readonly maxStderrBytes: number;
   protected readonly modelsCachePath?: string;
   private callbacks: ConnectorCallbacks | null = null;
@@ -86,6 +88,7 @@ export abstract class BaseConnector implements AgentConnector {
     this.spawn = options.spawn ?? nodeSpawn;
     this.env = options.env ?? {};
     this.killTimeoutMs = options.killTimeoutMs ?? 1_000;
+    this.commandTimeoutMs = options.commandTimeoutMs ?? 5_000;
     this.maxStderrBytes = options.maxStderrBytes ?? 4_096;
     this.modelsCachePath = options.modelsCachePath;
   }
@@ -224,6 +227,11 @@ export abstract class BaseConnector implements AgentConnector {
     if (session.nativeSessionId === nextNativeSessionId) {
       return;
     }
+    if (session.nativeSessionId != null) {
+      throw new Error(
+        `Native session id changed from ${session.nativeSessionId} to ${nextNativeSessionId}`,
+      );
+    }
     session.nativeSessionId = nextNativeSessionId;
     await session.onNativeSessionId?.(nextNativeSessionId);
   }
@@ -273,9 +281,28 @@ export abstract class BaseConnector implements AgentConnector {
     child.stdout?.on("data", (chunk: Buffer) => append(stdout, chunk));
     child.stderr?.on("data", (chunk: Buffer) => append(stderr, chunk));
 
+    let timeoutError: Error | null = null;
+    let killTimer: NodeJS.Timeout | null = null;
+    const timeout = setTimeout(() => {
+      timeoutError = new Error(`Command timed out after ${this.commandTimeoutMs}ms`);
+      child.kill("SIGTERM");
+      killTimer = setTimeout(() => child.kill("SIGKILL"), this.killTimeoutMs);
+    }, this.commandTimeoutMs);
     const close = new Promise<number>((resolvePromise, rejectPromise) => {
-      child.once("error", rejectPromise);
-      child.once("close", (code) => resolvePromise(code ?? 0));
+      child.once("error", (error) => {
+        clearTimeout(timeout);
+        if (killTimer) {
+          clearTimeout(killTimer);
+        }
+        rejectPromise(error);
+      });
+      child.once("close", (code) => {
+        clearTimeout(timeout);
+        if (killTimer) {
+          clearTimeout(killTimer);
+        }
+        resolvePromise(code ?? 0);
+      });
     });
 
     if (typeof input.stdin === "string") {
@@ -285,6 +312,9 @@ export abstract class BaseConnector implements AgentConnector {
     }
 
     const exitCode = await close;
+    if (timeoutError) {
+      throw timeoutError;
+    }
     return {
       exitCode,
       stdout: Buffer.concat(stdout).toString("utf8"),

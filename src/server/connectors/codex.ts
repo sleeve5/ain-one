@@ -76,6 +76,9 @@ export class CodexConnector extends CliJsonlConnector {
         args.push("--approve-for-me");
       }
     }
+    if (input.snapshot.permissionMode === "request_approval") {
+      args.push("-c", 'approval_policy="on-request"');
+    }
     if (input.snapshot.permissionMode === "full_access") {
       args.push("--dangerously-bypass-approvals-and-sandbox");
     }

@@ -175,7 +175,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
     };
 
     const maybeResolveStart = (): void => {
-      if (startSettled) {
+      if (startSettled || abortError) {
         return;
       }
       if (!persistedSessionId) {

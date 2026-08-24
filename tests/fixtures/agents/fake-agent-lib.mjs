@@ -55,7 +55,9 @@ process.exit(0);
 
 async function runExec(productId, argv) {
   const scenario = process.env.AIN_FIXTURE_SCENARIO ?? "normal";
-  const sessionId = sessionIdFor(productId, argv);
+  const sessionId = scenario === "session-id-drift"
+    ? `drifted-native-session-${productId}`
+    : sessionIdFor(productId, argv);
 
   if (scenario === "nonzero-before-identity") {
     process.stderr.write("native process failed before identity\n");

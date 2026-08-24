@@ -158,15 +158,23 @@ describe("native agent connectors", () => {
       probeStatus: "capability_limited",
       catalog: {
         models: ["trae-sonnet", "trae-opus"],
-        permissionModes: ["request_approval", "full_access"],
+        permissionModes: ["request_approval", "help_me_approve", "full_access"],
       },
-      startArgs: ["exec", "--json", "--skip-git-repo-check"],
+      startArgs: [
+        "exec",
+        "--json",
+        "--skip-git-repo-check",
+        "--permission-mode",
+        "default",
+      ],
       resumeArgs: [
         "exec",
         "resume",
         "native-session-trae",
         "--json",
         "--skip-git-repo-check",
+        "--permission-mode",
+        "default",
       ],
     },
   ];
@@ -477,7 +485,38 @@ describe("native agent connectors", () => {
     });
   });
 
-  it("lets Trae use its headless default for request approval", async () => {
+  it("maps request approval explicitly for Codex", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, {
+      ...turnInput("codex", null),
+      snapshot: {
+        modelId: null,
+        permissionMode: "request_approval",
+        pluginVersions: [],
+      },
+    });
+    await waitForSettled(harness.session);
+
+    const execRecord = readRecords(ctx.recordPath).find((record) => record.commandType === "exec");
+    expect(execRecord?.args).toEqual([
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "-c",
+      'approval_policy="on-request"',
+    ]);
+  });
+
+  it("maps request approval explicitly for Trae", async () => {
     const ctx = createFixtureContext();
     const connector = new TraeConnector({
       executable: fixtureBinary("fake-traecli.mjs"),
@@ -498,10 +537,16 @@ describe("native agent connectors", () => {
     await waitForSettled(harness.session);
 
     const execRecord = readRecords(ctx.recordPath).find((record) => record.commandType === "exec");
-    expect(execRecord?.args).toEqual(["exec", "--json", "--skip-git-repo-check"]);
+    expect(execRecord?.args).toEqual([
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--permission-mode",
+      "default",
+    ]);
   });
 
-  it("rejects Trae assisted approval before starting its headless process", async () => {
+  it("maps Trae assisted approval to its supported auto mode", async () => {
     const ctx = createFixtureContext();
     const connector = new TraeConnector({
       executable: fixtureBinary("fake-traecli.mjs"),
@@ -510,10 +555,17 @@ describe("native agent connectors", () => {
     });
     const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null);
 
-    await expect(
-      connector.startTurn(harness.session, turnInput("trae", null)),
-    ).rejects.toMatchObject({ definiteStartRejection: true });
-    expect(ctx.spawnCalls.filter((call) => call.args[0] === "exec")).toHaveLength(0);
+    await connector.startTurn(harness.session, turnInput("trae", null));
+    await waitForSettled(harness.session);
+
+    const execRecord = readRecords(ctx.recordPath).find((record) => record.commandType === "exec");
+    expect(execRecord?.args).toEqual([
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--permission-mode",
+      "auto",
+    ]);
   });
 
   it.each([
@@ -649,6 +701,34 @@ describe("native agent connectors", () => {
   it("reports missing executables truthfully", async () => {
     const connector = new CodexConnector({ executable: "/missing/codex" });
     await expect(connector.probe()).resolves.toMatchObject({ status: "not_installed" });
+  });
+
+  it("bounds probe subprocesses", async () => {
+    const connector = new CodexConnector({
+      executable: "codex",
+      spawn: () => createHangingChild(),
+      commandTimeoutMs: 20,
+      killTimeoutMs: 10,
+    });
+
+    await expect(withTimeout(connector.probe(), 100)).resolves.toMatchObject({
+      status: "runtime_error",
+      diagnostic: expect.stringContaining("timed out"),
+    });
+  });
+
+  it("bounds catalog subprocesses", async () => {
+    const connector = new TraeConnector({
+      executable: "traecli",
+      spawn: () => createHangingChild(),
+      commandTimeoutMs: 20,
+      killTimeoutMs: 10,
+    });
+
+    await expect(withTimeout(connector.fetchCatalog("/tmp/project"), 100)).resolves.toEqual({
+      models: [],
+      permissionModes: ["request_approval", "help_me_approve", "full_access"],
+    });
   });
 
   it("classifies a missing executable as a definite start rejection", async () => {
@@ -1196,6 +1276,40 @@ describe("native agent connectors", () => {
     await expect(startPromise).resolves.toMatchObject({ nativeTurnId: "native-turn-codex" });
   });
 
+  it.each([
+    { id: "codex" as const, binary: "fake-codex.mjs" },
+    { id: "claude" as const, binary: "fake-claude.mjs" },
+    { id: "trae" as const, binary: "fake-traecli.mjs" },
+  ])("rejects a drifted native session id while resuming $id", async ({ id, binary }) => {
+    const ctx = createFixtureContext();
+    const connector = createConnectorRegistry({
+      [id]: {
+        executable: fixtureBinary(binary),
+        spawn: spawnRecorder(ctx.spawnCalls),
+        modelsCachePath: ctx.modelsCachePath,
+        env: {
+          ...fixtureEnv(ctx.recordPath),
+          HOME: ctx.root,
+          AIN_FIXTURE_SCENARIO: "session-id-drift",
+        },
+        killTimeoutMs: 50,
+      },
+    })[id]!;
+    const expectedSessionId = `native-session-${id}`;
+    const harness = await createSessionHarness(connector, id, ctx.projectPath, expectedSessionId);
+    const input = turnInput(id, expectedSessionId);
+    if (id === "trae") {
+      input.snapshot.permissionMode = "request_approval";
+    }
+
+    await expect(
+      withTimeout(connector.startTurn(harness.session, input), 250),
+    ).rejects.toThrow(/native session id/i);
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(harness.session.nativeSessionId).toBe(expectedSessionId);
+    expect(harness.nativeSessionIds).toEqual([]);
+  });
+
   it("interrupts a new session if the process exits before a native session id is persisted", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({
@@ -1557,6 +1671,24 @@ function spawnRecorder(calls: SpawnCall[]) {
     }) as typeof child.kill;
     return child;
   };
+}
+
+function createHangingChild(): ChildProcess {
+  const child = Object.assign(new EventEmitter(), {
+    stdout: new PassThrough(),
+    stderr: new PassThrough(),
+    stdin: new PassThrough(),
+    pid: undefined,
+    exitCode: null,
+    signalCode: null,
+  }) as unknown as ChildProcess;
+  child.kill = ((signal?: NodeJS.Signals | number) => {
+    (child as ChildProcess & { signalCode: NodeJS.Signals | null }).signalCode =
+      typeof signal === "string" ? signal : "SIGTERM";
+    queueMicrotask(() => child.emit("close", null, child.signalCode));
+    return true;
+  }) as typeof child.kill;
+  return child;
 }
 
 function setTurnCallbacks(connector: AgentConnector, terminalCalls: TerminalCall[]): void {

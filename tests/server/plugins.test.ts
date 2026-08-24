@@ -1,11 +1,14 @@
 import { spawn } from "node:child_process";
 import {
+  cpSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
   readFileSync,
   readlinkSync,
+  readdirSync,
   realpathSync,
+  renameSync,
   rmSync,
   symlinkSync,
   writeFileSync,
@@ -204,6 +207,112 @@ describe("plugin hub", () => {
     expect(second.contentHash).not.toBe(first.contentHash);
     expect(readFileSync(canonicalSkill, "utf8")).toBe(before);
     expect(existsSync(join(second.canonicalPath, "SKILL.md"))).toBe(true);
+  });
+
+  it("rejects reinstalling identical content with different compatibility", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const skillDir = createSkillFixture(root, "metadata-bound-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+
+    await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+
+    await expect(
+      hub.installLocal({
+        path: skillDir,
+        compatibility: { claude: { kind: "skill" } },
+      }),
+    ).rejects.toThrow("metadata conflict");
+    expect(hub.listInstalled()[0]?.compatibleAgents).toEqual(["codex"]);
+  });
+
+  it("rejects reinstalling identical content when stored type conflicts", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const skillDir = createSkillFixture(root, "type-bound-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    const installed = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    const metadataPath = join(dataDir, "plugins.metadata.json");
+    const metadata = JSON.parse(readFileSync(metadataPath, "utf8")) as {
+      versions: Record<string, Record<string, { type: string }>>;
+    };
+    metadata.versions[installed.pluginId]![installed.versionId]!.type = "mcp";
+    writeFileSync(metadataPath, `${JSON.stringify(metadata, null, 2)}\n`, "utf8");
+
+    const reopened = createPluginHub({ dataDir, skillRoots: {} });
+    await expect(
+      reopened.installLocal({
+        path: skillDir,
+        compatibility: { codex: { kind: "skill" } },
+      }),
+    ).rejects.toThrow("metadata conflict");
+  });
+
+  it("rejects a symlink introduced after source hashing without storing a version", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const skillDir = createSkillFixture(root, "racy-skill");
+    const markerPath = join(skillDir, "zz-marker.txt");
+    const replacementPath = join(root, "replacement.txt");
+    for (let index = 0; index < 64; index += 1) {
+      writeFileSync(join(skillDir, `${String(index).padStart(2, "0")}.bin`), Buffer.alloc(1024 * 1024, index));
+    }
+    writeFileSync(markerPath, "original\n", "utf8");
+    writeFileSync(replacementPath, "replacement\n", "utf8");
+
+    const tempParent = join(dataDir, "plugins", "racy-skill");
+    const mutator = spawn(
+      process.execPath,
+      [
+        "-e",
+        `const fs = require("node:fs"); const parent = ${JSON.stringify(tempParent)}; const marker = ${JSON.stringify(markerPath)}; const replacement = ${JSON.stringify(replacementPath)}; const end = Date.now() + 5000; while (Date.now() < end) { try { if (fs.readdirSync(parent).some((name) => name.includes(".tmp-"))) { fs.rmSync(marker, { force: true }); fs.symlinkSync(replacement, marker); process.exit(0); } } catch {} Atomics.wait(new Int32Array(new SharedArrayBuffer(4)), 0, 0, 1); } process.exit(2);`,
+      ],
+      { stdio: "ignore" },
+    );
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    let installError: unknown;
+    try {
+      await hub.installLocal({
+        path: skillDir,
+        compatibility: { codex: { kind: "skill" } },
+      });
+    } catch (error) {
+      installError = error;
+    }
+    const exitCode = await new Promise<number | null>((resolvePromise) => {
+      mutator.once("close", resolvePromise);
+    });
+
+    expect(exitCode).toBe(0);
+    expect(installError).toBeInstanceOf(Error);
+    expect((installError as Error).message).toMatch(/symlink|changed during copy/);
+    expect(hub.listInstalled()).toEqual([]);
+    expect(existsSync(tempParent) ? readdirSync(tempParent) : []).toEqual([]);
+  });
+
+  it("rejects materialization when canonical content was tampered", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(codexSkillRoot, { recursive: true });
+    const skillDir = createSkillFixture(root, "tampered-canonical-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+    const installed = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    writeFileSync(join(installed.canonicalPath, "SKILL.md"), "# tampered\n", "utf8");
+
+    await expect(hub.materialize("codex", [installed])).rejects.toThrow(
+      "canonical content hash mismatch",
+    );
+    expect(existsSync(join(codexSkillRoot, installed.pluginId))).toBe(false);
   });
 
   it("rejects symlink source path", async () => {
@@ -475,6 +584,110 @@ describe("plugin hub", () => {
       false,
     );
     expect(readFileSync(metadataPath, "utf8")).toBe(metadataBefore);
+  });
+
+  it("rolls back an interrupted materialization journal during hub startup", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const skillRoot = join(root, "codex-skills");
+    const skillDir = createSkillFixture(root, "journal-skill");
+    mkdirSync(skillRoot, { recursive: true });
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: skillRoot } });
+    const first = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    await hub.materialize("codex", [first]);
+    writeFileSync(join(skillDir, "README.md"), "second version\n", "utf8");
+    const second = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+
+    const targetPath = join(skillRoot, first.pluginId);
+    const firstMaterialized = join(
+      dataDir,
+      "materialized",
+      "codex",
+      first.pluginId,
+      first.versionId,
+    );
+    const secondMaterialized = join(
+      dataDir,
+      "materialized",
+      "codex",
+      second.pluginId,
+      second.versionId,
+    );
+    const targetBackup = `${targetPath}.backup-interrupted`;
+    mkdirSync(join(secondMaterialized, ".."), { recursive: true });
+    cpSync(second.canonicalPath, secondMaterialized, { recursive: true });
+    renameSync(targetPath, targetBackup);
+    symlinkSync(secondMaterialized, targetPath, "dir");
+    writeFileSync(
+      join(dataDir, "materialization.journal.json"),
+      `${JSON.stringify({
+        format: "ain-one.materialization-journal.v1",
+        phase: "applying",
+        entries: [
+          {
+            path: secondMaterialized,
+            stagedPath: `${secondMaterialized}.stage-interrupted`,
+            backupPath: null,
+            originalIdentity: null,
+            replacementIdentity: { kind: "directory", hash: second.versionId },
+          },
+          {
+            path: targetPath,
+            stagedPath: `${targetPath}.stage-interrupted`,
+            backupPath: targetBackup,
+            originalIdentity: { kind: "symlink", target: firstMaterialized },
+            replacementIdentity: { kind: "symlink", target: secondMaterialized },
+          },
+        ],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const recovered = createPluginHub({ dataDir, skillRoots: { codex: skillRoot } });
+    await expect(recovered.materialize("codex", [first])).resolves.toMatchObject({
+      applied: [first],
+    });
+    expect(readlinkSync(targetPath)).toBe(firstMaterialized);
+    expect(existsSync(secondMaterialized)).toBe(false);
+    expect(existsSync(targetBackup)).toBe(false);
+    expect(existsSync(join(dataDir, "materialization.journal.json"))).toBe(false);
+  });
+
+  it("rejects a journal that targets paths outside PluginHub-managed roots", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const victimTarget = join(root, "victim-target");
+    const victimPath = join(root, "do-not-delete");
+    mkdirSync(dataDir, { recursive: true });
+    mkdirSync(victimTarget);
+    symlinkSync(victimTarget, victimPath, "dir");
+    writeFileSync(
+      join(dataDir, "materialization.journal.json"),
+      `${JSON.stringify({
+        format: "ain-one.materialization-journal.v1",
+        phase: "applying",
+        entries: [
+          {
+            path: victimPath,
+            stagedPath: null,
+            backupPath: null,
+            originalIdentity: null,
+            replacementIdentity: { kind: "symlink", target: victimTarget },
+          },
+        ],
+      }, null, 2)}\n`,
+      "utf8",
+    );
+
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    await expect(hub.scanNative([])).rejects.toThrow("invalid materialization journal path");
+    expect(readlinkSync(victimPath)).toBe(victimTarget);
   });
 
   it("preserves the previous managed target when a later plugin fails validation", async () => {
@@ -876,6 +1089,32 @@ describe("plugin hub", () => {
     expect(artifact.servers[0]?.pluginId).toBe("demo-mcp");
 
     expect(readFileSync(globalConfig, "utf8")).toBe('{"unchanged":true}\n');
+  });
+
+  it("rejects MCP compatibility targeting another Agent product", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const mcpPath = join(root, "cross-agent-mcp.json");
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({
+        format: "ain-one.mcp.v1",
+        pluginId: "cross-agent-mcp",
+        compatibility: {
+          codex: {
+            kind: "mcp",
+            target: "claude.mcp.v1",
+            server: { command: "node", args: ["server.js"] },
+          },
+        },
+      }),
+      "utf8",
+    );
+
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow(
+      "target must be codex.mcp.v1",
+    );
   });
 
   it("requires the claimed Turn ID before materializing MCP configuration", async () => {

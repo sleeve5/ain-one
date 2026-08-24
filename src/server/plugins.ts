@@ -1,12 +1,15 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
-  copyFileSync,
+  constants,
   existsSync,
+  fstatSync,
+  fsyncSync,
   lstatSync,
   mkdirSync,
   openSync,
   readFileSync,
+  readlinkSync,
   readdirSync,
   realpathSync,
   renameSync,
@@ -14,7 +17,8 @@ import {
   symlinkSync,
   writeFileSync,
 } from "node:fs";
-import { basename, dirname, join, resolve } from "node:path";
+import { basename, dirname, isAbsolute, join, relative, resolve, sep } from "node:path";
+import { isDeepStrictEqual } from "node:util";
 import type { AgentProductId, PluginVersion } from "../shared/contracts.js";
 
 type PluginType = "skill" | "mcp";
@@ -142,6 +146,25 @@ interface PluginMetadata {
   managedTargets: Partial<Record<AgentProductId, Record<string, ManagedTarget>>>;
 }
 
+type PathIdentity =
+  | { kind: "directory"; hash: string }
+  | { kind: "file"; hash: string }
+  | { kind: "symlink"; target: string };
+
+interface MaterializationJournalEntry {
+  path: string;
+  stagedPath: string | null;
+  backupPath: string | null;
+  originalIdentity: PathIdentity | null;
+  replacementIdentity: PathIdentity | null;
+}
+
+interface MaterializationJournal {
+  format: typeof MATERIALIZATION_JOURNAL_FORMAT;
+  phase: "applying" | "committed";
+  entries: MaterializationJournalEntry[];
+}
+
 const EMPTY_METADATA: PluginMetadata = {
   versions: {},
   candidates: {},
@@ -149,6 +172,7 @@ const EMPTY_METADATA: PluginMetadata = {
 };
 
 const MCP_FORMAT = "ain-one.mcp.v1";
+const MATERIALIZATION_JOURNAL_FORMAT = "ain-one.materialization-journal.v1";
 const METADATA_LOCK_POLL_MS = 10;
 const METADATA_LOCK_TIMEOUT_MS = 10_000;
 const STALE_METADATA_LOCK_MS = 30_000;
@@ -160,11 +184,17 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
   const materializedDir = join(dataDir, "materialized");
   const artifactsDir = join(dataDir, "turn-artifacts");
   const metadataPath = join(dataDir, "plugins.metadata.json");
+  const journalPath = join(dataDir, "materialization.journal.json");
   mkdirSync(dataDir, { recursive: true });
   mkdirSync(pluginsDir, { recursive: true });
+  const startupRecovery = withMetadataLock(metadataPath, () => {
+    recoverMaterializationJournal(journalPath, dataDir, options.skillRoots);
+  });
+  void startupRecovery.catch(() => undefined);
 
-  const scanNative = async (inputs: ScanNativeInput[]): Promise<PluginCandidate[]> =>
-    withMetadataLock(metadataPath, () => {
+  const scanNative = async (inputs: ScanNativeInput[]): Promise<PluginCandidate[]> => {
+    await startupRecovery;
+    return withMetadataLock(metadataPath, () => {
       const metadata = loadMetadata(metadataPath);
       const candidates: PluginCandidate[] = [];
       for (const item of inputs) {
@@ -216,9 +246,11 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
       saveMetadata(metadataPath, metadata);
       return candidates;
     });
+  };
 
   return {
     listInstalled() {
+      assertNoPendingMaterializationRecovery(journalPath);
       const metadata = loadMetadata(metadataPath);
       return Object.values(metadata.versions)
         .flatMap((versions) => Object.values(versions))
@@ -236,12 +268,14 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
     },
 
     listCandidates() {
+      assertNoPendingMaterializationRecovery(journalPath);
       return Object.values(loadMetadata(metadataPath).candidates)
         .map(mapCandidate)
         .sort((left, right) => left.pluginId.localeCompare(right.pluginId));
     },
 
     async installLocal(input) {
+      await startupRecovery;
       return withMetadataLock(metadataPath, () => {
         const metadata = loadMetadata(metadataPath);
         const source = inspectSource(input.path, input.compatibility);
@@ -266,6 +300,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
     },
 
     async acceptCandidate(candidateId) {
+      await startupRecovery;
       return withMetadataLock(metadataPath, () => {
         const metadata = loadMetadata(metadataPath);
         const candidate = metadata.candidates[candidateId];
@@ -285,6 +320,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
     },
 
     async repairMaterialization(agentProductId, plugin) {
+      await startupRecovery;
       await withMetadataLock(metadataPath, () => {
         const metadata = loadMetadata(metadataPath);
         const version = getStoredVersion(metadata, plugin.pluginId, plugin.versionId);
@@ -299,11 +335,13 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
           materializedDir,
           artifactsDir,
           metadataPath,
+          journalPath,
         });
       });
     },
 
     resolveForTurn(input) {
+      assertNoPendingMaterializationRecovery(journalPath);
       const metadata = loadMetadata(metadataPath);
       const resolved = new Map<string, PluginVersion>();
       applyScope(resolved, input.global ?? [], metadata);
@@ -319,6 +357,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
     },
 
     async materialize(agentProductId, plugins, materializeOptions) {
+      await startupRecovery;
       return withMetadataLock(metadataPath, () =>
         materializeTransaction({
           agentProductId,
@@ -329,6 +368,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
           materializedDir,
           artifactsDir,
           metadataPath,
+          journalPath,
         }),
       );
     },
@@ -362,6 +402,7 @@ function inspectSource(
     const pluginId = normalizePluginId(basename(absolutePath));
     const contentHash = hashSkillDirectory(absolutePath);
     const compatibility = compatibilityInput ?? {};
+    validateCompatibilityTargets(compatibility);
     return {
       path: absolutePath,
       pluginId,
@@ -374,6 +415,7 @@ function inspectSource(
   const raw = readFileSync(absolutePath, "utf8");
   const parsed = parseMcpDefinition(raw);
   const compatibility = parsed.compatibility;
+  validateCompatibilityTargets(compatibility);
   const hash = hashBytes("plugin.json", Buffer.from(raw, "utf8"));
   return {
     path: absolutePath,
@@ -463,12 +505,25 @@ function storeVersion(input: {
     input.source.contentHash,
   );
   if (existing) {
+    if (
+      existing.type !== input.source.type ||
+      existing.contentHash !== input.source.contentHash ||
+      !isDeepStrictEqual(existing.compatibility, input.source.compatibility)
+    ) {
+      throw new Error("plugin version metadata conflict");
+    }
+    assertCanonicalIntegrity(existing);
     return existing;
   }
 
   const versionId = input.source.contentHash;
   const canonicalPath = join(input.pluginsDir, input.source.pluginId, input.source.contentHash);
-  copyCanonicalImmutable(input.source.path, canonicalPath, input.source.type);
+  copyCanonicalImmutable(
+    input.source.path,
+    canonicalPath,
+    input.source.type,
+    input.source.contentHash,
+  );
 
   const stored: StoredVersion = {
     pluginId: input.source.pluginId,
@@ -483,9 +538,22 @@ function storeVersion(input: {
   return stored;
 }
 
-function copyCanonicalImmutable(sourcePath: string, destinationPath: string, type: PluginType): void {
-  if (existsSync(destinationPath)) {
-    return;
+function copyCanonicalImmutable(
+  sourcePath: string,
+  destinationPath: string,
+  type: PluginType,
+  expectedHash: string,
+): void {
+  if (safeLstat(destinationPath)) {
+    try {
+      if (hashCanonicalPath(destinationPath, type) !== expectedHash) {
+        throw new Error("canonical content hash mismatch");
+      }
+      return;
+    } catch (error) {
+      removePath(destinationPath);
+      throw error;
+    }
   }
   mkdirSync(dirname(destinationPath), { recursive: true });
   const tempPath = `${destinationPath}.tmp-${randomUUID()}`;
@@ -494,7 +562,10 @@ function copyCanonicalImmutable(sourcePath: string, destinationPath: string, typ
       copyDirectoryWithoutSymlink(sourcePath, tempPath);
     } else {
       mkdirSync(tempPath, { recursive: true });
-      copyFileSync(sourcePath, join(tempPath, "plugin.json"));
+      copyFileWithoutSymlink(sourcePath, join(tempPath, "plugin.json"));
+    }
+    if (hashCanonicalPath(tempPath, type) !== expectedHash) {
+      throw new Error("source changed during copy");
     }
     renameSync(tempPath, destinationPath);
   } catch (error) {
@@ -504,29 +575,76 @@ function copyCanonicalImmutable(sourcePath: string, destinationPath: string, typ
 }
 
 function copyDirectoryWithoutSymlink(source: string, destination: string): void {
-  const stats = lstatSync(source);
-  if (stats.isSymbolicLink()) {
+  const before = lstatSync(source);
+  if (before.isSymbolicLink()) {
     throw new Error("symlink source is not allowed");
   }
-  if (!stats.isDirectory()) {
+  if (!before.isDirectory()) {
     throw new Error("skill source must be a directory");
   }
   mkdirSync(destination, { recursive: true });
   for (const entry of readdirSync(source, { withFileTypes: true })) {
     const sourceChild = join(source, entry.name);
     const destinationChild = join(destination, entry.name);
-    if (entry.isSymbolicLink()) {
+    const stats = lstatSync(sourceChild);
+    if (stats.isSymbolicLink()) {
       throw new Error("symlink source is not allowed");
     }
-    if (entry.isDirectory()) {
+    if (stats.isDirectory()) {
       copyDirectoryWithoutSymlink(sourceChild, destinationChild);
       continue;
     }
-    if (entry.isFile()) {
-      copyFileSync(sourceChild, destinationChild);
+    if (stats.isFile()) {
+      copyFileWithoutSymlink(sourceChild, destinationChild);
       continue;
     }
     throw new Error("unsupported source entry");
+  }
+  const after = lstatSync(source);
+  if (after.isSymbolicLink() || after.dev !== before.dev || after.ino !== before.ino) {
+    throw new Error("source changed during copy");
+  }
+}
+
+function copyFileWithoutSymlink(source: string, destination: string): void {
+  writeFileSync(destination, readFileWithoutSymlink(source), { flag: "wx" });
+}
+
+function readFileWithoutSymlink(source: string): Buffer {
+  const descriptor = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    if (!fstatSync(descriptor).isFile()) {
+      throw new Error("source file changed during copy");
+    }
+    return readFileSync(descriptor);
+  } finally {
+    closeSync(descriptor);
+  }
+}
+
+function hashCanonicalPath(pathValue: string, type: PluginType): string {
+  const root = lstatSync(pathValue);
+  if (root.isSymbolicLink() || !root.isDirectory()) {
+    throw new Error("canonical content hash mismatch");
+  }
+  if (type === "skill") {
+    return hashSkillDirectory(pathValue);
+  }
+  const pluginPath = join(pathValue, "plugin.json");
+  const plugin = lstatSync(pluginPath);
+  if (plugin.isSymbolicLink() || !plugin.isFile()) {
+    throw new Error("canonical content hash mismatch");
+  }
+  return hashBytes("plugin.json", readFileWithoutSymlink(pluginPath));
+}
+
+function assertCanonicalIntegrity(version: StoredVersion): void {
+  try {
+    if (hashCanonicalPath(version.canonicalPath, version.type) !== version.contentHash) {
+      throw new Error("mismatch");
+    }
+  } catch {
+    throw new Error(`canonical content hash mismatch: ${version.pluginId}@${version.versionId}`);
   }
 }
 
@@ -556,7 +674,7 @@ function walkSkillFiles(root: string, relativePath: string, hash: ReturnType<typ
     if (!stats.isFile()) {
       throw new Error("unsupported source entry");
     }
-    const bytes = readFileSync(childAbsolute);
+    const bytes = readFileWithoutSymlink(childAbsolute);
     hash.update(childRelative);
     hash.update("\0");
     hash.update(bytes);
@@ -615,16 +733,10 @@ interface SkillMaterializationPlan {
   materializedPath: string;
   stagedCopyPath: string;
   stagedLinkPath: string;
-  previousTargetBackup: string | null;
-  previousMaterializedBackup: string | null;
-  targetSwitched: boolean;
-  materializedSwitched: boolean;
 }
 
 interface StaleManagedTargetPlan {
   targetPath: string;
-  backupPath: string | null;
-  switched: boolean;
 }
 
 function materializeTransaction(input: {
@@ -636,6 +748,7 @@ function materializeTransaction(input: {
   materializedDir: string;
   artifactsDir: string;
   metadataPath: string;
+  journalPath: string;
 }): MaterializeResult {
   const metadata = loadMetadata(input.metadataPath);
   const skillPlans: SkillMaterializationPlan[] = [];
@@ -652,6 +765,7 @@ function materializeTransaction(input: {
     if (!version) {
       throw new Error("plugin version not found");
     }
+    assertCanonicalIntegrity(version);
 
     if (version.type === "mcp") {
       const compatibility = version.compatibility[input.agentProductId];
@@ -689,10 +803,6 @@ function materializeTransaction(input: {
       materializedPath,
       stagedCopyPath: `${materializedPath}.stage-${randomUUID()}`,
       stagedLinkPath: join(dirname(targetPath), `${plugin.pluginId}.stage-${randomUUID()}`),
-      previousTargetBackup: null,
-      previousMaterializedBackup: null,
-      targetSwitched: false,
-      materializedSwitched: false,
     });
   }
 
@@ -708,11 +818,7 @@ function materializeTransaction(input: {
         managed.pluginId,
         managed.targetPath,
       );
-      stalePlans.push({
-        targetPath: managed.targetPath,
-        backupPath: null,
-        switched: false,
-      });
+      stalePlans.push({ targetPath: managed.targetPath });
     }
   }
 
@@ -725,10 +831,8 @@ function materializeTransaction(input: {
       ? join(input.artifactsDir, input.agentProductId, `${turnId!}.json`)
       : null;
   const stagedArtifactPath = artifactPath ? `${artifactPath}.stage-${randomUUID()}` : null;
-  const artifactBackupPath = artifactPath && existsSync(artifactPath)
-    ? `${artifactPath}.backup-${randomUUID()}`
-    : null;
-  let artifactSwitched = false;
+  const stagedMetadataPath = `${input.metadataPath}.stage-${randomUUID()}`;
+  let journalWritten = false;
 
   try {
     for (const plan of skillPlans) {
@@ -746,39 +850,14 @@ function materializeTransaction(input: {
       });
     }
 
-    for (const plan of stalePlans) {
-      if (!safeLstat(plan.targetPath)) {
-        continue;
-      }
-      plan.backupPath = `${plan.targetPath}.backup-${randomUUID()}`;
-      renameSync(plan.targetPath, plan.backupPath);
-      plan.switched = true;
-    }
-
     for (const plan of skillPlans) {
-      mkdirSync(dirname(plan.materializedPath), { recursive: true });
-      if (existsSync(plan.materializedPath)) {
-        plan.previousMaterializedBackup = `${plan.materializedPath}.backup-${randomUUID()}`;
-        renameSync(plan.materializedPath, plan.previousMaterializedBackup);
-      }
-      renameSync(plan.stagedCopyPath, plan.materializedPath);
-      plan.materializedSwitched = true;
-
-      if (safeLstat(plan.targetPath)) {
-        plan.previousTargetBackup = `${plan.targetPath}.backup-${randomUUID()}`;
-        renameSync(plan.targetPath, plan.previousTargetBackup);
-      }
-      renameSync(plan.stagedLinkPath, plan.targetPath);
-      plan.targetSwitched = true;
+      validateManagedTarget(metadata, input.agentProductId, plan.plugin.pluginId, plan.targetPath);
     }
-
-    if (artifactPath && stagedArtifactPath) {
-      mkdirSync(dirname(artifactPath), { recursive: true });
-      if (artifactBackupPath) {
-        renameSync(artifactPath, artifactBackupPath);
+    for (const plan of stalePlans) {
+      const managed = metadata.managedTargets[input.agentProductId]?.[plan.targetPath];
+      if (managed) {
+        validateManagedTarget(metadata, input.agentProductId, managed.pluginId, plan.targetPath);
       }
-      renameSync(stagedArtifactPath, artifactPath);
-      artifactSwitched = true;
     }
 
     const managedTargets = (metadata.managedTargets[input.agentProductId] ??= {});
@@ -793,52 +872,274 @@ function materializeTransaction(input: {
         materializedPath: plan.materializedPath,
       };
     }
-    saveMetadata(input.metadataPath, metadata);
-  } catch (error) {
-    if (artifactSwitched && artifactPath) {
-      removePath(artifactPath);
-    }
-    if (artifactBackupPath && existsSync(artifactBackupPath) && artifactPath) {
-      renameSync(artifactBackupPath, artifactPath);
-    }
-    removePath(stagedArtifactPath);
+    atomicWriteJson(stagedMetadataPath, metadata);
 
-    for (const plan of [...skillPlans].reverse()) {
-      if (plan.targetSwitched) {
-        removePath(plan.targetPath);
-      }
-      if (plan.previousTargetBackup && existsSync(plan.previousTargetBackup)) {
-        renameSync(plan.previousTargetBackup, plan.targetPath);
-      }
-      if (plan.materializedSwitched) {
-        removePath(plan.materializedPath);
-      }
-      if (plan.previousMaterializedBackup && existsSync(plan.previousMaterializedBackup)) {
-        renameSync(plan.previousMaterializedBackup, plan.materializedPath);
-      }
-      removePath(plan.stagedLinkPath);
-      removePath(plan.stagedCopyPath);
+    const entries: MaterializationJournalEntry[] = [];
+    for (const plan of stalePlans) {
+      entries.push(createJournalEntry(plan.targetPath, null));
     }
-    for (const plan of [...stalePlans].reverse()) {
-      if (plan.switched && plan.backupPath && existsSync(plan.backupPath)) {
-        renameSync(plan.backupPath, plan.targetPath);
+    for (const plan of skillPlans) {
+      entries.push(createJournalEntry(plan.materializedPath, plan.stagedCopyPath));
+      entries.push(createJournalEntry(plan.targetPath, plan.stagedLinkPath));
+    }
+    if (artifactPath && stagedArtifactPath) {
+      entries.push(createJournalEntry(artifactPath, stagedArtifactPath));
+    }
+    entries.push(createJournalEntry(input.metadataPath, stagedMetadataPath));
+
+    const journal: MaterializationJournal = {
+      format: MATERIALIZATION_JOURNAL_FORMAT,
+      phase: "applying",
+      entries,
+    };
+    atomicWriteJson(input.journalPath, journal, true);
+    journalWritten = true;
+    applyMaterializationJournal(journal);
+    atomicWriteJson(input.journalPath, { ...journal, phase: "committed" }, true);
+    recoverMaterializationJournal(input.journalPath, dirname(input.metadataPath), input.skillRoots);
+  } catch (error) {
+    if (journalWritten) {
+      try {
+        recoverMaterializationJournal(
+          input.journalPath,
+          dirname(input.metadataPath),
+          input.skillRoots,
+        );
+      } catch (recoveryError) {
+        throw new AggregateError([error, recoveryError], "plugin materialization rollback failed");
       }
+    } else {
+      for (const plan of skillPlans) {
+        removePath(plan.stagedLinkPath);
+        removePath(plan.stagedCopyPath);
+      }
+      removePath(stagedArtifactPath);
+      removePath(stagedMetadataPath);
     }
     throw error;
   }
 
-  for (const plan of skillPlans) {
-    removePathBestEffort(plan.previousTargetBackup);
-    removePathBestEffort(plan.previousMaterializedBackup);
-  }
-  for (const plan of stalePlans) {
-    removePathBestEffort(plan.backupPath);
-  }
-  removePathBestEffort(artifactBackupPath);
   return {
     applied: input.plugins,
     turnArtifactPath: artifactPath,
   };
+}
+
+function createJournalEntry(pathValue: string, stagedPath: string | null): MaterializationJournalEntry {
+  const originalIdentity = readPathIdentity(pathValue);
+  return {
+    path: pathValue,
+    stagedPath,
+    backupPath: originalIdentity ? `${pathValue}.backup-${randomUUID()}` : null,
+    originalIdentity,
+    replacementIdentity: stagedPath ? readPathIdentity(stagedPath) : null,
+  };
+}
+
+function applyMaterializationJournal(journal: MaterializationJournal): void {
+  for (const entry of journal.entries) {
+    if (!isDeepStrictEqual(readPathIdentity(entry.path), entry.originalIdentity)) {
+      throw new Error(`materialization path changed before switch: ${entry.path}`);
+    }
+    if (entry.backupPath) {
+      renameSync(entry.path, entry.backupPath);
+      if (!isDeepStrictEqual(readPathIdentity(entry.backupPath), entry.originalIdentity)) {
+        throw new Error(`materialization path changed during switch: ${entry.path}`);
+      }
+    }
+    if (entry.stagedPath) {
+      if (!isDeepStrictEqual(readPathIdentity(entry.stagedPath), entry.replacementIdentity)) {
+        throw new Error(`materialization staged path changed: ${entry.stagedPath}`);
+      }
+      renameSync(entry.stagedPath, entry.path);
+    }
+  }
+}
+
+function recoverMaterializationJournal(
+  journalPath: string,
+  dataDir: string,
+  skillRoots: Partial<Record<AgentProductId, string>>,
+): void {
+  if (!safeLstat(journalPath)) {
+    return;
+  }
+  const journal = parseMaterializationJournal(
+    readFileSync(journalPath, "utf8"),
+    dataDir,
+    skillRoots,
+  );
+  if (journal.phase === "committed") {
+    for (const entry of journal.entries) {
+      removePath(entry.stagedPath);
+      removePath(entry.backupPath);
+    }
+    removePath(journalPath);
+    return;
+  }
+
+  for (const entry of [...journal.entries].reverse()) {
+    if (entry.backupPath && safeLstat(entry.backupPath)) {
+      const current = readPathIdentity(entry.path);
+      if (
+        current &&
+        (!entry.replacementIdentity || !isDeepStrictEqual(current, entry.replacementIdentity))
+      ) {
+        throw new Error(`materialization recovery conflict: ${entry.path}`);
+      }
+      removePath(entry.path);
+      renameSync(entry.backupPath, entry.path);
+    } else {
+      const current = readPathIdentity(entry.path);
+      if (entry.originalIdentity === null) {
+        if (
+          current &&
+          entry.replacementIdentity &&
+          isDeepStrictEqual(current, entry.replacementIdentity)
+        ) {
+          removePath(entry.path);
+        } else if (current) {
+          throw new Error(`materialization recovery conflict: ${entry.path}`);
+        }
+      } else if (!current || !isDeepStrictEqual(current, entry.originalIdentity)) {
+        throw new Error(`materialization recovery missing backup: ${entry.path}`);
+      }
+    }
+    removePath(entry.stagedPath);
+  }
+  removePath(journalPath);
+}
+
+function parseMaterializationJournal(
+  raw: string,
+  dataDir: string,
+  skillRoots: Partial<Record<AgentProductId, string>>,
+): MaterializationJournal {
+  const parsed = JSON.parse(raw) as Partial<MaterializationJournal>;
+  if (
+    parsed.format !== MATERIALIZATION_JOURNAL_FORMAT ||
+    (parsed.phase !== "applying" && parsed.phase !== "committed") ||
+    !Array.isArray(parsed.entries)
+  ) {
+    throw new Error("invalid plugin materialization journal");
+  }
+  for (const entry of parsed.entries) {
+    if (!isValidMaterializationJournalEntry(entry, dataDir, skillRoots)) {
+      throw new Error("invalid materialization journal path");
+    }
+  }
+  return parsed as MaterializationJournal;
+}
+
+function isValidMaterializationJournalEntry(
+  entry: unknown,
+  dataDir: string,
+  skillRoots: Partial<Record<AgentProductId, string>>,
+): entry is MaterializationJournalEntry {
+  if (!entry || typeof entry !== "object") {
+    return false;
+  }
+  const value = entry as Partial<MaterializationJournalEntry>;
+  if (typeof value.path !== "string" || !isManagedJournalPath(value.path, dataDir, skillRoots)) {
+    return false;
+  }
+  if (!isJournalSiblingPath(value.backupPath, value.path, "backup")) {
+    return false;
+  }
+  if (!isJournalSiblingPath(value.stagedPath, value.path, "stage")) {
+    return false;
+  }
+  if (!isPathIdentity(value.originalIdentity) || !isPathIdentity(value.replacementIdentity)) {
+    return false;
+  }
+  return (
+    (value.backupPath === null) === (value.originalIdentity === null) &&
+    (value.stagedPath === null) === (value.replacementIdentity === null)
+  );
+}
+
+function isManagedJournalPath(
+  pathValue: string,
+  dataDir: string,
+  skillRoots: Partial<Record<AgentProductId, string>>,
+): boolean {
+  if (!isAbsolute(pathValue) || resolve(pathValue) !== pathValue) {
+    return false;
+  }
+  if (
+    pathValue === join(dataDir, "plugins.metadata.json") ||
+    isWithinPath(join(dataDir, "materialized"), pathValue) ||
+    isWithinPath(join(dataDir, "turn-artifacts"), pathValue)
+  ) {
+    return true;
+  }
+  return Object.values(skillRoots).some(
+    (root) => root && dirname(pathValue) === resolve(root),
+  );
+}
+
+function isWithinPath(root: string, pathValue: string): boolean {
+  const relativePath = relative(resolve(root), pathValue);
+  return (
+    relativePath !== "" &&
+    relativePath !== ".." &&
+    !relativePath.startsWith(`..${sep}`) &&
+    !isAbsolute(relativePath)
+  );
+}
+
+function isJournalSiblingPath(
+  candidate: string | null | undefined,
+  pathValue: string,
+  marker: "backup" | "stage",
+): boolean {
+  return candidate === null || (
+    typeof candidate === "string" &&
+    isAbsolute(candidate) &&
+    dirname(candidate) === dirname(pathValue) &&
+    basename(candidate).startsWith(`${basename(pathValue)}.${marker}-`)
+  );
+}
+
+function isPathIdentity(value: unknown): value is PathIdentity | null {
+  if (value === null) {
+    return true;
+  }
+  if (!value || typeof value !== "object") {
+    return false;
+  }
+  const identity = value as Partial<PathIdentity>;
+  return (
+    (identity.kind === "symlink" && typeof identity.target === "string") ||
+    ((identity.kind === "directory" || identity.kind === "file") &&
+      typeof identity.hash === "string")
+  );
+}
+
+function readPathIdentity(pathValue: string): PathIdentity | null {
+  const stats = safeLstat(pathValue);
+  if (!stats) {
+    return null;
+  }
+  if (stats.isSymbolicLink()) {
+    return { kind: "symlink", target: readlinkSync(pathValue) };
+  }
+  if (stats.isDirectory()) {
+    return { kind: "directory", hash: hashSkillDirectory(pathValue) };
+  }
+  if (stats.isFile()) {
+    return {
+      kind: "file",
+      hash: createHash("sha256").update(readFileWithoutSymlink(pathValue)).digest("hex"),
+    };
+  }
+  throw new Error(`unsupported materialization path: ${pathValue}`);
+}
+
+function assertNoPendingMaterializationRecovery(journalPath: string): void {
+  if (safeLstat(journalPath)) {
+    throw new Error("plugin materialization recovery is pending");
+  }
 }
 
 function validateManagedTarget(
@@ -986,6 +1287,18 @@ function parseMcpDefinition(raw: string): {
     pluginId: record.pluginId,
     compatibility,
   };
+}
+
+function validateCompatibilityTargets(compatibility: CompatibilityMap): void {
+  for (const [agentProductId, spec] of Object.entries(compatibility)) {
+    if (!isAgentProductId(agentProductId) || !isMcpCompatibility(spec)) {
+      continue;
+    }
+    const expected = `${agentProductId}.mcp.v1`;
+    if (spec.target !== expected) {
+      throw new Error(`MCP compatibility target must be ${expected}`);
+    }
+  }
 }
 
 function isSkillCompatibility(
@@ -1246,10 +1559,18 @@ function isProcessAlive(pid: number): boolean {
   }
 }
 
-function atomicWriteJson(pathValue: string, value: unknown): void {
+function atomicWriteJson(pathValue: string, value: unknown, durable = false): void {
   mkdirSync(dirname(pathValue), { recursive: true });
   const temporary = `${pathValue}.tmp-${randomUUID()}`;
   writeFileSync(temporary, `${JSON.stringify(value, null, 2)}\n`, "utf8");
+  if (durable) {
+    const descriptor = openSync(temporary, constants.O_RDONLY);
+    try {
+      fsyncSync(descriptor);
+    } finally {
+      closeSync(descriptor);
+    }
+  }
   renameSync(temporary, pathValue);
 }
 
@@ -1297,14 +1618,6 @@ function removePath(pathValue: string | null): void {
     return;
   }
   rmSync(pathValue, { recursive: true, force: true });
-}
-
-function removePathBestEffort(pathValue: string | null): void {
-  try {
-    removePath(pathValue);
-  } catch {
-    // A committed materialization stays valid even if an obsolete backup cannot be removed.
-  }
 }
 
 function getStoredVersion(

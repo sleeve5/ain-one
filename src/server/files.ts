@@ -3,6 +3,7 @@ import {
   type SpawnOptionsWithoutStdio,
   spawn as defaultSpawn,
 } from "node:child_process";
+import { constants, type Stats } from "node:fs";
 import { lstat, open, readdir, realpath, stat } from "node:fs/promises";
 import { isAbsolute, relative, resolve, sep } from "node:path";
 
@@ -47,7 +48,10 @@ export type GitRunner = (
 interface FilesServiceOptions {
   previewBytes?: number;
   gitOutputBytes?: number;
+  gitTimeoutMs?: number;
+  gitKillGraceMs?: number;
   spawn?: GitRunner;
+  openFile?: typeof open;
 }
 
 export class FilesServiceError extends Error {
@@ -63,11 +67,16 @@ export class FilesServiceError extends Error {
 
 const DEFAULT_PREVIEW_BYTES = 32 * 1024;
 const DEFAULT_GIT_OUTPUT_BYTES = 128 * 1024;
+const DEFAULT_GIT_TIMEOUT_MS = 10_000;
+const DEFAULT_GIT_KILL_GRACE_MS = 250;
 
 export function createProjectFilesService(options: FilesServiceOptions = {}): ProjectFilesService {
   const previewBytes = options.previewBytes ?? DEFAULT_PREVIEW_BYTES;
   const gitOutputBytes = options.gitOutputBytes ?? DEFAULT_GIT_OUTPUT_BYTES;
+  const gitTimeoutMs = options.gitTimeoutMs ?? DEFAULT_GIT_TIMEOUT_MS;
+  const gitKillGraceMs = options.gitKillGraceMs ?? DEFAULT_GIT_KILL_GRACE_MS;
   const spawn = options.spawn ?? defaultSpawn;
+  const openFile = options.openFile ?? open;
 
   return {
     async list(projectRoot, requestedPath) {
@@ -111,13 +120,22 @@ export function createProjectFilesService(options: FilesServiceOptions = {}): Pr
     async preview(projectRoot, requestedPath) {
       const projectRootReal = await resolveProjectRoot(projectRoot);
       const target = await resolveInsideProject(projectRootReal, requestedPath);
-      const targetStat = await stat(target.realPath);
-      if (!targetStat.isFile()) {
-        throw new FilesServiceError(400, "not_file", "Requested path is not a file");
-      }
-
-      const handle = await open(target.realPath, "r");
+      let handle;
       try {
+        handle = await openFile(target.realPath, constants.O_RDONLY | constants.O_NOFOLLOW);
+      } catch (error) {
+        if (isFileRaceError(error)) {
+          throw new FilesServiceError(409, "path_changed", "Requested file changed during open");
+        }
+        throw error;
+      }
+      try {
+        const targetStat = await handle.stat();
+        if (!targetStat.isFile()) {
+          throw new FilesServiceError(400, "not_file", "Requested path is not a file");
+        }
+        await assertOpenFileStillInsideProject(projectRootReal, target.realPath, targetStat);
+
         const buffer = Buffer.alloc(previewBytes + 1);
         const { bytesRead } = await handle.read(buffer, 0, previewBytes + 1, 0);
         const slice = buffer.subarray(0, Math.min(previewBytes, bytesRead));
@@ -142,6 +160,8 @@ export function createProjectFilesService(options: FilesServiceOptions = {}): Pr
         projectRoot: projectRootReal,
         args: ["status", "--short", "--branch"],
         maxBytes: gitOutputBytes,
+        timeoutMs: gitTimeoutMs,
+        killGraceMs: gitKillGraceMs,
         spawn,
       });
     },
@@ -155,8 +175,16 @@ export function createProjectFilesService(options: FilesServiceOptions = {}): Pr
 
       return runGit({
         projectRoot: projectRootReal,
-        args: pathSpec && pathSpec !== "." ? ["diff", "--", pathSpec] : ["diff"],
+        args: [
+          "diff",
+          "--no-ext-diff",
+          "--no-textconv",
+          "--",
+          pathSpec && pathSpec !== "." ? pathSpec : ".",
+        ],
         maxBytes: gitOutputBytes,
+        timeoutMs: gitTimeoutMs,
+        killGraceMs: gitKillGraceMs,
         spawn,
       });
     },
@@ -239,7 +267,7 @@ async function resolveInsideProject(
   }
 
   const rel = relative(projectRootReal, targetReal);
-  if (rel.startsWith("..") || isAbsolute(rel)) {
+  if (!isInsideProject(rel)) {
     throw new FilesServiceError(
       400,
       "path_outside_project",
@@ -251,6 +279,40 @@ async function resolveInsideProject(
     realPath: targetReal,
     relativePath: normalizeRelative(rel),
   };
+}
+
+async function assertOpenFileStillInsideProject(
+  projectRootReal: string,
+  targetPath: string,
+  openedStat: Stats,
+): Promise<void> {
+  let currentReal: string;
+  let currentStat: Awaited<ReturnType<typeof lstat>>;
+  try {
+    [currentReal, currentStat] = await Promise.all([realpath(targetPath), lstat(targetPath)]);
+  } catch {
+    throw new FilesServiceError(409, "path_changed", "Requested file changed during open");
+  }
+
+  const rel = relative(projectRootReal, currentReal);
+  if (
+    !isInsideProject(rel)
+    || currentStat.isSymbolicLink()
+    || currentStat.dev !== openedStat.dev
+    || currentStat.ino !== openedStat.ino
+  ) {
+    throw new FilesServiceError(409, "path_changed", "Requested file changed during open");
+  }
+}
+
+function isInsideProject(relativePath: string): boolean {
+  return relativePath !== ".." && !relativePath.startsWith(`..${sep}`) && !isAbsolute(relativePath);
+}
+
+function isFileRaceError(error: unknown): boolean {
+  return error instanceof Error
+    && "code" in error
+    && (error.code === "ELOOP" || error.code === "ENOENT");
 }
 
 function normalizeRelative(relativePath: string): string {
@@ -271,14 +333,39 @@ interface RunGitInput {
   projectRoot: string;
   args: string[];
   maxBytes: number;
+  timeoutMs: number;
+  killGraceMs: number;
   spawn: GitRunner;
 }
 
 async function runGit(input: RunGitInput): Promise<GitCommandResult> {
   const child = input.spawn(
     "git",
-    ["-C", input.projectRoot, ...input.args],
+    [
+      "--literal-pathspecs",
+      "-c",
+      "core.fsmonitor=false",
+      "-c",
+      "core.hooksPath=/dev/null",
+      "-c",
+      "diff.external=",
+      "-c",
+      "core.pager=cat",
+      "-C",
+      input.projectRoot,
+      ...input.args,
+      ...(input.args[0] === "status" ? ["--", "."] : []),
+    ],
     {
+      env: {
+        ...process.env,
+        GIT_CONFIG_GLOBAL: "/dev/null",
+        GIT_CONFIG_NOSYSTEM: "1",
+        GIT_EXTERNAL_DIFF: "",
+        GIT_OPTIONAL_LOCKS: "0",
+        GIT_PAGER: "cat",
+        GIT_TERMINAL_PROMPT: "0",
+      },
       shell: false,
     },
   );
@@ -294,7 +381,7 @@ async function runGit(input: RunGitInput): Promise<GitCommandResult> {
       if (!killed) {
         killed = true;
         truncated = true;
-        child.kill();
+        child.kill("SIGTERM");
       }
       return;
     }
@@ -307,7 +394,7 @@ async function runGit(input: RunGitInput): Promise<GitCommandResult> {
     if (portion.length < chunk.length && !killed) {
       killed = true;
       truncated = true;
-      child.kill();
+      child.kill("SIGTERM");
     }
   };
 
@@ -319,10 +406,45 @@ async function runGit(input: RunGitInput): Promise<GitCommandResult> {
   });
 
   const exitCode = await new Promise<number>((resolvePromise, rejectPromise) => {
-    child.once("error", rejectPromise);
-    child.once("close", (code) => {
-      resolvePromise(code ?? 0);
-    });
+    let settled = false;
+    let terminalError: FilesServiceError | null = null;
+    let killTimer: ReturnType<typeof setTimeout> | null = null;
+
+    const settle = (error: unknown, code = 0): void => {
+      if (settled) {
+        return;
+      }
+      settled = true;
+      clearTimeout(timeoutTimer);
+      if (killTimer) {
+        clearTimeout(killTimer);
+      }
+      if (error) {
+        rejectPromise(error);
+      } else {
+        resolvePromise(code);
+      }
+    };
+
+    const terminate = (error: FilesServiceError | null): void => {
+      terminalError ??= error;
+      child.kill("SIGTERM");
+      killTimer ??= setTimeout(() => {
+        child.kill("SIGKILL");
+        settle(terminalError, 0);
+      }, input.killGraceMs);
+    };
+
+    const timeoutTimer = setTimeout(() => {
+      terminate(new FilesServiceError(504, "git_timeout", "Git command timed out"));
+    }, input.timeoutMs);
+
+    child.once("error", (error) => settle(terminalError ?? error));
+    child.once("close", (code) => settle(terminalError, code ?? 0));
+
+    if (killed) {
+      terminate(null);
+    }
   });
 
   const output = Buffer.concat(stdoutChunks).toString("utf8");

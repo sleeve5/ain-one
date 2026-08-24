@@ -70,7 +70,7 @@ export interface Repositories {
   getNativeSession(conversationId: string): NativeSessionRecord | null;
   upsertNativeSession(conversationId: string, nativeSessionId: string | null): NativeSessionRecord;
   appendEvent(conversationId: string, event: ConnectorEvent): NormalizedEvent;
-  eventsAfter(conversationId: string, sequence: number): NormalizedEvent[];
+  eventsAfter(conversationId: string, sequence: number, limit?: number): NormalizedEvent[];
 }
 
 export type PluginScope =
@@ -847,14 +847,17 @@ class SqliteRepositories implements Repositories {
     });
   }
 
-  eventsAfter(conversationId: string, sequence: number): NormalizedEvent[] {
+  eventsAfter(conversationId: string, sequence: number, limit?: number): NormalizedEvent[] {
+    const boundedLimit = limit === undefined ? -1 : Math.max(1, Math.floor(limit));
     const rows = this.getRows<DbEventRow>(
       `SELECT id, conversation_id, sequence, type, payload_json, created_at
        FROM events
        WHERE conversation_id = ? AND sequence > ?
-       ORDER BY sequence ASC`,
+       ORDER BY sequence ASC
+       LIMIT ?`,
       conversationId,
       sequence,
+      boundedLimit,
     );
 
     return rows.map(mapEvent);

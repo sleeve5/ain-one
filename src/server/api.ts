@@ -69,6 +69,7 @@ interface ApiServerOptions {
   bodyLimitBytes?: number;
   ssePollMs?: number;
   sseHeartbeatMs?: number;
+  sseReplayBatchSize?: number;
   permissionResponder?: (input: PermissionResponderInput) => Promise<void>;
   catalogProvider?: (input: AgentCatalogProviderInput) => Promise<AgentCatalog>;
   listAgents?: () => Promise<Array<{
@@ -113,6 +114,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
   const bodyLimitBytes = options.bodyLimitBytes ?? 64 * 1024;
   const pollMs = options.ssePollMs ?? 500;
   const heartbeatMs = options.sseHeartbeatMs ?? 15_000;
+  const replayBatchSize = options.sseReplayBatchSize ?? 100;
   const originRules = buildOriginRules(options.allowedOrigins);
 
   let started = false;
@@ -496,30 +498,25 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
       let lastSequence = after;
       let closed = false;
+      let flushing = false;
+      let pollTimer: ReturnType<typeof setInterval> | null = null;
+      let heartbeatTimer: ReturnType<typeof setInterval> | null = null;
 
-      const flush = (): void => {
+      const cleanup = (): void => {
         if (closed) {
           return;
         }
-        const events = options.repositories.eventsAfter(conversationId, lastSequence);
-        for (const event of events) {
-          if (isUncommittedTerminalEvent(options.repositories, event)) {
-            break;
-          }
-          lastSequence = event.sequence;
-          response.write(`id: ${event.sequence}\n`);
-          response.write(`data: ${JSON.stringify(event)}\n\n`);
+        closed = true;
+        if (pollTimer) {
+          clearInterval(pollTimer);
         }
+        if (heartbeatTimer) {
+          clearInterval(heartbeatTimer);
+        }
+        activeSseClosers.delete(closeSse);
+        request.off("close", cleanup);
+        response.off("close", cleanup);
       };
-
-      flush();
-
-      const pollTimer = setInterval(flush, pollMs);
-      const heartbeatTimer = setInterval(() => {
-        if (!closed) {
-          response.write(": heartbeat\n\n");
-        }
-      }, heartbeatMs);
 
       const closeSse = (): void => {
         cleanup();
@@ -529,17 +526,54 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       };
       activeSseClosers.add(closeSse);
 
-      const cleanup = (): void => {
-        if (closed) {
+      const flush = async (): Promise<void> => {
+        if (closed || flushing) {
           return;
         }
-        closed = true;
-        clearInterval(pollTimer);
-        clearInterval(heartbeatTimer);
-        activeSseClosers.delete(closeSse);
-        request.off("close", cleanup);
-        response.off("close", cleanup);
+        flushing = true;
+        try {
+          while (!closed) {
+            const events = options.repositories.eventsAfter(
+              conversationId,
+              lastSequence,
+              replayBatchSize,
+            );
+            if (events.length === 0) {
+              return;
+            }
+            for (const event of events) {
+              if (isUncommittedTerminalEvent(options.repositories, event)) {
+                return;
+              }
+              const written = await writeWithBackpressure(
+                response,
+                `id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`,
+              );
+              if (!written) {
+                return;
+              }
+              lastSequence = event.sequence;
+            }
+            if (events.length < replayBatchSize) {
+              return;
+            }
+          }
+        } finally {
+          flushing = false;
+        }
       };
+
+      const scheduleFlush = (): void => {
+        void flush().catch(closeSse);
+      };
+      scheduleFlush();
+
+      pollTimer = setInterval(scheduleFlush, pollMs);
+      heartbeatTimer = setInterval(() => {
+        if (!closed && !response.writableNeedDrain) {
+          response.write(": heartbeat\n\n");
+        }
+      }, heartbeatMs);
 
       request.on("close", cleanup);
       response.on("close", cleanup);
@@ -751,6 +785,30 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     start,
     stop,
   };
+}
+
+async function writeWithBackpressure(
+  response: ServerResponse,
+  chunk: string,
+): Promise<boolean> {
+  if (response.destroyed || response.writableEnded) {
+    return false;
+  }
+  if (response.write(chunk)) {
+    return true;
+  }
+
+  return new Promise<boolean>((resolvePromise) => {
+    const onDrain = (): void => settle(true);
+    const onClose = (): void => settle(false);
+    const settle = (writable: boolean): void => {
+      response.off("drain", onDrain);
+      response.off("close", onClose);
+      resolvePromise(writable);
+    };
+    response.once("drain", onDrain);
+    response.once("close", onClose);
+  });
 }
 
 interface ClassifiedError {

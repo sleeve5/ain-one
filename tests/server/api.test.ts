@@ -103,12 +103,23 @@ async function createFixture(input?: {
     permissionModes: Array<"request_approval" | "help_me_approve" | "full_access">;
   };
   pickProjectDirectory?: () => Promise<string | null>;
+  sseReplayBatchSize?: number;
 }) {
   const projectPath = mkdtempSync(join(tmpdir(), "ain-one-task3-api-"));
   tempDirs.push(projectPath);
 
   const db = createDatabase(":memory:");
   const repositories = createRepositories(db);
+  const eventBatchLimits: Array<number | undefined> = [];
+  const eventsAfter = repositories.eventsAfter.bind(repositories) as (
+    conversationId: string,
+    sequence: number,
+    limit?: number,
+  ) => ReturnType<typeof repositories.eventsAfter>;
+  repositories.eventsAfter = ((conversationId: string, sequence: number, limit?: number) => {
+    eventBatchLimits.push(limit);
+    return eventsAfter(conversationId, sequence, limit);
+  }) as typeof repositories.eventsAfter;
   const project = repositories.createProject(projectPath, "demo");
   const conversation = repositories.createConversation({
     projectId: project.id,
@@ -155,6 +166,9 @@ async function createFixture(input?: {
     bodyLimitBytes: input?.bodyLimitBytes,
     ssePollMs: 5,
     sseHeartbeatMs: 50,
+    ...(input?.sseReplayBatchSize
+      ? { sseReplayBatchSize: input.sseReplayBatchSize }
+      : {}),
   });
 
   await api.start();
@@ -172,6 +186,7 @@ async function createFixture(input?: {
     conversation,
     queuedByCoordinator,
     recoveryCommands,
+    eventBatchLimits,
     request,
     stop: async () => {
       await api.stop();
@@ -363,6 +378,29 @@ describe("loopback api", () => {
         expect.objectContaining({ sequence: 2, eventId: 2 }),
         expect.objectContaining({ sequence: 3, eventId: 3 }),
       ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("replays SSE history in bounded batches", async () => {
+    const fixture = await createFixture({ sseReplayBatchSize: 2 });
+    try {
+      for (const text of ["one", "two", "three", "four", "five"]) {
+        fixture.repositories.appendEvent(fixture.conversation.id, {
+          type: "assistant_message",
+          payload: { text },
+        });
+      }
+
+      const response = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/events`,
+      );
+      expect(await readSseEvents(response, 5)).toHaveLength(5);
+      expect(fixture.eventBatchLimits.filter((limit) => limit !== undefined)).toEqual(
+        expect.arrayContaining([2]),
+      );
+      expect(fixture.eventBatchLimits).not.toContain(undefined);
     } finally {
       await fixture.stop();
     }

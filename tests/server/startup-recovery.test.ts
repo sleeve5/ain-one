@@ -10,7 +10,7 @@ import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { createServer as createHttpServer } from "node:http";
 import { afterEach, describe, expect, it, vi } from "vitest";
-import type { AgentConnector } from "../../src/shared/contracts.js";
+import type { ActiveTurnStatus, AgentConnector } from "../../src/shared/contracts.js";
 import { createDatabase } from "../../src/server/db.js";
 import { startServer } from "../../src/server/main.js";
 import { createPluginHub } from "../../src/server/plugins.js";
@@ -25,6 +25,92 @@ afterEach(() => {
 });
 
 describe("server composition", () => {
+  it("interrupts active Turns from a reopened file database without redispatching pending work", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "ain-one-active-recovery-"));
+    const projectDir = join(dataDir, "project");
+    mkdirSync(projectDir);
+    tempDirs.push(dataDir);
+    const databasePath = join(dataDir, "ain-one.sqlite");
+    const database = createDatabase(databasePath);
+    const repositories = createRepositories(database);
+    const project = repositories.createProject(projectDir, "project");
+    const activeTurns: Array<{
+      status: ActiveTurnStatus;
+      conversationId: string;
+      turnId: string;
+      pendingContent: string;
+    }> = [];
+    const snapshot = {
+      modelId: "test",
+      permissionMode: "request_approval" as const,
+      pluginVersions: [],
+    };
+
+    for (const status of ["starting", "running", "cancelling"] as const) {
+      const conversation = repositories.createConversation({
+        projectId: project.id,
+        agentProductId: "codex",
+        modelId: "test",
+      });
+      repositories.enqueueMessage(conversation.id, `${status} active`);
+      const claimed = repositories.claimNextMessage(conversation.id, snapshot);
+      if (!claimed) {
+        throw new Error(`expected ${status} Turn`);
+      }
+      if (status !== "starting") {
+        repositories.markTurnRunning(claimed.turn.id, `${status}-native-turn`);
+      }
+      if (status === "cancelling") {
+        repositories.markTurnCancelling(claimed.turn.id);
+      }
+      const pendingContent = `${status} pending`;
+      repositories.enqueueMessage(conversation.id, pendingContent);
+      activeTurns.push({
+        status,
+        conversationId: conversation.id,
+        turnId: claimed.turn.id,
+        pendingContent,
+      });
+    }
+    database.close();
+
+    const prompts: string[] = [];
+    const connector = {
+      id: "codex",
+      probe: async () => ({ status: "available", version: "test" }),
+      fetchCatalog: async () => ({ models: ["test"], permissionModes: [] }),
+      createOrResumeSession: async (input: { conversationId: string }) => ({
+        id: input.conversationId,
+        nativeSessionId: "native-session",
+      }),
+      startTurn: async (_session: unknown, input: { content: string }) => {
+        prompts.push(input.content);
+        return { nativeTurnId: "native-turn" };
+      },
+      closeSession: async () => undefined,
+    } as unknown as AgentConnector;
+    const server = await startServer({
+      dataDir,
+      port: 0,
+      token: "active-recovery-token",
+      connectors: { codex: connector },
+      pluginHub: createPluginHub({ dataDir, skillRoots: {} }),
+    });
+    await server.stop();
+
+    expect(prompts).toEqual([]);
+    const reopened = createDatabase(databasePath);
+    const recovered = createRepositories(reopened);
+    for (const active of activeTurns) {
+      expect(recovered.getTurn(active.turnId)?.status).toBe("interrupted");
+      expect(recovered.getConversation(active.conversationId)?.queuePaused).toBe(true);
+      expect(recovered.listQueuedMessages(active.conversationId)).toEqual([
+        expect.objectContaining({ content: active.pendingContent }),
+      ]);
+    }
+    reopened.close();
+  });
+
   it("dispatches unpaused pending messages on startup", async () => {
     const dataDir = mkdtempSync(join(tmpdir(), "ain-one-pending-recovery-"));
     const projectDir = join(dataDir, "project");
@@ -569,7 +655,12 @@ describe("server composition", () => {
     tempDirs.push(dataDir);
     const token = "agent-settings-token";
 
-    const first = await startServer({ dataDir, port: 0, token });
+    const first = await startServer({
+      dataDir,
+      port: 0,
+      token,
+      pluginHub: createPluginHub({ dataDir, skillRoots: {} }),
+    });
     const saved = await fetch(`${first.url}/api/agents/codex/settings`, {
       method: "PUT",
       headers: {
@@ -581,7 +672,12 @@ describe("server composition", () => {
     expect(saved.status).toBe(200);
     await first.stop();
 
-    const second = await startServer({ dataDir, port: 0, token });
+    const second = await startServer({
+      dataDir,
+      port: 0,
+      token,
+      pluginHub: createPluginHub({ dataDir, skillRoots: {} }),
+    });
     try {
       const response = await fetch(`${second.url}/api/agents`, {
         headers: { authorization: `Bearer ${token}` },
@@ -602,6 +698,81 @@ describe("server composition", () => {
       });
     } finally {
       await second.stop();
+    }
+  });
+
+  it("rejects an executable override that does not identify the Agent Product", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "ain-one-agent-identity-"));
+    tempDirs.push(dataDir);
+    const token = "agent-identity-token";
+    const server = await startServer({
+      dataDir,
+      port: 0,
+      token,
+      pluginHub: createPluginHub({ dataDir, skillRoots: {} }),
+    });
+
+    try {
+      const saved = await fetch(`${server.url}/api/agents/codex/settings`, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({ executablePath: "/usr/bin/true" }),
+      });
+      expect(saved.status).toBe(400);
+      expect(await saved.json()).toEqual({
+        error: {
+          code: "agent_identity_mismatch",
+          message: "Executable did not identify as codex",
+        },
+      });
+
+      const agents = await fetch(`${server.url}/api/agents`, {
+        headers: { authorization: `Bearer ${token}` },
+      });
+      const payload = (await agents.json()) as {
+        agents: Array<{ agentProductId: string; executablePathOverride: string | null }>;
+      };
+      expect(payload.agents.find((agent) => agent.agentProductId === "codex")?.executablePathOverride)
+        .toBeNull();
+    } finally {
+      await server.stop();
+    }
+  });
+
+  it("rejects enabling a plugin version with no compatible Agent Product", async () => {
+    const dataDir = mkdtempSync(join(tmpdir(), "ain-one-plugin-no-compat-"));
+    const skillDir = join(dataDir, "unavailable-skill");
+    mkdirSync(skillDir);
+    writeFileSync(join(skillDir, "SKILL.md"), "# Unavailable\n");
+    tempDirs.push(dataDir);
+    const pluginHub = createPluginHub({ dataDir, skillRoots: {} });
+    const installed = await pluginHub.installLocal({ path: skillDir });
+    const token = "plugin-no-compat-token";
+    const server = await startServer({ dataDir, port: 0, token, pluginHub });
+
+    try {
+      const response = await fetch(`${server.url}/api/plugins/enablements/global`, {
+        method: "PUT",
+        headers: {
+          authorization: `Bearer ${token}`,
+          "content-type": "application/json",
+        },
+        body: JSON.stringify({
+          pluginVersions: [{ pluginId: installed.pluginId, versionId: installed.versionId }],
+        }),
+      });
+      expect(response.status).toBe(400);
+      expect(await response.json()).toEqual({
+        error: {
+          code: "plugin_incompatible",
+          message: "Plugin has no compatible Agent Product",
+        },
+      });
+    } finally {
+      await server.stop();
     }
   });
 });

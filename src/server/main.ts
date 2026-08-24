@@ -93,13 +93,25 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
     turnCoordinator,
     resolvePluginVersions,
     validatePluginVersions: (scope, pluginVersions) => {
-      const installed = new Set(
-        pluginHub.listInstalled().map((plugin) => `${plugin.pluginId}\0${plugin.versionId}`),
+      const installed = new Map(
+        pluginHub.listInstalled().map((plugin) => [
+          `${plugin.pluginId}\0${plugin.versionId}`,
+          plugin,
+        ]),
       );
       if (pluginVersions.some(
         (plugin) => !installed.has(`${plugin.pluginId}\0${plugin.versionId}`),
       )) {
         throw new InputError(400, "plugin_version_not_found", "Plugin version not found");
+      }
+      if (pluginVersions.some(
+        (plugin) => installed.get(`${plugin.pluginId}\0${plugin.versionId}`)?.compatibleAgents.length === 0,
+      )) {
+        throw new InputError(
+          400,
+          "plugin_incompatible",
+          "Plugin has no compatible Agent Product",
+        );
       }
       if (scope.type === "conversation") {
         const conversation = repositories.getConversation(scope.id);
@@ -146,6 +158,19 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
             [agentProductId]: { executable: executablePath ?? undefined },
           });
           const connector = registry[agentProductId];
+          const probe = await connector.probe();
+          if (
+            !probe.version
+            || probe.status === "not_installed"
+            || probe.status === "runtime_error"
+            || probe.status === "version_unsupported"
+          ) {
+            throw new InputError(
+              400,
+              "agent_identity_mismatch",
+              `Executable did not identify as ${agentProductId}`,
+            );
+          }
           const result = await turnCoordinator.setConnector(agentProductId, connector);
           if (result === "turn_active") {
             return result;

@@ -1232,6 +1232,122 @@ describe("native agent connectors", () => {
     );
   });
 
+  it("interrupts the Turn when an unterminated stdout record exceeds the limit", async () => {
+    const ctx = createFixtureContext();
+    const child = createHangingChild();
+    const stdout = child.stdout as PassThrough;
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: () => child,
+      modelsCachePath: ctx.modelsCachePath,
+      killTimeoutMs: 50,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(
+      connector,
+      "codex",
+      ctx.projectPath,
+      "native-session-codex",
+    );
+
+    try {
+      const startPromise = connector.startTurn(
+        harness.session,
+        turnInput("codex", "native-session-codex"),
+      );
+      stdout.write(
+        `${JSON.stringify({ type: "thread.started", thread_id: "native-session-codex" })}\n` +
+          `${JSON.stringify({ type: "turn.started", turn_id: "native-turn-codex" })}\n`,
+      );
+      await startPromise;
+
+      stdout.write("x".repeat(1_048_577));
+
+      await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+      expect(terminalCalls).toEqual([
+        expect.objectContaining({
+          status: "interrupted",
+          error: expect.objectContaining({ code: "stdout_record_too_large" }),
+        }),
+      ]);
+    } finally {
+      await connector.closeSession(harness.session);
+    }
+  });
+
+  it("pauses stdout while event persistence is pending and resumes in order", async () => {
+    const ctx = createFixtureContext();
+    const child = createHangingChild();
+    const stdout = child.stdout as PassThrough;
+    const pause = vi.spyOn(stdout, "pause");
+    const resume = vi.spyOn(stdout, "resume");
+    const releaseFirstEvent = createDeferred<void>();
+    const firstEvent = createDeferred<void>();
+    const secondEvent = createDeferred<void>();
+    let assistantEvents = 0;
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: () => child,
+      modelsCachePath: ctx.modelsCachePath,
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(
+      connector,
+      "codex",
+      ctx.projectPath,
+      "native-session-codex",
+      {
+        onEvent: async (event) => {
+          harness.events.push(event);
+          if (event.type !== "assistant_message") {
+            return;
+          }
+          assistantEvents += 1;
+          if (assistantEvents === 1) {
+            firstEvent.resolve();
+            await releaseFirstEvent.promise;
+          } else if (assistantEvents === 2) {
+            secondEvent.resolve();
+          }
+        },
+      },
+    );
+
+    try {
+      const startPromise = connector.startTurn(
+        harness.session,
+        turnInput("codex", "native-session-codex"),
+      );
+      stdout.write(
+        `${JSON.stringify({ type: "thread.started", thread_id: "native-session-codex" })}\n` +
+          `${JSON.stringify({ type: "turn.started", turn_id: "native-turn-codex" })}\n` +
+          `${JSON.stringify({ type: "message", role: "assistant", content: "first" })}\n` +
+          `${JSON.stringify({ type: "message", role: "assistant", content: "second" })}\n`,
+      );
+      await startPromise;
+      await withTimeout(firstEvent.promise, 250);
+
+      expect(stdout.isPaused()).toBe(true);
+      expect(pause).toHaveBeenCalled();
+      expect(assistantEvents).toBe(1);
+      const resumeCallsWhilePending = resume.mock.calls.length;
+
+      releaseFirstEvent.resolve();
+      await withTimeout(secondEvent.promise, 250);
+      await sleep(0);
+
+      expect(resume.mock.calls.length).toBeGreaterThan(resumeCallsWhilePending);
+      expect(harness.events.filter((event) => event.type === "assistant_message")).toEqual([
+        expect.objectContaining({ payload: expect.objectContaining({ text: "first" }) }),
+        expect.objectContaining({ payload: expect.objectContaining({ text: "second" }) }),
+      ]);
+    } finally {
+      releaseFirstEvent.resolve();
+      await connector.closeSession(harness.session);
+    }
+  });
+
   it("cleans up and settles when onNativeSessionId throws", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({

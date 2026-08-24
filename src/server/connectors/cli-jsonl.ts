@@ -10,6 +10,8 @@ import { BaseConnector, redactSecrets, truncateText, type RuntimeSession } from 
 
 type TurnError = { code: string; message: string; details?: Record<string, unknown> };
 
+const MAX_STDOUT_RECORD_BYTES = 1024 * 1024;
+
 export interface JsonlEventContext {
   emit(event: ConnectorEvent): Promise<void>;
   setNativeSessionId(nativeSessionId: string | null): Promise<void>;
@@ -280,28 +282,46 @@ export abstract class CliJsonlConnector extends BaseConnector {
       },
     };
 
-    const queue = (work: () => Promise<void>): void => {
-      processing = processing.then(work).catch((error: unknown) => {
-        abortTurn({
-          code: "event_processing_failed",
-          message: error instanceof Error ? error.message : "Event processing failed",
-        });
-      });
+    const queue = (work: () => Promise<void>, after?: () => void): void => {
+      processing = processing
+        .then(work)
+        .catch((error: unknown) => {
+          abortTurn({
+            code: "event_processing_failed",
+            message: error instanceof Error ? error.message : "Event processing failed",
+          });
+        })
+        .finally(after);
     };
 
     child.stdout?.on("data", (chunk: Buffer) => {
-      stdoutBuffer += chunk.toString("utf8");
-      while (true) {
-        const newlineIndex = stdoutBuffer.indexOf("\n");
-        if (newlineIndex === -1) {
-          break;
-        }
-        const line = stdoutBuffer.slice(0, newlineIndex).trim();
-        stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-        if (!line) {
-          continue;
-        }
-        queue(async () => {
+      if (abortError) {
+        return;
+      }
+      const stdout = child.stdout;
+      stdout?.pause();
+      queue(async () => {
+        stdoutBuffer += chunk.toString("utf8");
+        while (true) {
+          const newlineIndex = stdoutBuffer.indexOf("\n");
+          if (newlineIndex === -1) {
+            break;
+          }
+          const rawLine = stdoutBuffer.slice(0, newlineIndex);
+          stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
+          if (Buffer.byteLength(rawLine) > MAX_STDOUT_RECORD_BYTES) {
+            stdoutBuffer = "";
+            abortTurn({
+              code: "stdout_record_too_large",
+              message: `Native JSONL record exceeded ${MAX_STDOUT_RECORD_BYTES} bytes`,
+              details: { maxBytes: MAX_STDOUT_RECORD_BYTES },
+            });
+            return;
+          }
+          const line = rawLine.trim();
+          if (!line) {
+            continue;
+          }
           let event: unknown;
           try {
             event = JSON.parse(line) as unknown;
@@ -313,11 +333,23 @@ export abstract class CliJsonlConnector extends BaseConnector {
                 line: truncateText(redactSecrets(line), 200),
               },
             });
-            return;
+            continue;
           }
           await input.mapEvent(event, context);
-        });
-      }
+        }
+        if (Buffer.byteLength(stdoutBuffer) > MAX_STDOUT_RECORD_BYTES) {
+          stdoutBuffer = "";
+          abortTurn({
+            code: "stdout_record_too_large",
+            message: `Native JSONL record exceeded ${MAX_STDOUT_RECORD_BYTES} bytes`,
+            details: { maxBytes: MAX_STDOUT_RECORD_BYTES },
+          });
+        }
+      }, () => {
+        if (!stdout?.destroyed) {
+          stdout?.resume();
+        }
+      });
     });
 
     child.stderr?.on("data", (chunk: Buffer) => {

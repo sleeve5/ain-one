@@ -214,7 +214,16 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       const repairMatch = /^\/api\/plugins\/([^/]+)\/versions\/([^/]+)\/materializations\/([^/]+)\/repair$/.exec(path);
       if (method === "POST" && repairMatch) {
         const agentProductId = readAgentProductId(decodeURIComponent(repairMatch[3]));
-        if (repositories.hasActiveTurnForAgent(agentProductId)) {
+        const result = await turnCoordinator.runBetweenTurns(agentProductId, () =>
+          pluginHub.repairMaterialization(
+            agentProductId,
+            {
+              pluginId: decodeURIComponent(repairMatch[1]),
+              versionId: decodeURIComponent(repairMatch[2]),
+            },
+          ),
+        );
+        if (result === "turn_active") {
           return {
             status: 409,
             body: {
@@ -225,13 +234,6 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
             },
           };
         }
-        await pluginHub.repairMaterialization(
-          agentProductId,
-          {
-            pluginId: decodeURIComponent(repairMatch[1]),
-            versionId: decodeURIComponent(repairMatch[2]),
-          },
-        );
         return { status: 200, body: { repaired: true } };
       }
       return { status: 404, body: { error: { code: "not_found", message: "Route not found" } } };

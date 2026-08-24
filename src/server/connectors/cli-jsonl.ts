@@ -248,7 +248,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
     };
     input.session.settled = settled;
 
-    let stdoutBuffer = "";
+    let stdoutBuffer = Buffer.alloc(0);
     let processing = Promise.resolve();
 
     const context: JsonlEventContext = {
@@ -301,16 +301,16 @@ export abstract class CliJsonlConnector extends BaseConnector {
       const stdout = child.stdout;
       stdout?.pause();
       queue(async () => {
-        stdoutBuffer += chunk.toString("utf8");
+        stdoutBuffer = Buffer.concat([stdoutBuffer, chunk]);
         while (true) {
-          const newlineIndex = stdoutBuffer.indexOf("\n");
+          const newlineIndex = stdoutBuffer.indexOf(0x0a);
           if (newlineIndex === -1) {
             break;
           }
           const rawLine = stdoutBuffer.slice(0, newlineIndex);
           stdoutBuffer = stdoutBuffer.slice(newlineIndex + 1);
-          if (Buffer.byteLength(rawLine) > MAX_STDOUT_RECORD_BYTES) {
-            stdoutBuffer = "";
+          if (rawLine.byteLength > MAX_STDOUT_RECORD_BYTES) {
+            stdoutBuffer = Buffer.alloc(0);
             abortTurn({
               code: "stdout_record_too_large",
               message: `Native JSONL record exceeded ${MAX_STDOUT_RECORD_BYTES} bytes`,
@@ -318,7 +318,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
             });
             return;
           }
-          const line = rawLine.trim();
+          const line = rawLine.toString("utf8").trim();
           if (!line) {
             continue;
           }
@@ -337,8 +337,8 @@ export abstract class CliJsonlConnector extends BaseConnector {
           }
           await input.mapEvent(event, context);
         }
-        if (Buffer.byteLength(stdoutBuffer) > MAX_STDOUT_RECORD_BYTES) {
-          stdoutBuffer = "";
+        if (stdoutBuffer.byteLength > MAX_STDOUT_RECORD_BYTES) {
+          stdoutBuffer = Buffer.alloc(0);
           abortTurn({
             code: "stdout_record_too_large",
             message: `Native JSONL record exceeded ${MAX_STDOUT_RECORD_BYTES} bytes`,

@@ -30,6 +30,10 @@ interface AppProps {
 
 type CenterView = "workspace" | "agents" | "plugins";
 type ConfigurationWriteKey = string;
+interface WorkspaceSelection {
+  projectId?: string;
+  conversationId?: string;
+}
 
 export function App(props: AppProps) {
   const [state, setState] = useState<WorkspaceUiState>(() => createInitialWorkspaceUiState());
@@ -39,6 +43,7 @@ export function App(props: AppProps) {
   const [pluginEnablementsLoading, setPluginEnablementsLoading] = useState(false);
   const workspaceRequest = useRef(0);
   const workspaceGeneration = useRef(0);
+  const pendingWorkspaceSelection = useRef<WorkspaceSelection | null>(null);
   const inspectorRequest = useRef(0);
   const pluginRequest = useRef(0);
   const pluginScopeRef = useRef<PluginScopeKind>("global");
@@ -50,10 +55,11 @@ export function App(props: AppProps) {
     () => globalThis.matchMedia?.("(max-width: 960px)").matches ?? false,
   );
 
-  const loadWorkspace = async (selection?: {
-    projectId?: string;
-    conversationId?: string;
-  }): Promise<boolean> => {
+  const loadWorkspace = async (selection?: WorkspaceSelection): Promise<boolean> => {
+    if (selection) {
+      pendingWorkspaceSelection.current = selection;
+    }
+    const requestedSelection = selection ?? pendingWorkspaceSelection.current ?? undefined;
     const request = ++workspaceRequest.current;
     const generation = workspaceGeneration.current;
     try {
@@ -80,13 +86,13 @@ export function App(props: AppProps) {
         }));
         let selectedConversation: ConversationView | null;
         let selectedProjectId: string | null;
-        if (selection?.conversationId) {
+        if (requestedSelection?.conversationId) {
           selectedConversation =
-            conversations.find((item) => item.id === selection.conversationId) ?? null;
-          selectedProjectId = selectedConversation?.projectId ?? selection.projectId ?? null;
-        } else if (selection?.projectId) {
-          selectedProjectId = workspace.projects.some((item) => item.id === selection.projectId)
-            ? selection.projectId
+            conversations.find((item) => item.id === requestedSelection.conversationId) ?? null;
+          selectedProjectId = selectedConversation?.projectId ?? requestedSelection.projectId ?? null;
+        } else if (requestedSelection?.projectId) {
+          selectedProjectId = workspace.projects.some((item) => item.id === requestedSelection.projectId)
+            ? requestedSelection.projectId
             : workspace.selectedProjectId;
           selectedConversation =
             conversations.find(
@@ -124,6 +130,14 @@ export function App(props: AppProps) {
           },
         };
       });
+      const pendingSelection = pendingWorkspaceSelection.current;
+      if (
+        requestedSelection &&
+        pendingSelection?.projectId === requestedSelection.projectId &&
+        pendingSelection?.conversationId === requestedSelection.conversationId
+      ) {
+        pendingWorkspaceSelection.current = null;
+      }
       return true;
     } catch (error) {
       if (request !== workspaceRequest.current) {

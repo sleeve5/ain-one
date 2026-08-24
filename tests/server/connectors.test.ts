@@ -1348,6 +1348,54 @@ describe("native agent connectors", () => {
     }
   });
 
+  it("preserves UTF-8 characters split across stdout chunks", async () => {
+    const ctx = createFixtureContext();
+    const child = createHangingChild();
+    const stdout = child.stdout as PassThrough;
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: () => child,
+      modelsCachePath: ctx.modelsCachePath,
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(
+      connector,
+      "codex",
+      ctx.projectPath,
+      "native-session-codex",
+    );
+
+    try {
+      const startPromise = connector.startTurn(
+        harness.session,
+        turnInput("codex", "native-session-codex"),
+      );
+      stdout.write(
+        `${JSON.stringify({ type: "thread.started", thread_id: "native-session-codex" })}\n` +
+          `${JSON.stringify({ type: "turn.started", turn_id: "native-turn-codex" })}\n`,
+      );
+      await startPromise;
+
+      const line = Buffer.from(
+        `${JSON.stringify({ type: "message", role: "assistant", content: "中文" })}\n`,
+      );
+      const splitAt = line.indexOf(Buffer.from("中文")) + 1;
+      stdout.write(line.subarray(0, splitAt));
+      stdout.write(line.subarray(splitAt));
+
+      await vi.waitFor(() => {
+        expect(harness.events).toContainEqual(
+          expect.objectContaining({
+            type: "assistant_message",
+            payload: expect.objectContaining({ text: "中文" }),
+          }),
+        );
+      });
+    } finally {
+      await connector.closeSession(harness.session);
+    }
+  });
+
   it("cleans up and settles when onNativeSessionId throws", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({

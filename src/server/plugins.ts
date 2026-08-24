@@ -405,6 +405,9 @@ function inspectSource(
     const pluginId = normalizePluginId(basename(absolutePath));
     const contentHash = hashSkillDirectory(absolutePath);
     const compatibility = compatibilityInput ?? {};
+    if (Object.values(compatibility).some((spec) => spec?.kind === "mcp")) {
+      throw new Error("Skill compatibility must use kind skill");
+    }
     validateCompatibilityTargets(compatibility);
     return {
       path: absolutePath,

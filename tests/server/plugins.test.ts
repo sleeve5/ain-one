@@ -1182,6 +1182,32 @@ describe("plugin hub", () => {
     await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("raw secret");
   });
 
+  it("rejects MCP compatibility for a Skill directory before storing metadata", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const skillDir = createSkillFixture(root, "mcp-disguised-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+
+    await expect(
+      hub.installLocal({
+        path: skillDir,
+        compatibility: {
+          codex: {
+            kind: "mcp",
+            target: "codex.mcp.v1",
+            server: { apiKey: "RAW_SECRET" },
+          },
+        },
+      }),
+    ).rejects.toThrow("Skill compatibility must use kind skill");
+
+    expect(hub.listInstalled()).toEqual([]);
+    const metadataPath = join(dataDir, "plugins.metadata.json");
+    if (existsSync(metadataPath)) {
+      expect(readFileSync(metadataPath, "utf8")).not.toContain("RAW_SECRET");
+    }
+  });
+
   it("rejects raw Authorization strings after sensitive-key normalization", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");

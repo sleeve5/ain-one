@@ -220,7 +220,9 @@ export function App(props: AppProps) {
         0,
       );
       return props.api.subscribeConversationEvents(conversation.id, replaySequence, (event) => {
-        workspaceGeneration.current += 1;
+        if (event.type === "turn_status") {
+          workspaceGeneration.current += 1;
+        }
         startTransition(() => {
           setState((current) => {
             const existing = current.workspace.conversations.find(

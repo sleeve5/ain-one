@@ -157,6 +157,58 @@ describe("web app", () => {
     await vi.waitFor(() => expect(loadWorkspace).toHaveBeenCalledTimes(2));
   });
 
+  it("applies the terminal refresh when the next queued Turn emits an ordinary event", async () => {
+    const api = fakeApi({ activeTurn: true, initialQueuedMessages: ["next task"] });
+    const initial = await api.loadWorkspace();
+    const refresh = deferred<WorkspaceState>();
+    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockImplementationOnce(async () => refresh.promise);
+    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
+      onEvent = callback;
+      return () => undefined;
+    };
+    render(<App api={api} />);
+    await screen.findByRole("button", { name: "Stop" });
+
+    onEvent({
+      id: "event-first-terminal",
+      conversationId: "conv-1",
+      sequence: 1,
+      type: "turn_status",
+      payload: { turnId: "turn-first", status: "completed" },
+      createdAt: new Date().toISOString(),
+    });
+    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
+    onEvent({
+      id: "event-next-output",
+      conversationId: "conv-1",
+      sequence: 2,
+      type: "assistant_message",
+      payload: { text: "continuing queued work" },
+      createdAt: new Date().toISOString(),
+    });
+
+    const continuedConversation = {
+      ...initial.conversation!,
+      activeTurnStatus: "running" as const,
+      latestTurnId: "turn-next",
+      latestTurnStatus: "running" as const,
+      queuedMessages: [],
+    };
+    await act(async () => refresh.resolve({
+      ...initial,
+      conversation: continuedConversation,
+      conversations: initial.conversations.map((conversation) =>
+        conversation.id === continuedConversation.id ? continuedConversation : conversation,
+      ),
+    }));
+
+    expect(await screen.findByRole("button", { name: "Stop" })).toBeVisible();
+    expect(screen.queryByText("next task")).toBeNull();
+  });
+
   it("keeps the selected Project Inspector after a background workspace refresh", async () => {
     const user = userEvent.setup();
     const api = fakeApi({

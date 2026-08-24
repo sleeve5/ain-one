@@ -38,6 +38,7 @@ export interface OpenCodeSdkAdapter {
       }) => Promise<void>;
     },
   ): Promise<OpenCodeSdkTurn>;
+  closeSession?(session: LiveSession): Promise<void>;
 }
 
 export interface OpenCodeConnectorOptions extends BaseConnectorOptions {
@@ -144,6 +145,7 @@ export class OpenCodeConnector extends BaseConnector {
         await this.syncNativeSessionId(runtime, nativeSessionId);
       },
       emitTerminal: async (terminal) => {
+        await this.emitTerminal(runtime, terminal);
         await this.emitEvent(runtime, {
           type: "turn_status",
           payload: {
@@ -153,7 +155,6 @@ export class OpenCodeConnector extends BaseConnector {
             ...(terminal.error ? { error: terminal.error } : {}),
           },
         });
-        await this.emitTerminal(runtime, terminal);
       },
     });
 
@@ -165,6 +166,11 @@ export class OpenCodeConnector extends BaseConnector {
     });
 
     return { nativeTurnId: activeTurn.nativeTurnId };
+  }
+
+  override async closeSession(session: LiveSession): Promise<void> {
+    await super.closeSession(session);
+    await this.sdkAdapter?.closeSession?.(session);
   }
 
   private async ensureRuntimeAvailable(): Promise<void> {

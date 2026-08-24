@@ -102,10 +102,38 @@ textarea {
 .workspace__toolbar {
   padding: 0.6rem 0.9rem;
   border-bottom: 1px solid var(--line);
+  display: flex;
+  align-items: center;
+  justify-content: space-between;
+  gap: 0.7rem;
+  flex-wrap: wrap;
 }
 
-.workspace__canvas {
+.workspace__canvas,
+.workspace__page {
   overflow: auto;
+}
+
+.workspace__view-switch {
+  display: flex;
+  gap: 0.35rem;
+  flex-wrap: wrap;
+}
+
+.workspace__view-switch button,
+.project-sidebar__form button,
+.settings button,
+.plugin-settings button {
+  border: 1px solid var(--line);
+  background: var(--panel);
+  color: inherit;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.65rem;
+}
+
+.workspace__view-switch button[data-active="true"] {
+  border-color: var(--accent);
+  background: color-mix(in srgb, var(--accent) 12%, var(--panel));
 }
 
 .workspace-empty {
@@ -132,6 +160,27 @@ textarea {
 .project-sidebar__heading {
   margin: 0 0 0.7rem;
   font-family: var(--serif);
+}
+
+.project-sidebar__form,
+.settings form,
+.plugin-settings__install {
+  margin-bottom: 0.8rem;
+  display: grid;
+  gap: 0.35rem;
+}
+
+.project-sidebar__form input,
+.project-sidebar__form select,
+.settings input,
+.plugin-settings input,
+.plugin-settings select {
+  min-width: 0;
+  border: 1px solid var(--line);
+  background: color-mix(in srgb, var(--panel) 88%, white);
+  color: inherit;
+  border-radius: 0.4rem;
+  padding: 0.4rem 0.5rem;
 }
 
 .project-sidebar__project-list,
@@ -225,6 +274,24 @@ textarea {
   font-family: var(--mono);
   font-size: 0.82rem;
   color: var(--ink-soft);
+}
+
+.conversation-canvas__recovery {
+  margin: 0 1rem 1rem;
+  padding: 0.75rem;
+  border: 1px solid color-mix(in srgb, var(--accent) 45%, var(--line));
+  background: color-mix(in srgb, var(--paper-strong) 82%, var(--accent));
+  border-radius: 0.55rem;
+}
+
+.conversation-canvas__recovery p {
+  margin: 0 0 0.55rem;
+}
+
+.conversation-canvas__recovery div {
+  display: flex;
+  flex-wrap: wrap;
+  gap: 0.45rem;
 }
 
 .conversation-canvas__controls {
@@ -337,6 +404,42 @@ textarea {
 
 .graph-canvas__text {
   color: var(--ink-soft);
+}
+
+.settings,
+.plugin-settings {
+  padding: 1rem;
+}
+
+.settings > h1,
+.plugin-settings > h1 {
+  margin-top: 0;
+  font-family: var(--serif);
+}
+
+.settings__agents,
+.plugin-settings__versions,
+.plugin-settings__candidates {
+  list-style: none;
+  margin: 0;
+  padding: 0;
+  display: grid;
+  gap: 0.75rem;
+}
+
+.settings__agent-card,
+.plugin-settings__version,
+.plugin-settings__candidate {
+  border: 1px solid var(--line);
+  border-radius: 0.55rem;
+  background: color-mix(in srgb, var(--panel) 92%, white);
+  padding: 0.8rem;
+}
+
+.settings__agent-card h2,
+.settings__agent-card h3,
+.plugin-settings h2 {
+  font-family: var(--serif);
 }
 
 .inspector {

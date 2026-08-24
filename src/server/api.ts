@@ -1,18 +1,23 @@
 import { createHash, timingSafeEqual } from "node:crypto";
+import { constants } from "node:fs";
 import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
-import { realpath, stat } from "node:fs/promises";
+import { access, realpath, stat } from "node:fs/promises";
 import { basename } from "node:path";
-import type { AgentCatalog, AgentProbe, AgentProductId, PermissionDecision } from "../shared/contracts.js";
+import type { AgentCatalog, AgentProbe, AgentProductId, PermissionDecision, PluginVersion } from "../shared/contracts.js";
 import {
+  parseAgentSettings,
+  parseConversationSettings,
   parseCreateConversation,
   parseCreateProject,
   parsePermissionDecision,
+  parsePluginEnablements,
   parseQueueMessage,
+  ValidationError,
 } from "../shared/validation.js";
 import type { ProjectFilesService } from "./files.js";
 import { FilesServiceError } from "./files.js";
-import type { Repositories } from "./repositories.js";
+import type { PluginScope, Repositories } from "./repositories.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const SUPPORTED_AGENTS: AgentProductId[] = ["codex", "claude", "trae", "opencode"];
@@ -20,6 +25,8 @@ const SUPPORTED_AGENTS: AgentProductId[] = ["codex", "claude", "trae", "opencode
 interface TurnCoordinatorLike {
   enqueueMessage(conversationId: string, content: string): Promise<void>;
   cancelActiveTurn(conversationId: string): Promise<boolean>;
+  continueConversation(conversationId: string): Promise<boolean>;
+  retryInterruptedTurn(conversationId: string, turnId: string): Promise<boolean>;
 }
 
 interface PermissionResponderInput {
@@ -32,6 +39,11 @@ interface AgentCatalogProviderInput {
   projectId: string;
   projectPath: string;
   agentProductId: AgentProductId;
+}
+
+interface AgentSettingsUpdate {
+  agentProductId: AgentProductId;
+  executablePath: string | null;
 }
 
 interface PluginRequest {
@@ -58,7 +70,21 @@ interface ApiServerOptions {
   sseHeartbeatMs?: number;
   permissionResponder?: (input: PermissionResponderInput) => Promise<void>;
   catalogProvider?: (input: AgentCatalogProviderInput) => Promise<AgentCatalog>;
-  listAgents?: () => Promise<Array<{ agentProductId: AgentProductId; probe: AgentProbe }>>;
+  listAgents?: () => Promise<Array<{
+    agentProductId: AgentProductId;
+    executablePath: string;
+    executablePathOverride: string | null;
+    probe: AgentProbe;
+  }>>;
+  updateAgentSettings?: (
+    input: AgentSettingsUpdate,
+  ) => Promise<"updated" | "turn_active">;
+  resolvePluginVersions?: (input: {
+    projectId: string;
+    conversationId: string;
+    agentProductId: AgentProductId;
+  }) => PluginVersion[];
+  validatePluginVersions?: (scope: PluginScope, pluginVersions: PluginVersion[]) => void;
   pluginHandler?: (request: PluginRequest) => Promise<PluginResponse>;
 }
 
@@ -216,7 +242,15 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         return;
       }
 
-      const conversation = options.repositories.createConversation(payload);
+      const permissionMode = await validateConversationCatalog(options, {
+        projectId: project.id,
+        projectPath: project.path,
+        agentProductId: payload.agentProductId,
+        modelId: payload.modelId,
+        permissionMode: payload.permissionMode,
+      });
+
+      const conversation = options.repositories.createConversation({ ...payload, permissionMode });
       sendJson(response, 201, { conversation });
       return;
     }
@@ -232,9 +266,57 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
       sendJson(response, 200, {
         conversation,
+        pluginVersions: resolveConversationPlugins(options, conversation),
         queuedMessages: options.repositories.listQueuedMessages(conversationId),
         activeTurn: options.repositories.getActiveTurn(conversationId),
         latestTurn: options.repositories.getLatestTurn(conversationId),
+      });
+      return;
+    }
+
+    const conversationSettingsMatch = match(
+      pathname,
+      /^\/api\/conversations\/([^/]+)\/settings$/,
+    );
+    if (request.method === "PUT" && conversationSettingsMatch) {
+      const conversationId = conversationSettingsMatch[0];
+      const settings = parseConversationSettings(await readJsonBody(request, bodyLimitBytes));
+      const conversation = options.repositories.getConversation(conversationId);
+      if (!conversation) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      if (options.repositories.getActiveTurn(conversationId)) {
+        sendError(response, 409, "turn_active", "Settings can change only between Turns");
+        return;
+      }
+      const project = options.repositories.getProject(conversation.projectId);
+      if (!project) {
+        sendError(response, 404, "project_not_found", "Project not found");
+        return;
+      }
+      await validateConversationCatalog(options, {
+        projectId: project.id,
+        projectPath: project.path,
+        agentProductId: conversation.agentProductId,
+        modelId: settings.modelId,
+        permissionMode: settings.permissionMode,
+      });
+      const result = options.repositories.updateConversationSettings(conversationId, settings);
+      if (result === "not_found") {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      if (result === "turn_active") {
+        sendError(response, 409, "turn_active", "Settings can change only between Turns");
+        return;
+      }
+      sendJson(response, 200, {
+        conversation: options.repositories.getConversation(conversationId),
+        pluginVersions: resolveConversationPlugins(
+          options,
+          options.repositories.getConversation(conversationId)!,
+        ),
       });
       return;
     }
@@ -303,6 +385,40 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       return;
     }
 
+    const continueMatch = match(pathname, /^\/api\/conversations\/([^/]+)\/continue$/);
+    if (request.method === "POST" && continueMatch) {
+      const conversationId = continueMatch[0];
+      if (!options.repositories.getConversation(conversationId)) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      await options.turnCoordinator.continueConversation(conversationId);
+      sendJson(response, 200, { accepted: true });
+      return;
+    }
+
+    const retryMatch = match(
+      pathname,
+      /^\/api\/conversations\/([^/]+)\/turns\/([^/]+)\/retry$/,
+    );
+    if (request.method === "POST" && retryMatch) {
+      const conversationId = retryMatch[0];
+      if (!options.repositories.getConversation(conversationId)) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      const accepted = await options.turnCoordinator.retryInterruptedTurn(
+        conversationId,
+        retryMatch[1],
+      );
+      if (!accepted) {
+        sendError(response, 409, "turn_not_interrupted", "Turn is not retryable");
+        return;
+      }
+      sendJson(response, 200, { accepted: true });
+      return;
+    }
+
     const permissionMatch = match(
       pathname,
       /^\/api\/conversations\/([^/]+)\/permissions\/([^/]+)$/,
@@ -366,6 +482,9 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         }
         const events = options.repositories.eventsAfter(conversationId, lastSequence);
         for (const event of events) {
+          if (isUncommittedTerminalEvent(options.repositories, event)) {
+            break;
+          }
           lastSequence = event.sequence;
           response.write(`id: ${event.sequence}\n`);
           response.write(`data: ${JSON.stringify(event)}\n\n`);
@@ -411,12 +530,43 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         ? await options.listAgents()
         : SUPPORTED_AGENTS.map((agentProductId) => ({
             agentProductId,
+            executablePath: agentProductId === "trae" ? "traecli" : agentProductId,
+            executablePathOverride: null,
             probe: {
               status: "not_installed" as const,
               diagnostic: "Connector not installed yet",
             },
           }));
       sendJson(response, 200, { agents });
+      return;
+    }
+
+    const agentSettingsMatch = match(pathname, /^\/api\/agents\/([^/]+)\/settings$/);
+    if (request.method === "PUT" && agentSettingsMatch) {
+      const agentProductId = asAgentProductId(agentSettingsMatch[0]);
+      if (!agentProductId) {
+        sendError(response, 400, "unsupported_agent", "Unsupported agent product");
+        return;
+      }
+      if (options.repositories.hasActiveTurnForAgent(agentProductId)) {
+        sendError(response, 409, "turn_active", "Agent settings can change only between Turns");
+        return;
+      }
+      if (!options.updateAgentSettings) {
+        sendError(response, 501, "agent_settings_unsupported", "Agent settings are not supported");
+        return;
+      }
+
+      const settings = parseAgentSettings(await readJsonBody(request, bodyLimitBytes));
+      const executablePath = settings.executablePath
+        ? await canonicalExecutablePath(settings.executablePath)
+        : null;
+      const result = await options.updateAgentSettings({ agentProductId, executablePath });
+      if (result === "turn_active") {
+        sendError(response, 409, "turn_active", "Agent settings can change only between Turns");
+        return;
+      }
+      sendJson(response, 200, { agentProductId, executablePath });
       return;
     }
 
@@ -450,6 +600,26 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         projectPath: project.path,
       });
       sendJson(response, 200, { catalog });
+      return;
+    }
+
+    const pluginScope = parsePluginScope(pathname);
+    if (pluginScope && (request.method === "GET" || request.method === "PUT")) {
+      if (!pluginScopeExists(options.repositories, pluginScope)) {
+        sendError(response, 404, "scope_not_found", "Plugin scope not found");
+        return;
+      }
+      if (request.method === "PUT") {
+        const input = parsePluginEnablements(await readJsonBody(request, bodyLimitBytes));
+        options.validatePluginVersions?.(pluginScope, input.pluginVersions);
+        if (options.repositories.setPluginEnablements(pluginScope, input.pluginVersions) === "turn_active") {
+          sendError(response, 409, "turn_active", "Plugin settings can change only between Turns");
+          return;
+        }
+      }
+      sendJson(response, 200, {
+        pluginVersions: options.repositories.listPluginEnablements(pluginScope),
+      });
       return;
     }
 
@@ -585,6 +755,14 @@ function classifyError(error: unknown): ClassifiedError {
     };
   }
 
+  if (error instanceof ValidationError) {
+    return {
+      status: 400,
+      code: "invalid_input",
+      message: error.message,
+    };
+  }
+
   if (error instanceof Error && error.message.startsWith("No connector registered")) {
     return {
       status: 501,
@@ -648,7 +826,7 @@ function sendError(
   });
 }
 
-class InputError extends Error {
+export class InputError extends Error {
   readonly status: number;
   readonly code: string;
 
@@ -904,4 +1082,109 @@ async function canonicalProjectPath(path: string): Promise<string> {
   }
 
   return canonical;
+}
+
+async function canonicalExecutablePath(path: string): Promise<string> {
+  let canonical: string;
+  try {
+    canonical = await realpath(path);
+  } catch {
+    throw new InputError(404, "executable_not_found", "Agent executable path does not exist");
+  }
+  const details = await stat(canonical);
+  if (!details.isFile()) {
+    throw new InputError(400, "executable_not_file", "Agent executable path must be a file");
+  }
+  try {
+    await access(canonical, constants.X_OK);
+  } catch {
+    throw new InputError(400, "executable_not_executable", "Agent executable path is not executable");
+  }
+  return canonical;
+}
+
+function parsePluginScope(pathname: string): PluginScope | null {
+  if (pathname === "/api/plugins/enablements/global") {
+    return { type: "global" };
+  }
+  const project = match(pathname, /^\/api\/plugins\/enablements\/project\/([^/]+)$/);
+  if (project) {
+    return { type: "project", id: project[0] };
+  }
+  const conversation = match(
+    pathname,
+    /^\/api\/plugins\/enablements\/conversation\/([^/]+)$/,
+  );
+  return conversation ? { type: "conversation", id: conversation[0] } : null;
+}
+
+function pluginScopeExists(repositories: Repositories, scope: PluginScope): boolean {
+  if (scope.type === "global") {
+    return true;
+  }
+  return scope.type === "project"
+    ? repositories.getProject(scope.id) !== null
+    : repositories.getConversation(scope.id) !== null;
+}
+
+function resolveConversationPlugins(
+  options: ApiServerOptions,
+  conversation: { id: string; projectId: string; agentProductId: AgentProductId },
+): PluginVersion[] {
+  return options.resolvePluginVersions?.({
+    projectId: conversation.projectId,
+    conversationId: conversation.id,
+    agentProductId: conversation.agentProductId,
+  }) ?? options.repositories.resolvePluginVersions(conversation.projectId, conversation.id);
+}
+
+async function validateConversationCatalog(
+  options: ApiServerOptions,
+  input: AgentCatalogProviderInput & {
+    modelId: string | null;
+    permissionMode?: import("../shared/contracts.js").PermissionMode;
+  },
+): Promise<import("../shared/contracts.js").PermissionMode> {
+  if (!options.catalogProvider) {
+    throw new InputError(501, "catalog_unsupported", "Catalog capability is not available");
+  }
+  const catalog = await options.catalogProvider(input);
+  if (input.modelId !== null && !catalog.models.includes(input.modelId)) {
+    throw new InputError(400, "unsupported_model", "Model is not supported by this Agent Product");
+  }
+  const permissionMode = input.permissionMode ?? catalog.permissionModes[0];
+  if (!permissionMode || !catalog.permissionModes.includes(permissionMode)) {
+    throw new InputError(
+      400,
+      "unsupported_permission_mode",
+      "Permission mode is not supported by this Agent Product",
+    );
+  }
+  return permissionMode;
+}
+
+function isUncommittedTerminalEvent(
+  repositories: Repositories,
+  event: { type: string; payload: Record<string, unknown> },
+): boolean {
+  if (event.type !== "turn_status") {
+    return false;
+  }
+  const status = event.payload.status;
+  if (
+    status !== "completed" &&
+    status !== "cancelled" &&
+    status !== "start_failed" &&
+    status !== "failed" &&
+    status !== "interrupted" &&
+    status !== "cancel_failed"
+  ) {
+    return false;
+  }
+  const turnId = event.payload.turnId;
+  if (typeof turnId !== "string") {
+    return false;
+  }
+  const turn = repositories.getTurn(turnId);
+  return turn?.status === "starting" || turn?.status === "running" || turn?.status === "cancelling";
 }

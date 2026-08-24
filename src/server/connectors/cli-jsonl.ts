@@ -1,4 +1,5 @@
 import type { ChildProcess } from "node:child_process";
+import { readFileSync } from "node:fs";
 import type {
   ConnectorEvent,
   LiveSession,
@@ -9,7 +10,7 @@ import { BaseConnector, redactSecrets, truncateText, type RuntimeSession } from 
 
 type TurnError = { code: string; message: string; details?: Record<string, unknown> };
 
-interface JsonlEventContext {
+export interface JsonlEventContext {
   emit(event: ConnectorEvent): Promise<void>;
   setNativeSessionId(nativeSessionId: string | null): Promise<void>;
   setNativeTurnId(nativeTurnId: string | null): void;
@@ -26,10 +27,18 @@ interface StartCliJsonlTurnInput {
 export abstract class CliJsonlConnector extends BaseConnector {
   async startTurn(session: LiveSession, input: StartTurnInput): Promise<{ nativeTurnId: string | null }> {
     const runtime = this.asRuntimeSession(session);
+    let args: string[];
+    try {
+      args = this.buildStartArgs(runtime, input);
+    } catch (cause) {
+      const error = cause instanceof Error ? cause : new Error(String(cause));
+      (error as Error & { definiteStartRejection: boolean }).definiteStartRejection = true;
+      throw error;
+    }
     return this.startCliJsonlTurn({
       session: runtime,
       turn: input,
-      args: this.buildStartArgs(runtime, input),
+      args,
       mapEvent: async (event, context) => {
         await this.mapEvent(event, context);
       },
@@ -67,17 +76,24 @@ export abstract class CliJsonlConnector extends BaseConnector {
     }
 
     let nativeTurnId: string | null = null;
+    let nativeTurnStarted = false;
     const requiresPersistedSessionId = input.session.nativeSessionId == null;
     let persistedSessionId = !requiresPersistedSessionId;
     let stderrText = "";
     let stderrBytes = 0;
     let cancelled = false;
+    let closing = false;
     let killTimer: NodeJS.Timeout | null = null;
+    let abortError: TurnError | null = null;
+    let nativeTerminal: { status: TerminalTurnStatus; error?: TurnError } | null = null;
     let terminalSent = false;
     let settledResolve!: () => void;
-    const settled = new Promise<void>((resolvePromise) => {
+    let settledReject!: (reason?: unknown) => void;
+    const settled = new Promise<void>((resolvePromise, rejectPromise) => {
       settledResolve = resolvePromise;
+      settledReject = rejectPromise;
     });
+    void settled.catch(() => undefined);
     let resolveStart!: (value: { nativeTurnId: string | null }) => void;
     let rejectStart!: (reason?: unknown) => void;
     let startSettled = false;
@@ -93,13 +109,9 @@ export abstract class CliJsonlConnector extends BaseConnector {
       if (terminalSent) {
         return;
       }
-      terminalSent = true;
-
-      const startReady = Boolean(nativeTurnId) && persistedSessionId;
+      const startReady = nativeTurnStarted && persistedSessionId;
       const effectiveStatus =
-        (status === "completed" || status === "cancelled") && !startReady
-          ? "interrupted"
-          : status;
+        !startReady && status !== "start_failed" ? "interrupted" : status;
       const effectiveError =
         effectiveStatus === "interrupted" && !error && !startReady
           ? {
@@ -115,12 +127,30 @@ export abstract class CliJsonlConnector extends BaseConnector {
           effectiveStatus === "interrupted" ||
           effectiveStatus === "start_failed"
         ) {
-          rejectStart(new Error(effectiveError?.message ?? "Native turn failed before start"));
+          const startError = new Error(
+            effectiveError?.message ?? "Native turn failed before start",
+          );
+          if (effectiveStatus === "start_failed") {
+            (startError as Error & { definiteStartRejection: boolean }).definiteStartRejection = true;
+          }
+          rejectStart(startError);
         } else {
           resolveStart({ nativeTurnId });
         }
       }
+      const terminal = {
+        turnId: input.turn.turnId,
+        nativeTurnId,
+        status: effectiveStatus,
+        error: effectiveError,
+      };
       try {
+        try {
+          await this.emitTerminal(input.session, terminal);
+        } catch {
+          await this.emitTerminal(input.session, terminal);
+        }
+        terminalSent = true;
         await this.emitEvent(input.session, {
           type: "turn_status",
           payload: {
@@ -130,17 +160,16 @@ export abstract class CliJsonlConnector extends BaseConnector {
             error: effectiveError,
           },
         });
-        await this.emitTerminal(input.session, {
-          turnId: input.turn.turnId,
-          nativeTurnId,
-          status: effectiveStatus,
-          error: effectiveError,
-        });
+      } catch (error) {
+        settledReject(error);
+        return;
       } finally {
+        input.session.settled = settled;
+      }
+      if (terminalSent) {
         if (input.session.activeTurn?.settled === settled) {
           delete input.session.activeTurn;
         }
-        input.session.settled = settled;
         settledResolve();
       }
     };
@@ -149,14 +178,34 @@ export abstract class CliJsonlConnector extends BaseConnector {
       if (startSettled) {
         return;
       }
-      if (!nativeTurnId) {
+      if (!persistedSessionId) {
         return;
       }
-      if (!persistedSessionId) {
+      if (!nativeTurnStarted) {
         return;
       }
       startSettled = true;
       resolveStart({ nativeTurnId });
+    };
+
+    const abortTurn = (error: TurnError): void => {
+      if (terminalSent || abortError) {
+        return;
+      }
+      abortError = error;
+      stopChild();
+    };
+
+    const stopChild = (): void => {
+      if (child.exitCode !== null || child.signalCode !== null) {
+        return;
+      }
+      child.kill();
+      killTimer ??= setTimeout(() => {
+        if (!terminalSent) {
+          child.kill("SIGKILL");
+        }
+      }, this.killTimeoutMs);
     };
 
     const closeTurn = async (): Promise<void> => {
@@ -164,8 +213,9 @@ export abstract class CliJsonlConnector extends BaseConnector {
         await settled;
         return;
       }
+      closing = true;
       cancelled = false;
-      child.kill();
+      stopChild();
       await settled;
     };
 
@@ -176,14 +226,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
       }
 
       cancelled = true;
-      if (!child.killed) {
-        child.kill();
-      }
-      killTimer = setTimeout(() => {
-        if (!terminalSent) {
-          child.kill("SIGKILL");
-        }
-      }, this.killTimeoutMs);
+      stopChild();
 
       await settled;
       return terminalSent;
@@ -210,27 +253,30 @@ export abstract class CliJsonlConnector extends BaseConnector {
           persistedSessionId = true;
           maybeResolveStart();
         } catch (error) {
-          await finalize("interrupted", {
+          abortTurn({
             code: "session_persist_failed",
             message: error instanceof Error ? error.message : "Failed to persist native session id",
           });
         }
       },
       setNativeTurnId: (nextNativeTurnId) => {
-        nativeTurnId = nextNativeTurnId;
+        nativeTurnStarted = true;
+        if (nextNativeTurnId !== null) {
+          nativeTurnId = nextNativeTurnId;
+        }
         if (input.session.activeTurn) {
-          input.session.activeTurn.nativeTurnId = nextNativeTurnId;
+          input.session.activeTurn.nativeTurnId = nativeTurnId;
         }
         maybeResolveStart();
       },
       terminal: async (status, error) => {
-        await finalize(status, error);
+        nativeTerminal = { status, error };
       },
     };
 
     const queue = (work: () => Promise<void>): void => {
-      processing = processing.then(work).catch(async (error: unknown) => {
-        await finalize("interrupted", {
+      processing = processing.then(work).catch((error: unknown) => {
+        abortTurn({
           code: "event_processing_failed",
           message: error instanceof Error ? error.message : "Event processing failed",
         });
@@ -279,7 +325,10 @@ export abstract class CliJsonlConnector extends BaseConnector {
 
     child.once("error", (error) => {
       queue(async () => {
-        await finalize("interrupted", {
+        const code = error && typeof error === "object" && "code" in error
+          ? (error as { code?: unknown }).code
+          : undefined;
+        await finalize(code === "ENOENT" || code === "EACCES" ? "start_failed" : "interrupted", {
           code: "spawn_failed",
           message: error instanceof Error ? error.message : "Failed to start child process",
         });
@@ -296,8 +345,23 @@ export abstract class CliJsonlConnector extends BaseConnector {
           return;
         }
 
+        if (abortError) {
+          await finalize("interrupted", abortError);
+          return;
+        }
+
         if (cancelled) {
           await finalize("cancelled");
+          return;
+        }
+
+        if (nativeTerminal) {
+          await finalize(nativeTerminal.status, nativeTerminal.error);
+          return;
+        }
+
+        if (closing) {
+          await finalize("interrupted");
           return;
         }
 
@@ -337,6 +401,95 @@ export abstract class CliJsonlConnector extends BaseConnector {
   }
 }
 
+interface McpArtifactServer {
+  pluginId: string;
+  target: string;
+  server: Record<string, unknown>;
+}
+
+export function readMcpArtifact(
+  path: string | null | undefined,
+  agentProductId: "codex" | "claude" | "trae",
+): McpArtifactServer[] {
+  if (!path) {
+    return [];
+  }
+  const parsed = JSON.parse(readFileSync(path, "utf8")) as unknown;
+  if (!parsed || typeof parsed !== "object" || Array.isArray(parsed)) {
+    throw new Error("Invalid MCP artifact");
+  }
+  const artifact = parsed as Record<string, unknown>;
+  if (
+    artifact.format !== "ain-one.turn.mcp.v1" ||
+    artifact.agentProductId !== agentProductId ||
+    !Array.isArray(artifact.servers)
+  ) {
+    throw new Error("Invalid MCP artifact");
+  }
+  return artifact.servers.map((value) => {
+    if (!value || typeof value !== "object" || Array.isArray(value)) {
+      throw new Error("Invalid MCP server");
+    }
+    const item = value as Record<string, unknown>;
+    if (
+      typeof item.pluginId !== "string" ||
+      item.target !== `${agentProductId}.mcp.v1` ||
+      !item.server ||
+      typeof item.server !== "object" ||
+      Array.isArray(item.server)
+    ) {
+      throw new Error("Invalid MCP server");
+    }
+    assertNoSecretRefs(item.server);
+    return {
+      pluginId: item.pluginId,
+      target: item.target,
+      server: item.server as Record<string, unknown>,
+    };
+  });
+}
+
+export function renderTomlMcpOverride(server: McpArtifactServer): string {
+  return `mcp_servers.${JSON.stringify(server.pluginId)}=${toToml(server.server)}`;
+}
+
+function toToml(value: unknown): string {
+  if (typeof value === "string") {
+    return JSON.stringify(value);
+  }
+  if (typeof value === "number" && Number.isFinite(value)) {
+    return String(value);
+  }
+  if (typeof value === "boolean") {
+    return String(value);
+  }
+  if (Array.isArray(value)) {
+    return `[${value.map(toToml).join(",")}]`;
+  }
+  if (value && typeof value === "object") {
+    return `{${Object.entries(value as Record<string, unknown>)
+      .map(([key, child]) => `${JSON.stringify(key)}=${toToml(child)}`)
+      .join(",")}}`;
+  }
+  throw new Error("Unsupported MCP configuration value");
+}
+
+function assertNoSecretRefs(value: unknown): void {
+  if (!value || typeof value !== "object") {
+    return;
+  }
+  if (
+    !Array.isArray(value) &&
+    Object.keys(value).length === 1 &&
+    typeof (value as { secretRef?: unknown }).secretRef === "string"
+  ) {
+    throw new Error("MCP secretRef must be resolved before dispatch");
+  }
+  for (const child of Array.isArray(value) ? value : Object.values(value)) {
+    assertNoSecretRefs(child);
+  }
+}
+
 async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promise<void> {
   if (!event || typeof event !== "object") {
     await context.emit({
@@ -351,7 +504,11 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
 
   const record = event as Record<string, unknown>;
   const type = typeof record.type === "string" ? record.type : null;
-  const nativeSessionId = stringValue(record.session_id) ?? stringValue(record.sessionId);
+  const nativeSessionId =
+    stringValue(record.session_id) ??
+    stringValue(record.sessionId) ??
+    stringValue(record.thread_id) ??
+    stringValue(record.threadId);
   const nativeTurnId = stringValue(record.turn_id) ?? stringValue(record.turnId);
 
   if (nativeSessionId) {
@@ -361,16 +518,26 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
     context.setNativeTurnId(nativeTurnId);
   }
 
-  if (type === "session.started" || type === "turn.started") {
+  if (type === "turn.started") {
+    context.setNativeTurnId(nativeTurnId);
+    return;
+  }
+
+  if (type === "session.started" || type === "thread.started") {
+    return;
+  }
+
+  if (type === "item.completed") {
+    await mapCompletedItem(record.item, context);
     return;
   }
 
   if (type === "message" || type === "assistant_message") {
     const role = stringValue(record.role) ?? "assistant";
-    const content = stringValue(record.content) ?? stringValue(record.text) ?? "";
+    const text = stringValue(record.content) ?? stringValue(record.text) ?? "";
     await context.emit({
       type: role === "user" ? "user_message" : "assistant_message",
-      payload: { content, role },
+      payload: { text, role },
     });
     return;
   }
@@ -378,7 +545,7 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
   if (type === "reasoning") {
     await context.emit({
       type: "reasoning",
-      payload: { content: stringValue(record.content) ?? stringValue(record.summary) ?? "" },
+      payload: { summary: stringValue(record.summary) ?? stringValue(record.content) ?? "" },
     });
     return;
   }
@@ -386,7 +553,14 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
   if (type === "tool") {
     await context.emit({
       type: "tool",
-      payload: { ...record },
+      payload: {
+        ...record,
+        name:
+          stringValue(record.name) ??
+          stringValue(record.tool_name) ??
+          stringValue(record.toolName) ??
+          "tool",
+      },
     });
     return;
   }
@@ -408,9 +582,17 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
   }
 
   if (type === "usage") {
+    const inputTokens = numberValue(record.input_tokens) ?? numberValue(record.inputTokens);
+    const outputTokens = numberValue(record.output_tokens) ?? numberValue(record.outputTokens);
     await context.emit({
       type: "usage",
-      payload: { ...record },
+      payload: {
+        ...record,
+        summary:
+          inputTokens !== null && outputTokens !== null
+            ? `${inputTokens} input / ${outputTokens} output tokens`
+            : "Usage updated",
+      },
     });
     return;
   }
@@ -424,6 +606,10 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
   }
 
   if (type === "turn.completed") {
+    const usage = objectValue(record.usage);
+    if (usage) {
+      await emitUsage(usage, context);
+    }
     await context.terminal("completed");
     return;
   }
@@ -445,6 +631,95 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
   });
 }
 
+async function mapCompletedItem(
+  value: unknown,
+  context: JsonlEventContext,
+): Promise<void> {
+  const item = objectValue(value);
+  if (!item) {
+    return;
+  }
+
+  const type = stringValue(item.type);
+  if (type === "agent_message") {
+    await context.emit({
+      type: "assistant_message",
+      payload: { text: stringValue(item.text) ?? "", role: "assistant" },
+    });
+    return;
+  }
+  if (type === "reasoning") {
+    await context.emit({
+      type: "reasoning",
+      payload: { summary: stringValue(item.text) ?? "" },
+    });
+    return;
+  }
+  if (type === "command_execution") {
+    await context.emit({ type: "shell", payload: { ...item } });
+    return;
+  }
+  if (type === "file_change") {
+    await context.emit({ type: "file", payload: { ...item } });
+    return;
+  }
+  if (type === "mcp_tool_call") {
+    const server = stringValue(item.server) ?? stringValue(item.server_name);
+    const tool = stringValue(item.tool) ?? stringValue(item.tool_name) ?? "tool";
+    await context.emit({
+      type: "tool",
+      payload: { ...item, name: server ? `${server}.${tool}` : tool },
+    });
+    return;
+  }
+  if (type === "web_search") {
+    await context.emit({ type: "tool", payload: { ...item, name: "web_search" } });
+    return;
+  }
+  if (type === "error") {
+    await context.emit({
+      type: "warning",
+      payload: { ...item, message: stringValue(item.message) ?? "Agent warning" },
+    });
+    return;
+  }
+  await context.emit({
+    type: "warning",
+    payload: {
+      code: "unknown_native_event",
+      event: truncateText(redactSecrets(JSON.stringify(item)), 200),
+    },
+  });
+}
+
+async function emitUsage(
+  usage: Record<string, unknown>,
+  context: JsonlEventContext,
+): Promise<void> {
+  const inputTokens = numberValue(usage.input_tokens) ?? numberValue(usage.inputTokens);
+  const outputTokens = numberValue(usage.output_tokens) ?? numberValue(usage.outputTokens);
+  await context.emit({
+    type: "usage",
+    payload: {
+      ...usage,
+      summary:
+        inputTokens !== null && outputTokens !== null
+          ? `${inputTokens} input / ${outputTokens} output tokens`
+          : "Usage updated",
+    },
+  });
+}
+
 function stringValue(value: unknown): string | null {
   return typeof value === "string" ? value : null;
+}
+
+function numberValue(value: unknown): number | null {
+  return typeof value === "number" && Number.isFinite(value) ? value : null;
+}
+
+function objectValue(value: unknown): Record<string, unknown> | null {
+  return value && typeof value === "object" && !Array.isArray(value)
+    ? value as Record<string, unknown>
+    : null;
 }

@@ -62,6 +62,12 @@ describe("SQLite migration", () => {
         WHERE type = 'index' AND name = 'queued_messages_pending_idx'
       `)
       .get() as { sql: string };
+    const columns = migrated
+      .prepare("PRAGMA table_info(queued_messages)")
+      .all() as Array<{ name: string }>;
+    const pluginScopeTable = migrated
+      .prepare("SELECT name FROM sqlite_master WHERE type = 'table' AND name = 'plugin_enablement_scopes'")
+      .get() as { name: string } | undefined;
 
     expect(messages).toEqual([
       { id: "z-first", enqueue_seq: 1 },
@@ -74,6 +80,8 @@ describe("SQLite migration", () => {
     ]);
     expect(index.sql).toContain("enqueue_seq");
     expect(index.sql).not.toContain("created_at");
+    expect(columns.map((column) => column.name)).toContain("retry_of_turn_id");
+    expect(pluginScopeTable?.name).toBe("plugin_enablement_scopes");
     migrated.close();
   });
 });

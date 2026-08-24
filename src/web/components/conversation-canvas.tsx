@@ -4,18 +4,41 @@ import type { ConversationView } from "../api.js";
 import { Composer } from "./composer.js";
 
 interface ConversationCanvasProps {
-  conversation: ConversationView;
+  conversation: ConversationView | null;
   onChangeModel(modelId: string | null): void;
   onChangePermissionMode(permissionMode: PermissionMode): void;
-  onTogglePlugin(pluginId: string): void;
+  onChangePlugins(pluginIds: string[]): void;
   onDeletePendingMessage(messageId: string): Promise<void>;
   onQueueMessage(content: string): Promise<void>;
   onCancelTurn(): Promise<void>;
+  onContinueConversation(): Promise<void>;
+  onRetryInterruptedTurn(turnId: string): Promise<void>;
 }
 
 export function ConversationCanvas(props: ConversationCanvasProps) {
   const [permissionOpen, setPermissionOpen] = useState(false);
-  const turnActive = Boolean(props.conversation.activeTurnStatus);
+  const [drafts, setDrafts] = useState<Record<string, string>>({});
+  const conversation = props.conversation;
+  if (!conversation) {
+    return (
+      <section
+        className="conversation-canvas"
+        data-testid="conversation-canvas"
+        aria-label="Conversation Canvas"
+      >
+        <div className="workspace-empty">Create a conversation to start.</div>
+      </section>
+    );
+  }
+
+  const turnActive = Boolean(conversation.activeTurnStatus);
+  const recoveryStatus = conversation.latestTurnStatus;
+  const recoveryRequired =
+    conversation.queuePaused &&
+    recoveryStatus !== null &&
+    ["start_failed", "failed", "interrupted", "cancel_failed"].includes(recoveryStatus);
+  const uncertainNativeWork =
+    recoveryStatus === "interrupted" || recoveryStatus === "cancel_failed";
 
   return (
     <section
@@ -25,8 +48,8 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     >
       <header className="conversation-canvas__header">
         <div>
-          <h2>{props.conversation.title}</h2>
-          <p className="conversation-canvas__agent">Agent product: {props.conversation.agentProductLabel}</p>
+          <h2>{conversation.title}</h2>
+          <p className="conversation-canvas__agent">Agent product: {conversation.agentProductLabel}</p>
         </div>
         {turnActive ? (
           <button type="button" className="conversation-canvas__stop" onClick={props.onCancelTurn}>
@@ -35,20 +58,42 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
         ) : null}
       </header>
 
+      {recoveryRequired && conversation.latestTurnId ? (
+        <section className="conversation-canvas__recovery" aria-label="Paused Turn recovery">
+          <p>
+            The last Turn ended with {recoveryStatus}. Ain One will not continue automatically.
+            {uncertainNativeWork ? " Before Continue or Retry, confirm native work is inactive." : ""}
+          </p>
+          <div>
+            <button type="button" onClick={props.onContinueConversation}>
+              Continue pending queue
+            </button>
+            {recoveryStatus === "interrupted" ? (
+              <button
+                type="button"
+                onClick={() => props.onRetryInterruptedTurn(conversation.latestTurnId!)}
+              >
+                Retry interrupted Turn
+              </button>
+            ) : null}
+          </div>
+        </section>
+      ) : null}
+
       <div className="conversation-canvas__controls">
         <label>
           Model
           <select
             aria-label="Model"
-            value={props.conversation.modelId ?? ""}
+            value={conversation.modelId ?? ""}
             disabled={turnActive}
             onChange={(event) => {
               const next = event.currentTarget.value;
               props.onChangeModel(next.length === 0 ? null : next);
             }}
           >
-            {!props.conversation.modelId ? <option value="">Default</option> : null}
-            {props.conversation.availableModels.map((modelId) => (
+            {!conversation.modelId ? <option value="">Default</option> : null}
+            {conversation.availableModels.map((modelId) => (
               <option key={modelId} value={modelId}>
                 {modelId}
               </option>
@@ -60,19 +105,21 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           <button
             type="button"
             aria-label="Permission mode"
+            aria-haspopup="menu"
+            aria-expanded={permissionOpen && !turnActive}
             disabled={turnActive}
             onClick={() => setPermissionOpen((value) => !value)}
           >
-            {permissionLabel(props.conversation.permissionMode)}
+            {permissionLabel(conversation.permissionMode)}
           </button>
-          {permissionOpen ? (
+          {permissionOpen && !turnActive ? (
             <div role="menu" className="permission-selector__popover">
-              {props.conversation.availablePermissionModes.map((mode) => (
+              {conversation.availablePermissionModes.map((mode) => (
                 <button
                   key={mode}
                   type="button"
                   role="menuitemradio"
-                  aria-checked={props.conversation.permissionMode === mode}
+                  aria-checked={conversation.permissionMode === mode}
                   onClick={() => {
                     props.onChangePermissionMode(mode);
                     setPermissionOpen(false);
@@ -90,21 +137,15 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           <select
             aria-label="Plugins"
             multiple
-            value={props.conversation.enabledPluginIds}
+            value={conversation.enabledPluginIds}
             disabled={turnActive}
             onChange={(event) => {
-              const selected = new Set(
+              props.onChangePlugins(
                 Array.from(event.currentTarget.selectedOptions, (option) => option.value),
               );
-              for (const plugin of props.conversation.availablePlugins) {
-                const enabled = props.conversation.enabledPluginIds.includes(plugin.id);
-                if (enabled !== selected.has(plugin.id)) {
-                  props.onTogglePlugin(plugin.id);
-                }
-              }
             }}
           >
-            {props.conversation.availablePlugins.map((plugin) => (
+            {conversation.availablePlugins.map((plugin) => (
               <option key={plugin.id} value={plugin.id}>
                 {plugin.name}
               </option>
@@ -116,7 +157,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
       <section className="conversation-canvas__timeline" aria-label="Activity timeline">
         <h3>Timeline</h3>
         <ul>
-          {props.conversation.events.map((event) => (
+          {conversation.events.map((event) => (
             <li key={event.id} className="conversation-canvas__event">
               <code>{event.type}</code>
               <span>{describeEvent(event)}</span>
@@ -128,7 +169,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
       <section className="conversation-canvas__pending" aria-label="Pending messages">
         <h3>Pending queue</h3>
         <ul>
-          {props.conversation.queuedMessages.map((message) => (
+          {conversation.queuedMessages.map((message) => (
             <li key={message.id}>
               <span>{message.content}</span>
               <button
@@ -144,7 +185,23 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
         </ul>
       </section>
 
-      <Composer queueMode={turnActive} onSubmit={props.onQueueMessage} />
+      <Composer
+        queueMode={turnActive}
+        value={drafts[conversation.id] ?? ""}
+        onChange={(value) => {
+          setDrafts((current) => ({ ...current, [conversation.id]: value }));
+        }}
+        onSubmit={async (content) => {
+          const conversationId = conversation.id;
+          const submittedDraft = drafts[conversationId] ?? "";
+          await props.onQueueMessage(content);
+          setDrafts((current) =>
+            current[conversationId] === submittedDraft
+              ? { ...current, [conversationId]: "" }
+              : current,
+          );
+        }}
+      />
     </section>
   );
 }

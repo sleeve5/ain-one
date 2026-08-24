@@ -43,6 +43,7 @@ function migrate(db: DatabaseSync): void {
       content TEXT NOT NULL,
       status TEXT NOT NULL,
       claimed_turn_id TEXT,
+      retry_of_turn_id TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL,
       UNIQUE (conversation_id, enqueue_seq)
@@ -76,6 +77,28 @@ function migrate(db: DatabaseSync): void {
       UNIQUE (conversation_id, sequence)
     );
 
+    CREATE TABLE IF NOT EXISTS plugin_enablements (
+      scope_type TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      plugin_id TEXT NOT NULL,
+      version_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (scope_type, scope_id, plugin_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS plugin_enablement_scopes (
+      scope_type TEXT NOT NULL,
+      scope_id TEXT NOT NULL,
+      updated_at TEXT NOT NULL,
+      PRIMARY KEY (scope_type, scope_id)
+    );
+
+    CREATE TABLE IF NOT EXISTS agent_installations (
+      agent_product_id TEXT PRIMARY KEY,
+      executable_path TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
     CREATE UNIQUE INDEX IF NOT EXISTS turns_one_active_per_conversation
     ON turns(conversation_id)
     WHERE status IN ('starting', 'running', 'cancelling');
@@ -95,6 +118,15 @@ function migrateQueuedMessageSequence(db: DatabaseSync): void {
 
     if (!hasEnqueueSeq) {
       db.exec("ALTER TABLE queued_messages ADD COLUMN enqueue_seq INTEGER;");
+    }
+
+    const hasRetryOfTurnId = (db
+      .prepare("PRAGMA table_info(queued_messages)")
+      .all() as Array<{ name: string }>).some(
+      (column) => column.name === "retry_of_turn_id",
+    );
+    if (!hasRetryOfTurnId) {
+      db.exec("ALTER TABLE queued_messages ADD COLUMN retry_of_turn_id TEXT;");
     }
 
     db.exec(`
@@ -138,6 +170,11 @@ function migrateQueuedMessageSequence(db: DatabaseSync): void {
       CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_sequence_idx
       ON queued_messages(conversation_id, enqueue_seq)
       WHERE enqueue_seq IS NOT NULL
+    `);
+    db.exec(`
+      CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_retry_idx
+      ON queued_messages(retry_of_turn_id)
+      WHERE retry_of_turn_id IS NOT NULL
     `);
     db.exec("COMMIT");
   } catch (error) {

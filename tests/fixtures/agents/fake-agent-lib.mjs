@@ -1,6 +1,7 @@
 #!/usr/bin/env node
 
-import { appendFileSync } from "node:fs";
+import { appendFileSync, existsSync } from "node:fs";
+import { createServer } from "node:http";
 import { basename } from "node:path";
 
 const product = detectProduct();
@@ -24,10 +25,24 @@ if (product === "claude" && args[0] === "auth" && args[1] === "status" && args[2
   process.exit(0);
 }
 
+if ((product === "codex" || product === "trae") && args[0] === "login" && args[1] === "status") {
+  if (process.env.AIN_FIXTURE_AUTH === "required") {
+    process.stderr.write("Not logged in\n");
+    process.exit(1);
+  }
+  process.stdout.write(`Logged in using ${product === "codex" ? "ChatGPT" : "Trae"}\n`);
+  process.exit(0);
+}
+
 if (product === "trae" && args[0] === "models" && args[1] === "--json") {
   process.stdout.write(
     `${JSON.stringify([{ id: "trae-sonnet" }, { name: "trae-opus" }, null])}\n`,
   );
+  process.exit(0);
+}
+
+if (product === "opencode" && args[0] === "serve") {
+  await runOpenCodeServer(args);
   process.exit(0);
 }
 
@@ -41,6 +56,117 @@ process.exit(0);
 async function runExec(productId, argv) {
   const scenario = process.env.AIN_FIXTURE_SCENARIO ?? "normal";
   const sessionId = sessionIdFor(productId, argv);
+
+  if (scenario === "nonzero-before-identity") {
+    process.stderr.write("native process failed before identity\n");
+    process.exit(23);
+  }
+
+  if (scenario === "codex-modern-jsonl") {
+    writeLine({ type: "thread.started", thread_id: sessionId });
+    writeLine({ type: "turn.started" });
+    writeLine({
+      type: "item.completed",
+      item: { id: "reasoning-1", type: "reasoning", text: "confirmed working directory" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "warning-1", type: "error", message: "skills context shortened" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: {
+        id: "shell-1",
+        type: "command_execution",
+        command: "/bin/zsh -c pwd",
+        aggregated_output: "/tmp/project\n",
+        exit_code: 0,
+        status: "completed",
+      },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "file-1", type: "file_change", changes: [{ path: "README.md" }] },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "mcp-1", type: "mcp_tool_call", server: "docs", tool: "search" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "web-1", type: "web_search", query: "Codex JSONL" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "future-1", type: "future_item", token: "sk-secret-value" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "message-1", type: "agent_message", text: "/tmp/project" },
+    });
+    writeLine({
+      type: "turn.completed",
+      usage: { input_tokens: 12, output_tokens: 4 },
+    });
+    return;
+  }
+
+  if (scenario === "claude-modern-jsonl") {
+    writeLine({ type: "system", subtype: "hook_started", session_id: sessionId });
+    writeLine({ type: "system", subtype: "init", session_id: sessionId });
+    writeLine({
+      type: "stream_event",
+      session_id: sessionId,
+      event: { type: "content_block_delta", delta: { type: "text_delta", text: "duplicate" } },
+    });
+    writeLine({
+      type: "assistant",
+      session_id: sessionId,
+      message: {
+        role: "assistant",
+        content: [
+          { type: "thinking", thinking: "checking the working directory" },
+          { type: "tool_use", id: "tool-claude", name: "Bash", input: { command: "pwd" } },
+        ],
+      },
+    });
+    writeLine({
+      type: "user",
+      session_id: sessionId,
+      message: {
+        role: "user",
+        content: [
+          { type: "tool_result", tool_use_id: "tool-claude", content: "/tmp/project", is_error: false },
+        ],
+      },
+    });
+    writeLine({
+      type: "assistant",
+      session_id: sessionId,
+      message: { role: "assistant", content: [{ type: "text", text: "/tmp/project" }] },
+    });
+    writeLine({
+      type: "result",
+      subtype: "success",
+      session_id: sessionId,
+      is_error: false,
+      result: "/tmp/project",
+      usage: { input_tokens: 42, output_tokens: 7 },
+    });
+    return;
+  }
+
+  if (scenario === "claude-error-result") {
+    writeLine({ type: "system", subtype: "init", session_id: sessionId });
+    writeLine({
+      type: "result",
+      subtype: "error",
+      session_id: sessionId,
+      is_error: true,
+      result: "model denied",
+    });
+    return;
+  }
 
   if (scenario === "turn-before-session") {
     writeLine({ type: "turn.started", turn_id: `native-turn-${productId}` });
@@ -56,13 +182,14 @@ async function runExec(productId, argv) {
   }
 
   if (scenario === "cancel") {
+    const keepAlive = setInterval(() => undefined, 1_000);
     await new Promise((resolvePromise) => {
-      process.on("SIGTERM", () => {
+      const stop = () => {
+        clearInterval(keepAlive);
         resolvePromise();
-      });
-      process.on("SIGINT", () => {
-        resolvePromise();
-      });
+      };
+      process.on("SIGTERM", stop);
+      process.on("SIGINT", stop);
     });
     return;
   }
@@ -78,6 +205,16 @@ async function runExec(productId, argv) {
       setTimeout(resolvePromise, 5_000);
     });
     return;
+  }
+
+  if (scenario === "wait-for-file") {
+    const gatePath = process.env.AIN_FIXTURE_GATE_PATH;
+    if (!gatePath) {
+      throw new Error("AIN_FIXTURE_GATE_PATH is required for wait-for-file");
+    }
+    while (!existsSync(gatePath)) {
+      await sleep(20);
+    }
   }
 
   if (scenario === "malformed-json") {
@@ -111,6 +248,49 @@ async function runExec(productId, argv) {
   }
 
   writeLine({ type: "turn.completed" });
+  if (scenario === "terminal-before-exit") {
+    const keepAlive = setInterval(() => undefined, 1_000);
+    await new Promise((resolvePromise) => {
+      const stop = () => {
+        clearInterval(keepAlive);
+        resolvePromise();
+      };
+      process.on("SIGTERM", stop);
+      process.on("SIGINT", stop);
+    });
+  }
+}
+
+async function runOpenCodeServer(argv) {
+  const hostname = readFlag(argv, "--hostname=") ?? "127.0.0.1";
+  const port = Number(readFlag(argv, "--port=") ?? "0");
+  const server = createServer((_request, response) => {
+    response.statusCode = 404;
+    response.end();
+  });
+  await new Promise((resolvePromise, rejectPromise) => {
+    server.once("error", rejectPromise);
+    server.listen(port, hostname, resolvePromise);
+  });
+  const address = server.address();
+  if (!address || typeof address === "string") {
+    throw new Error("expected TCP server address");
+  }
+  process.stdout.write(`opencode server listening on http://${hostname}:${address.port}\n`);
+  if (process.env.AIN_FIXTURE_SCENARIO === "ignore-sigterm") {
+    await new Promise((resolvePromise) => {
+      process.on("SIGTERM", () => {
+        recordInvocation({ product: "opencode", commandType: "signal", signal: "SIGTERM" });
+      });
+      setTimeout(resolvePromise, 5_000);
+    });
+    return;
+  }
+  await new Promise((resolvePromise) => {
+    const stop = () => server.close(resolvePromise);
+    process.on("SIGTERM", stop);
+    process.on("SIGINT", stop);
+  });
 }
 
 function sleep(ms) {
@@ -153,10 +333,20 @@ function detectCommandType(productId, argv) {
   if (productId === "claude" && argv[0] === "auth") {
     return "auth";
   }
+  if ((productId === "codex" || productId === "trae") && argv[0] === "login") {
+    return "auth";
+  }
   if (productId === "trae" && argv[0] === "models") {
     return "models";
   }
+  if (productId === "opencode" && argv[0] === "serve") {
+    return "serve";
+  }
   return isExecCommand(productId, argv) ? "exec" : "other";
+}
+
+function readFlag(argv, prefix) {
+  return argv.find((value) => value.startsWith(prefix))?.slice(prefix.length);
 }
 
 function isExecCommand(productId, argv) {

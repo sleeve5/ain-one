@@ -1,13 +1,15 @@
 import { randomUUID } from "node:crypto";
-import { mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
+import { chmodSync, mkdirSync, mkdtempSync, rmSync, writeFileSync } from "node:fs";
 import { Agent, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
+import type { AgentConnector } from "../../src/shared/contracts.js";
 import { createDatabase } from "../../src/server/db.js";
 import { createRepositories } from "../../src/server/repositories.js";
-import { createApiServer } from "../../src/server/api.js";
+import { createApiServer, InputError } from "../../src/server/api.js";
 import { createProjectFilesService } from "../../src/server/files.js";
+import { TurnCoordinator } from "../../src/server/turn-coordinator.js";
 
 const TOKEN = "task-3-token";
 const tempDirs: string[] = [];
@@ -32,6 +34,7 @@ async function makeHttpRequest(input: {
   token: string;
   body?: string;
   agent?: Agent;
+  beforeBodyEnd?: () => Promise<void>;
 }): Promise<{
   statusCode: number;
   headers: Record<string, string | string[]>;
@@ -73,6 +76,14 @@ async function makeHttpRequest(input: {
     );
 
     req.on("error", rejectPromise);
+    if (input.body && input.beforeBodyEnd) {
+      req.flushHeaders();
+      void input.beforeBodyEnd().then(
+        () => req.end(input.body),
+        (error: unknown) => req.destroy(error instanceof Error ? error : new Error(String(error))),
+      );
+      return;
+    }
     if (input.body) {
       req.write(input.body);
     }
@@ -87,6 +98,10 @@ async function createFixture(input?: {
     decision: "allow_once" | "deny_once";
   }) => Promise<void>;
   bodyLimitBytes?: number;
+  catalog?: {
+    models: string[];
+    permissionModes: Array<"request_approval" | "help_me_approve" | "full_access">;
+  };
 }) {
   const projectPath = mkdtempSync(join(tmpdir(), "ain-one-task3-api-"));
   tempDirs.push(projectPath);
@@ -101,6 +116,7 @@ async function createFixture(input?: {
   });
 
   const queuedByCoordinator: string[] = [];
+  const recoveryCommands: string[] = [];
   const api = createApiServer({
     host: "127.0.0.1",
     port: 0,
@@ -113,8 +129,27 @@ async function createFixture(input?: {
         repositories.enqueueMessage(conversationId, content);
       },
       cancelActiveTurn: async () => false,
+      continueConversation: async (conversationId) => {
+        recoveryCommands.push(`continue:${conversationId}`);
+        return true;
+      },
+      retryInterruptedTurn: async (conversationId, turnId) => {
+        recoveryCommands.push(`retry:${conversationId}:${turnId}`);
+        return true;
+      },
     },
     permissionResponder: input?.permissionResponder,
+    catalogProvider: async () => input?.catalog ?? ({
+      models: ["gpt-test", "gpt-next"],
+      permissionModes: ["request_approval", "full_access"],
+    }),
+    validatePluginVersions: (_scope, pluginVersions) => {
+      if (pluginVersions.some(
+        (plugin) => plugin.pluginId !== "formatter" || plugin.versionId !== "v1",
+      )) {
+        throw new InputError(400, "plugin_version_not_found", "Plugin version not found");
+      }
+    },
     bodyLimitBytes: input?.bodyLimitBytes,
     ssePollMs: 5,
     sseHeartbeatMs: 50,
@@ -134,6 +169,7 @@ async function createFixture(input?: {
     project,
     conversation,
     queuedByCoordinator,
+    recoveryCommands,
     request,
     stop: async () => {
       await api.stop();
@@ -208,6 +244,8 @@ describe("loopback api", () => {
       turnCoordinator: {
         enqueueMessage: async () => undefined,
         cancelActiveTurn: async () => false,
+        continueConversation: async () => false,
+        retryInterruptedTurn: async () => false,
       },
       files: createProjectFilesService(),
     });
@@ -245,6 +283,8 @@ describe("loopback api", () => {
       turnCoordinator: {
         enqueueMessage: async () => undefined,
         cancelActiveTurn: async () => false,
+        continueConversation: async () => false,
+        retryInterruptedTurn: async () => false,
       },
       files: createProjectFilesService(),
       allowedOrigins: ["http://127.0.0.1:0", "http://localhost:0", "http://[::1]:0"],
@@ -291,6 +331,48 @@ describe("loopback api", () => {
         expect.objectContaining({ sequence: 2, eventId: 2 }),
         expect.objectContaining({ sequence: 3, eventId: 3 }),
       ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("withholds terminal SSE events until the Turn state is committed", async () => {
+    const fixture = await createFixture();
+    try {
+      fixture.repositories.enqueueMessage(fixture.conversation.id, "run");
+      const claimed = fixture.repositories.claimNextMessage(fixture.conversation.id, {
+        modelId: "gpt-test",
+        permissionMode: "request_approval",
+        pluginVersions: [],
+      });
+      if (!claimed) {
+        throw new Error("expected active Turn");
+      }
+      fixture.repositories.markTurnRunning(claimed.turn.id, "native-turn");
+      fixture.repositories.appendEvent(fixture.conversation.id, {
+        type: "turn_status",
+        payload: { turnId: claimed.turn.id, status: "failed" },
+      });
+
+      const response = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/events`,
+      );
+      const reader = response.body?.getReader();
+      if (!reader) {
+        throw new Error("expected stream reader");
+      }
+      const firstChunk = await reader.read();
+      expect(new TextDecoder().decode(firstChunk.value)).not.toContain('"status":"failed"');
+
+      fixture.repositories.finishTurn(claimed.turn.id, "failed");
+      const deadline = Date.now() + 500;
+      let output = "";
+      while (Date.now() < deadline && !output.includes('"status":"failed"')) {
+        const chunk = await reader.read();
+        output += new TextDecoder().decode(chunk.value);
+      }
+      expect(output).toContain('"status":"failed"');
+      await reader.cancel();
     } finally {
       await fixture.stop();
     }
@@ -582,6 +664,319 @@ describe("loopback api", () => {
       expect(fixture.queuedByCoordinator).toContain("hello");
     } finally {
       await fixture.stop();
+    }
+  });
+
+  it("exposes explicit continue and interrupted-Turn retry commands", async () => {
+    const fixture = await createFixture();
+    try {
+      const continued = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/continue`,
+        { method: "POST", body: "{}" },
+      );
+      const retried = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/turns/turn-1/retry`,
+        { method: "POST", body: "{}" },
+      );
+
+      expect(continued.status).toBe(200);
+      expect(retried.status).toBe(200);
+      expect(fixture.recoveryCommands).toEqual([
+        `continue:${fixture.conversation.id}`,
+        `retry:${fixture.conversation.id}:turn-1`,
+      ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("persists between-Turn conversation settings and rejects changes while active", async () => {
+    const fixture = await createFixture();
+    try {
+      const update = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/settings`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            modelId: "gpt-next",
+            permissionMode: "full_access",
+          }),
+        },
+      );
+      expect(update.status).toBe(200);
+      expect(fixture.repositories.getConversation(fixture.conversation.id)).toMatchObject({
+        agentProductId: "codex",
+        modelId: "gpt-next",
+        permissionMode: "full_access",
+      });
+      expect(fixture.repositories.resolvePluginVersions(
+        fixture.project.id,
+        fixture.conversation.id,
+      )).toEqual([]);
+
+      const detail = await fixture.request(`/api/conversations/${fixture.conversation.id}`);
+      expect(await readJson(detail)).toMatchObject({ pluginVersions: [] });
+
+      fixture.repositories.enqueueMessage(fixture.conversation.id, "active");
+      fixture.repositories.claimNextMessage(fixture.conversation.id, {
+        modelId: "gpt-next",
+        permissionMode: "full_access",
+        pluginVersions: [],
+      });
+      const blocked = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/settings`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            modelId: "forbidden",
+            permissionMode: "request_approval",
+          }),
+        },
+      );
+      expect(blocked.status).toBe(409);
+      expect(fixture.repositories.getConversation(fixture.conversation.id)?.modelId).toBe(
+        "gpt-next",
+      );
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("returns 400 for invalid settings payloads", async () => {
+    const fixture = await createFixture();
+    try {
+      const response = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/settings`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({ modelId: null, permissionMode: "invalid" }),
+        },
+      );
+
+      expect(response.status).toBe(400);
+      expect(await readJson(response)).toEqual({
+        error: {
+          code: "invalid_input",
+          message: "Unsupported permission mode",
+        },
+      });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("rejects models and permission modes outside the Agent catalog", async () => {
+    const fixture = await createFixture({
+      catalog: {
+        models: ["gpt-test"],
+        permissionModes: ["request_approval"],
+      },
+    });
+    try {
+      const create = await fixture.request("/api/conversations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: fixture.project.id,
+          agentProductId: "codex",
+          modelId: "missing-model",
+          permissionMode: "request_approval",
+        }),
+      });
+      expect(create.status).toBe(400);
+      expect(await readJson(create)).toMatchObject({
+        error: { code: "unsupported_model" },
+      });
+
+      const update = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/settings`,
+        {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            modelId: "gpt-test",
+            permissionMode: "help_me_approve",
+          }),
+        },
+      );
+      expect(update.status).toBe(400);
+      expect(await readJson(update)).toMatchObject({
+        error: { code: "unsupported_permission_mode" },
+      });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("uses the Agent catalog default permission when create omits it", async () => {
+    const fixture = await createFixture({
+      catalog: {
+        models: ["openai/gpt-5"],
+        permissionModes: ["full_access"],
+      },
+    });
+    try {
+      const response = await fixture.request("/api/conversations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          projectId: fixture.project.id,
+          agentProductId: "opencode",
+          modelId: "openai/gpt-5",
+        }),
+      });
+
+      expect(response.status).toBe(201);
+      expect(await readJson(response)).toMatchObject({
+        conversation: { permissionMode: "full_access" },
+      });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("reads and replaces plugin enablements at each scope", async () => {
+    const fixture = await createFixture();
+    try {
+      const put = await fixture.request("/api/plugins/enablements/global", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pluginVersions: [{ pluginId: "formatter", versionId: "v1" }],
+        }),
+      });
+      expect(put.status).toBe(200);
+
+      const get = await fixture.request("/api/plugins/enablements/global");
+      expect(await readJson(get)).toEqual({
+        pluginVersions: [{ pluginId: "formatter", versionId: "v1" }],
+      });
+
+      const invalid = await fixture.request("/api/plugins/enablements/global", {
+        method: "PUT",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({
+          pluginVersions: [{ pluginId: "missing", versionId: "v2" }],
+        }),
+      });
+      expect(invalid.status).toBe(400);
+      expect(await readJson(invalid)).toEqual({
+        error: {
+          code: "plugin_version_not_found",
+          message: "Plugin version not found",
+        },
+      });
+      expect(fixture.repositories.listPluginEnablements({ type: "global" })).toEqual([
+        { pluginId: "formatter", versionId: "v1" },
+      ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("rejects plugin enablement changes that affect an active Turn", async () => {
+    const fixture = await createFixture();
+    try {
+      fixture.repositories.enqueueMessage(fixture.conversation.id, "active");
+      fixture.repositories.claimNextMessage(fixture.conversation.id, {
+        modelId: "gpt-test",
+        permissionMode: "request_approval",
+        pluginVersions: [],
+      });
+
+      for (const path of [
+        "/api/plugins/enablements/global",
+        `/api/plugins/enablements/project/${fixture.project.id}`,
+        `/api/plugins/enablements/conversation/${fixture.conversation.id}`,
+      ]) {
+        const response = await fixture.request(path, {
+          method: "PUT",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify({
+            pluginVersions: [{ pluginId: "formatter", versionId: "v1" }],
+          }),
+        });
+        expect(response.status).toBe(409);
+      }
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("returns turn_active when an Agent Turn starts while settings input is loading", async () => {
+    const projectPath = mkdtempSync(join(tmpdir(), "ain-one-agent-settings-race-"));
+    const executable = join(projectPath, "replacement-agent");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n");
+    chmodSync(executable, 0o755);
+    tempDirs.push(projectPath);
+
+    const db = createDatabase(":memory:");
+    const repositories = createRepositories(db);
+    const project = repositories.createProject(projectPath, "race");
+    const conversation = repositories.createConversation({
+      projectId: project.id,
+      agentProductId: "codex",
+      modelId: "gpt-test",
+    });
+    const initial = { id: "codex" } as AgentConnector;
+    const replacement = { id: "codex" } as AgentConnector;
+    const coordinator = new TurnCoordinator({ repositories, connectors: { codex: initial } });
+    let releaseInitialCheck = (): void => undefined;
+    const initialCheck = new Promise<void>((resolvePromise) => {
+      releaseInitialCheck = resolvePromise;
+    });
+    const hasActiveTurnForAgent = repositories.hasActiveTurnForAgent.bind(repositories);
+    let checks = 0;
+    repositories.hasActiveTurnForAgent = (agentProductId) => {
+      const active = hasActiveTurnForAgent(agentProductId);
+      if (checks++ === 0) {
+        releaseInitialCheck();
+      }
+      return active;
+    };
+    const api = createApiServer({
+      host: "127.0.0.1",
+      port: 0,
+      token: TOKEN,
+      repositories,
+      files: createProjectFilesService(),
+      turnCoordinator: coordinator,
+      updateAgentSettings: ({ agentProductId }) =>
+        coordinator.setConnector(agentProductId, replacement),
+    });
+    await api.start();
+
+    try {
+      const body = JSON.stringify({ executablePath: executable });
+      const response = await makeHttpRequest({
+        url: new URL(`/api/agents/codex/settings`, api.url),
+        method: "PUT",
+        token: TOKEN,
+        body,
+        beforeBodyEnd: async () => {
+          await initialCheck;
+          repositories.enqueueMessage(conversation.id, "active");
+          repositories.claimNextMessage(conversation.id, {
+            modelId: "gpt-test",
+            permissionMode: "request_approval",
+            pluginVersions: [],
+          });
+        },
+      });
+
+      expect(response.statusCode).toBe(409);
+      expect(JSON.parse(response.body)).toEqual({
+        error: {
+          code: "turn_active",
+          message: "Agent settings can change only between Turns",
+        },
+      });
+    } finally {
+      await api.stop();
+      db.close();
     }
   });
 });

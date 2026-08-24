@@ -28,6 +28,10 @@ export function createInitialWorkspaceUiState(): WorkspaceUiState {
       selectedConversationId: null,
       conversation: null,
       inspector: emptyInspector(),
+      agents: [],
+      installedPlugins: [],
+      pluginCandidates: [],
+      pluginError: null,
     },
   };
 }
@@ -95,8 +99,17 @@ export function applyConversationEvent(
     ...conversation,
     events: nextEvents,
     activeTurnStatus: null,
+    latestTurnId: readTurnId(event.payload) ?? conversation.latestTurnId,
     latestTurnStatus: payloadStatus,
+    queuePaused:
+      payloadStatus === "completed" || payloadStatus === "cancelled"
+        ? false
+        : true,
   };
+}
+
+function readTurnId(payload: Record<string, unknown>): string | null {
+  return typeof payload.turnId === "string" ? payload.turnId : null;
 }
 
 function readTurnStatus(payload: Record<string, unknown>): TurnStatus | null {

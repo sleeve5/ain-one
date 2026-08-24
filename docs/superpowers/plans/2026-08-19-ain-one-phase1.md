@@ -46,7 +46,7 @@ src/server/connectors/cli-jsonl.ts  common Codex/Trae JSONL session runtime
 src/server/connectors/codex.ts      Codex probing/catalog/command mapping
 src/server/connectors/claude.ts     Claude stream-json runtime
 src/server/connectors/trae.ts       Trae probing/catalog/command mapping
-src/server/connectors/opencode.ts   OpenCode availability and SDK runtime
+src/server/connectors/opencode.ts   retained backend adapter; hidden from the Phase 1 Web UI
 src/server/connectors/registry.ts   Connector registry
 src/server/plugins.ts               canonical plugin store/import/materialize
 src/server/files.ts                 safe file tree, preview, and Git diff
@@ -273,7 +273,7 @@ git commit -m "feat: expose secure local control API"
 
 **Interfaces:**
 - Consumes: `AgentConnector` contract.
-- Produces: a registry with IDs `codex`, `claude`, `trae`, `opencode` and normalized events for message/tool/shell/file/usage/status data.
+- Produces: a registry with IDs `codex`, `claude`, `trae`, `opencode`; the Phase 1 Web UI allowlists only `codex`, `claude`, and `trae`.
 
 - [ ] **Step 1: Write failing shared Connector contract tests**
 
@@ -310,7 +310,7 @@ Implement executable lookup, version probing, direct spawn, line-delimited JSON 
 - Codex: use `codex exec --json` and `codex exec resume <session-id> --json`; read native model cache when present; map `request_approval`, `help_me_approve`, and `full_access` to native CLI flags.
 - Claude: use `claude --print --output-format stream-json --include-partial-messages`; resume with `--resume`; expose accepted model aliases and native permission modes; use a UUID session ID supplied by Ain One.
 - Trae: use `traecli exec --json`, resume subcommand, and `traecli models --json`; map the three permission choices to native modes.
-- OpenCode: probe the `opencode` binary and official SDK availability; when absent return `not_installed`; when present create/resume SDK sessions and consume server events.
+- OpenCode: retain the backend adapter and contract coverage, but do not expose it in Phase 1 Agent Settings, Conversation creation, plugin compatibility controls, or user acceptance.
 
 If a native protocol cannot provide interactive permission responses in this transport, `respondToPermission` throws a typed unsupported-capability error and probing returns `capability_limited`; never emulate approval.
 
@@ -452,10 +452,10 @@ git commit -m "feat: add conversation workspace UI"
 - [ ] **Step 1: Write failing settings and startup recovery tests**
 
 ```ts
-it("shows truthful Agent availability and only supported permission modes", async () => {
-  render(<Settings api={fakeApi({ agents: [{ id: "opencode", status: "not_installed", modes: [] }] })} />);
-  expect(await screen.findByText("OpenCode is not installed")).toBeVisible();
-  expect(screen.queryByRole("button", { name: "Full access" })).not.toBeInTheDocument();
+it("shows only Phase 1 Agent Products and their supported permission modes", async () => {
+  render(<Settings api={fakeApi({ agents: [{ id: "codex", status: "available", modes: ["request_approval"] }] })} />);
+  expect(await screen.findByText("Codex is available")).toBeVisible();
+  expect(screen.queryByText("OpenCode")).not.toBeInTheDocument();
 });
 
 it("marks active Turns interrupted on startup and preserves queued messages", async () => {
@@ -487,7 +487,7 @@ Document prerequisites, `pnpm install`, `pnpm dev`, local data location, opening
 - [ ] **Step 6: Run full verification**
 
 Run: `pnpm test && pnpm typecheck && pnpm build && pnpm test:e2e`
-Expected: all commands exit 0. Local probe output must report Codex, Claude Code, and Trae according to their installed state and OpenCode as `not_installed` on the current machine.
+Expected: all commands exit 0. Local probe output must report Codex, Claude Code, and Trae according to their installed state. OpenCode is excluded from Phase 1 UI acceptance.
 
 - [ ] **Step 7: Run minimal real-Agent acceptance without modifying the repository**
 

@@ -49,10 +49,58 @@ function fakeApi(): AinOneApi {
     async cancelActiveTurn() {
       return undefined;
     },
+    async continueConversation() {
+      return undefined;
+    },
+    async retryInterruptedTurn() {
+      return undefined;
+    },
     subscribeConversationEvents() {
       return () => undefined;
     },
-    async updateConversationDraftSettings() {
+    async openProject() {
+      return {
+        id: "project-2",
+        path: "/tmp/project-2",
+        name: "Project Two",
+        createdAt: "2026-08-23T00:00:00.000Z",
+        updatedAt: "2026-08-23T00:00:00.000Z",
+      };
+    },
+    async createConversation() {
+      return {
+        id: "conv-2",
+        projectId: "project-1",
+        agentProductId: "codex",
+        modelId: "gpt-5",
+        permissionMode: "request_approval",
+        queuePaused: false,
+        createdAt: "2026-08-23T00:00:00.000Z",
+        updatedAt: "2026-08-23T00:00:00.000Z",
+      };
+    },
+    async updateConversationSettings() {
+      return undefined;
+    },
+    async updateAgentExecutablePath() {
+      return undefined;
+    },
+    async installPlugin() {
+      return undefined;
+    },
+    async refreshPluginImports() {
+      return undefined;
+    },
+    async acceptPluginCandidate() {
+      return undefined;
+    },
+    async repairPluginMaterialization() {
+      return undefined;
+    },
+    async getPluginEnablements() {
+      return [];
+    },
+    async setPluginEnablements() {
       return undefined;
     },
     async listProjectFiles() {
@@ -75,6 +123,7 @@ function createWorkspaceState(): WorkspaceState {
     enabledPluginIds: [],
     availablePlugins: [],
     activeTurnStatus: null,
+    latestTurnId: "turn-completed",
     latestTurnStatus: "completed",
     queuePaused: false,
     queuedMessages: [],
@@ -107,5 +156,9 @@ function createWorkspaceState(): WorkspaceState {
     selectedConversationId: "conv-1",
     conversation,
     inspector,
+    agents: [],
+    installedPlugins: [],
+    pluginCandidates: [],
+    pluginError: null,
   };
 }

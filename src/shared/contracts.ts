@@ -123,6 +123,7 @@ export interface AgentProbe {
 export interface AgentCatalog {
   models: string[];
   permissionModes: PermissionMode[];
+  error?: string;
 }
 
 export interface SessionInput {
@@ -142,6 +143,7 @@ export interface StartTurnInput {
   content: string;
   snapshot: TurnSnapshot;
   turnId?: string;
+  mcpConfigPath?: string | null;
 }
 
 export interface NativeTurn {
@@ -197,6 +199,19 @@ export interface CreateConversationRequest {
 
 export interface CreateConversationInput extends CreateConversationRequest {
   permissionMode?: PermissionMode;
+}
+
+export interface ConversationSettingsInput {
+  modelId: string | null;
+  permissionMode: PermissionMode;
+}
+
+export interface AgentSettingsInput {
+  executablePath: string | null;
+}
+
+export interface PluginEnablementsInput {
+  pluginVersions: PluginVersion[];
 }
 
 export interface QueueMessageRequest {

@@ -107,6 +107,202 @@ describe("HTTP AinOneApi", () => {
     ]);
   });
 
+  it("posts explicit recovery commands once", async () => {
+    const calls: Array<{ url: string; method: string; body: string | null }> = [];
+    const api = createHttpAinOneApi({
+      baseUrl: "http://127.0.0.1:3000",
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return Response.json({ accepted: true });
+      },
+    });
+
+    await api.continueConversation("conv-1");
+    await api.retryInterruptedTurn("conv-1", "turn-1");
+
+    expect(calls).toEqual([
+      {
+        url: "http://127.0.0.1:3000/api/conversations/conv-1/continue",
+        method: "POST",
+        body: "{}",
+      },
+      {
+        url: "http://127.0.0.1:3000/api/conversations/conv-1/turns/turn-1/retry",
+        method: "POST",
+        body: "{}",
+      },
+    ]);
+  });
+
+  it("persists exact conversation settings without local draft storage", async () => {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    const storage = memoryStorage();
+    const api = createHttpAinOneApi({
+      token: "token",
+      storage,
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        return jsonResponse({ conversation: conversation("conv-1", "project-1") });
+      },
+    });
+
+    await api.updateConversationSettings("conv-1", {
+      modelId: "gpt-5.1",
+      permissionMode: "full_access",
+    });
+
+    expect(calls).toEqual([
+      {
+        url: "/api/conversations/conv-1/settings",
+        method: "PUT",
+        body: {
+          modelId: "gpt-5.1",
+          permissionMode: "full_access",
+        },
+      },
+    ]);
+    expect(storage.getItem("ain-one:draft-settings:conv-1")).toBeNull();
+  });
+
+  it("opens a Project and creates a Conversation through the control API", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        return String(input).endsWith("/api/projects")
+          ? jsonResponse({ project: project("project-1", "One") })
+          : jsonResponse({ conversation: conversation("conv-1", "project-1") });
+      },
+    });
+
+    const opened = await api.openProject("/tmp/one");
+    const created = await api.createConversation({
+      projectId: "project-1",
+      agentProductId: "codex",
+      modelId: "gpt-5",
+      permissionMode: "request_approval",
+    });
+
+    expect(opened.id).toBe("project-1");
+    expect(created.id).toBe("conv-1");
+
+    expect(calls).toEqual([
+      { url: "/api/projects", body: { path: "/tmp/one", name: null } },
+      {
+        url: "/api/conversations",
+        body: {
+          projectId: "project-1",
+          agentProductId: "codex",
+          modelId: "gpt-5",
+          permissionMode: "request_approval",
+        },
+      },
+    ]);
+  });
+
+  it("requests plugin materialization repair for one exact Agent version", async () => {
+    const calls: Array<{ url: string; method: string }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({ url: String(input), method: init?.method ?? "GET" });
+        return Response.json({ repaired: true });
+      },
+    });
+
+    await api.repairPluginMaterialization("claude", {
+      pluginId: "review skill",
+      versionId: "sha/1",
+    });
+
+    expect(calls).toEqual([
+      {
+        url: "/api/plugins/review%20skill/versions/sha%2F1/materializations/claude/repair",
+        method: "POST",
+      },
+    ]);
+  });
+
+  it("installs a local Skill with an explicit compatibility matrix", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        return Response.json({ plugin: {} }, { status: 201 });
+      },
+    });
+
+    await api.installPlugin("/tmp/my-skill", "skill", ["codex", "claude"]);
+
+    expect(calls).toEqual([
+      {
+        url: "/api/plugins/install",
+        body: {
+          path: "/tmp/my-skill",
+          compatibility: {
+            codex: { kind: "skill" },
+            claude: { kind: "skill" },
+          },
+        },
+      },
+    ]);
+  });
+
+  it("installs an MCP definition without a fake Skill compatibility matrix", async () => {
+    const calls: Array<{ url: string; body: unknown }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        return Response.json({ plugin: {} }, { status: 201 });
+      },
+    });
+
+    await api.installPlugin("/tmp/mcp.json", "mcp", []);
+
+    expect(calls).toEqual([
+      { url: "/api/plugins/install", body: { path: "/tmp/mcp.json" } },
+    ]);
+  });
+
+  it("refreshes native imports without sending filesystem paths", async () => {
+    const calls: Array<{ url: string; body: string | null }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          body: typeof init?.body === "string" ? init.body : null,
+        });
+        return Response.json({ candidates: [] });
+      },
+    });
+
+    await api.refreshPluginImports();
+
+    expect(calls).toEqual([{ url: "/api/plugins/scan", body: "{}" }]);
+  });
+
   it("loads conversation details in parallel and shares catalog requests", async () => {
     const requested: string[] = [];
     const detailResolvers = new Map<string, (response: Response) => void>();
@@ -122,7 +318,19 @@ describe("HTTP AinOneApi", () => {
           });
         }
         if (url.pathname === "/api/plugins") {
-          return jsonResponse({ plugins: [] });
+          return jsonResponse({ plugins: [], candidates: [] });
+        }
+        if (url.pathname === "/api/agents") {
+          return jsonResponse({
+            agents: [
+              {
+                agentProductId: "codex",
+                executablePath: "codex",
+                executablePathOverride: "/custom/codex",
+                probe: { status: "available", version: "1.0" },
+              },
+            ],
+          });
         }
         if (url.pathname === "/api/projects/project-1/conversations") {
           return jsonResponse({
@@ -143,7 +351,7 @@ describe("HTTP AinOneApi", () => {
         if (url.pathname === "/api/agents/codex/catalog") {
           return jsonResponse({
             catalog: {
-              models: ["gpt-5"],
+              models: [url.searchParams.get("projectId") === "project-2" ? "gpt-5-project-2" : "gpt-5"],
               permissionModes: ["request_approval"],
             },
           });
@@ -165,11 +373,196 @@ describe("HTTP AinOneApi", () => {
       const id = path.endsWith("conv-1") ? "conv-1" : "conv-2";
       resolve(jsonResponse(conversationDetail(id, "project-1")));
     }
-    await loading;
+    const workspace = await loading;
 
     expect(
       requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-1")),
     ).toHaveLength(1);
+    expect(
+      requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-2")),
+    ).toHaveLength(1);
+    expect(workspace.agents[0]?.projectCatalogs?.["project-2"]?.models).toEqual([
+      "gpt-5-project-2",
+    ]);
+    expect(workspace.agents[0]?.executablePathOverride).toBe("/custom/codex");
+  });
+
+  it("keeps catalog request failures explicit for the affected Project", async () => {
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        if (url.pathname === "/api/projects") {
+          return jsonResponse({ projects: [project("project-1", "One")] });
+        }
+        if (url.pathname === "/api/plugins") {
+          return jsonResponse({ plugins: [], candidates: [] });
+        }
+        if (url.pathname === "/api/agents") {
+          return jsonResponse({
+            agents: [{
+              agentProductId: "codex",
+              executablePath: "codex",
+              probe: { status: "available", version: "1.0" },
+            }],
+          });
+        }
+        if (url.pathname === "/api/agents/codex/catalog") {
+          return jsonResponse({ error: { code: "catalog_failed" } }, { status: 503 });
+        }
+        if (url.pathname === "/api/projects/project-1/conversations") {
+          return jsonResponse({ conversations: [] });
+        }
+        if (url.pathname === "/api/projects/project-1/files") {
+          return jsonResponse({ path: ".", entries: [] });
+        }
+        if (url.pathname === "/api/projects/project-1/git/status") {
+          return jsonResponse({ output: "## main\n" });
+        }
+        throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
+      },
+    });
+
+    const workspace = await api.loadWorkspace();
+
+    expect(workspace.agents[0]?.catalog).toMatchObject({
+      models: [],
+      permissionModes: [],
+      error: "Could not load Agent catalog",
+    });
+  });
+
+  it("keeps workspace loading usable while exposing plugin inventory failures", async () => {
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        if (url.pathname === "/api/projects") {
+          return jsonResponse({ projects: [] });
+        }
+        if (url.pathname === "/api/agents") {
+          return jsonResponse({ agents: [] });
+        }
+        if (url.pathname === "/api/plugins") {
+          return jsonResponse({
+            error: {
+              code: "plugins_failed",
+              message: "Plugin inventory is unavailable",
+            },
+          }, { status: 503 });
+        }
+        throw new Error(`Unexpected request: ${url.pathname}`);
+      },
+    });
+
+    await expect(api.loadWorkspace()).resolves.toMatchObject({
+      projects: [],
+      agents: [],
+      installedPlugins: [],
+      pluginCandidates: [],
+      pluginError: "plugins_failed: Plugin inventory is unavailable",
+    });
+  });
+
+  it("keeps deferred OpenCode capability out of the Phase 1 workspace", async () => {
+    const requested: string[] = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        requested.push(`${url.pathname}${url.search}`);
+        if (url.pathname === "/api/projects") {
+          return jsonResponse({ projects: [] });
+        }
+        if (url.pathname === "/api/agents") {
+          return jsonResponse({
+            agents: [
+              {
+                agentProductId: "codex",
+                executablePath: "codex",
+                probe: { status: "available" },
+              },
+              {
+                agentProductId: "opencode",
+                executablePath: "opencode",
+                probe: { status: "available" },
+              },
+            ],
+          });
+        }
+        if (url.pathname === "/api/plugins") {
+          return jsonResponse({
+            plugins: [
+              {
+                pluginId: "shared",
+                versionId: "v1",
+                type: "skill",
+                compatibleAgents: ["codex", "opencode"],
+                materializations: [
+                  { agentProductId: "codex", status: "materialized", repairable: false },
+                  { agentProductId: "opencode", status: "materialized", repairable: false },
+                ],
+              },
+              {
+                pluginId: "opencode-only-installed",
+                versionId: "v1",
+                type: "skill",
+                compatibleAgents: ["opencode"],
+                materializations: [],
+              },
+              {
+                pluginId: "agent-agnostic-mcp",
+                versionId: "v1",
+                type: "mcp",
+                compatibleAgents: [],
+                materializations: [],
+              },
+            ],
+            candidates: [{
+              id: "candidate-opencode",
+              pluginId: "opencode-only",
+              versionId: "v1",
+              type: "skill",
+              compatibleAgents: ["opencode"],
+              materializations: [],
+              agentProductId: "opencode",
+            }],
+          });
+        }
+        throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
+      },
+    });
+
+    const workspace = await api.loadWorkspace();
+
+    expect(workspace.agents.map((agent) => agent.id)).toEqual(["codex"]);
+    expect(workspace.installedPlugins.map((plugin) => plugin.pluginId)).toEqual([
+      "shared",
+      "agent-agnostic-mcp",
+    ]);
+    expect(workspace.installedPlugins[0]?.compatibleAgents).toEqual(["codex"]);
+    expect(workspace.installedPlugins[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "materialized", repairable: false },
+    ]);
+    expect(workspace.pluginCandidates).toEqual([]);
+    expect(requested.some((path) => path.includes("opencode"))).toBe(false);
+  });
+
+  it("preserves normalized server errors for actionable settings feedback", async () => {
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async () => jsonResponse({
+        error: {
+          code: "turn_active",
+          message: "Settings can change only between Turns",
+        },
+      }, { status: 409 }),
+    });
+
+    await expect(api.updateConversationSettings("conv-1", {
+      modelId: "gpt-5",
+      permissionMode: "request_approval",
+    })).rejects.toThrow("turn_active: Settings can change only between Turns");
   });
 
   it("loads directories without requesting file preview or diff", async () => {
@@ -220,6 +613,31 @@ describe("conversation event reducer", () => {
 
     expect(duplicateSequence.events).toEqual([first]);
   });
+
+  it("pauses recovery immediately when a Turn fails", () => {
+    const conversation = {
+      ...conversationView([]),
+      activeTurnStatus: "running" as const,
+      latestTurnId: "turn-running",
+      latestTurnStatus: "running" as const,
+    };
+
+    const failed = applyConversationEvent(conversation, {
+      id: "event-failed",
+      conversationId: conversation.id,
+      sequence: 1,
+      type: "turn_status",
+      payload: { turnId: "turn-failed", status: "failed" },
+      createdAt: "2026-08-20T00:00:00.000Z",
+    });
+
+    expect(failed).toMatchObject({
+      activeTurnStatus: null,
+      latestTurnId: "turn-failed",
+      latestTurnStatus: "failed",
+      queuePaused: true,
+    });
+  });
 });
 
 function memoryStorage(initial: Record<string, string> = {}) {
@@ -234,8 +652,8 @@ function memoryStorage(initial: Record<string, string> = {}) {
   };
 }
 
-function jsonResponse(body: unknown): Response {
-  return Response.json(body);
+function jsonResponse(body: unknown, init?: ResponseInit): Response {
+  return Response.json(body, init);
 }
 
 function project(id: string, name: string) {
@@ -264,6 +682,7 @@ function conversation(id: string, projectId: string) {
 function conversationDetail(id: string, projectId: string) {
   return {
     conversation: conversation(id, projectId),
+    pluginVersions: [],
     queuedMessages: [],
     activeTurn: null,
     latestTurn: null,
@@ -295,6 +714,7 @@ function conversationView(events: NormalizedEvent[]): ConversationView {
     enabledPluginIds: [],
     availablePlugins: [],
     activeTurnStatus: null,
+    latestTurnId: null,
     latestTurnStatus: null,
     queuePaused: false,
     queuedMessages: [],
@@ -303,11 +723,12 @@ function conversationView(events: NormalizedEvent[]): ConversationView {
 }
 
 async function waitFor(predicate: () => boolean): Promise<void> {
-  for (let attempt = 0; attempt < 20; attempt += 1) {
+  const deadline = Date.now() + 1_000;
+  while (Date.now() < deadline) {
     if (predicate()) {
       return;
     }
-    await Promise.resolve();
+    await new Promise((resolve) => setTimeout(resolve, 0));
   }
   throw new Error("Condition was not met");
 }

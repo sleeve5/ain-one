@@ -12,6 +12,7 @@ export function CanvasSwitch(props: CanvasSwitchProps) {
         type="button"
         className="canvas-switch__button"
         data-active={props.value === "conversation"}
+        aria-pressed={props.value === "conversation"}
         onClick={() => props.onChange("conversation")}
       >
         Conversation
@@ -20,6 +21,7 @@ export function CanvasSwitch(props: CanvasSwitchProps) {
         type="button"
         className="canvas-switch__button"
         data-active={props.value === "graph"}
+        aria-pressed={props.value === "graph"}
         onClick={() => props.onChange("graph")}
       >
         Graph

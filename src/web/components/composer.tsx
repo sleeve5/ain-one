@@ -3,14 +3,15 @@ import { useState } from "react";
 interface ComposerProps {
   disabled?: boolean;
   queueMode: boolean;
+  value: string;
+  onChange(value: string): void;
   onSubmit(content: string): Promise<void>;
 }
 
 export function Composer(props: ComposerProps) {
-  const [draft, setDraft] = useState("");
   const [busy, setBusy] = useState(false);
 
-  const submitDisabled = props.disabled || busy || draft.trim().length === 0;
+  const submitDisabled = props.disabled || busy || props.value.trim().length === 0;
 
   return (
     <form
@@ -21,11 +22,10 @@ export function Composer(props: ComposerProps) {
           return;
         }
 
-        const message = draft.trim();
+        const message = props.value.trim();
         setBusy(true);
         void props.onSubmit(message).then(
           () => {
-            setDraft("");
             setBusy(false);
           },
           () => {
@@ -40,8 +40,8 @@ export function Composer(props: ComposerProps) {
       <textarea
         id="message-input"
         className="composer__input"
-        value={draft}
-        onChange={(event) => setDraft(event.currentTarget.value)}
+        value={props.value}
+        onChange={(event) => props.onChange(event.currentTarget.value)}
         rows={4}
       />
       <button type="submit" className="composer__send" disabled={submitDisabled}>

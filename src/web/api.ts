@@ -1,10 +1,14 @@
 import type {
   ActiveTurnStatus,
   AgentCatalog,
+  AgentProbe,
   AgentProductId,
   Conversation,
+  ConversationSettingsInput,
+  CreateConversationInput,
   NormalizedEvent,
   PermissionMode,
+  PluginVersion,
   Project,
   Turn,
 } from "../shared/contracts.js";
@@ -25,7 +29,35 @@ export interface PendingMessage {
 
 export interface PluginOption {
   id: string;
+  pluginId: string;
+  versionId: string;
   name: string;
+  type: "skill" | "mcp";
+  compatibleAgents: AgentProductId[];
+  materializations: PluginMaterializationView[];
+}
+
+export interface PluginMaterializationView {
+  agentProductId: AgentProductId;
+  status: "materialized" | "not_materialized" | "conflicted" | "turn_scoped";
+  repairable: boolean;
+}
+
+export interface AgentSettingsView {
+  id: AgentProductId;
+  name: string;
+  status: AgentProbe["status"];
+  version?: string;
+  executablePath: string;
+  executablePathOverride?: string;
+  diagnostic?: string;
+  catalog: AgentCatalog;
+  projectCatalogs?: Record<string, AgentCatalog>;
+}
+
+export interface PluginCandidateView extends PluginOption {
+  candidateId: string;
+  sourceAgent: AgentProductId;
 }
 
 export interface ConversationView {
@@ -41,6 +73,7 @@ export interface ConversationView {
   enabledPluginIds: string[];
   availablePlugins: PluginOption[];
   activeTurnStatus: ActiveTurnStatus | null;
+  latestTurnId: string | null;
   latestTurnStatus: Turn["status"] | null;
   queuePaused: boolean;
   queuedMessages: PendingMessage[];
@@ -83,33 +116,50 @@ export interface WorkspaceState {
   selectedConversationId: string | null;
   conversation: ConversationView | null;
   inspector: InspectorState;
-}
-
-export interface ConversationDraftSettings {
-  modelId: string | null;
-  permissionMode: PermissionMode;
-  enabledPluginIds: string[];
+  agents: AgentSettingsView[];
+  installedPlugins: PluginOption[];
+  pluginCandidates: PluginCandidateView[];
+  pluginError: string | null;
 }
 
 export interface AinOneApi {
   loadWorkspace(): Promise<WorkspaceState>;
+  openProject(path: string): Promise<Project>;
+  createConversation(input: CreateConversationInput): Promise<Conversation>;
   queueMessage(conversationId: string, content: string): Promise<void>;
   deletePendingMessage(conversationId: string, messageId: string): Promise<void>;
   cancelActiveTurn(conversationId: string): Promise<void>;
+  continueConversation(conversationId: string): Promise<void>;
+  retryInterruptedTurn(conversationId: string, turnId: string): Promise<void>;
   subscribeConversationEvents(
     conversationId: string,
     afterSequence: number,
     onEvent: (event: NormalizedEvent) => void,
   ): () => void;
-  updateConversationDraftSettings(
+  updateConversationSettings(
     conversationId: string,
-    settings: ConversationDraftSettings,
+    settings: ConversationSettingsInput,
   ): Promise<void>;
+  updateAgentExecutablePath(agentProductId: AgentProductId, executablePath: string | null): Promise<void>;
+  installPlugin(path: string, type: "skill" | "mcp", compatibleAgents: AgentProductId[]): Promise<void>;
+  refreshPluginImports(): Promise<void>;
+  acceptPluginCandidate(candidateId: string): Promise<void>;
+  repairPluginMaterialization(
+    agentProductId: AgentProductId,
+    plugin: PluginVersion,
+  ): Promise<void>;
+  getPluginEnablements(scope: PluginScope): Promise<PluginVersion[]>;
+  setPluginEnablements(scope: PluginScope, pluginVersions: PluginVersion[]): Promise<void>;
   listProjectFiles(
     projectId: string,
     selection?: InspectorSelection | null,
   ): Promise<InspectorState>;
 }
+
+export type PluginScope =
+  | { type: "global" }
+  | { type: "project"; id: string }
+  | { type: "conversation"; id: string };
 
 interface StorageLike {
   getItem(key: string): string | null;
@@ -127,6 +177,7 @@ interface HttpAinOneApiOptions {
 
 interface ConversationDetailResponse {
   conversation: Conversation;
+  pluginVersions: PluginVersion[];
   queuedMessages: PendingMessage[];
   activeTurn: Turn | null;
   latestTurn: Turn | null;
@@ -153,15 +204,15 @@ interface GitCommandResponse {
 
 interface PluginListResponse {
   plugins?: unknown;
+  candidates?: unknown;
 }
 
-const FALLBACK_PERMISSION_MODES: PermissionMode[] = [
-  "request_approval",
-  "help_me_approve",
-  "full_access",
-];
-
 const ACTIVE_TURN_STATUS = new Set<ActiveTurnStatus>(["starting", "running", "cancelling"]);
+const PHASE_ONE_AGENT_PRODUCTS = new Set<AgentProductId>(["codex", "claude", "trae"]);
+
+export function isPhaseOneAgentProductId(value: unknown): value is AgentProductId {
+  return typeof value === "string" && PHASE_ONE_AGENT_PRODUCTS.has(value as AgentProductId);
+}
 
 export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
   const fetchFn = options.fetchFn ?? fetch;
@@ -178,12 +229,12 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       },
     });
     if (!response.ok) {
-      throw new Error(`Request failed (${response.status}) ${path}`);
+      throw await responseError(response, path);
     }
     return (await response.json()) as T;
   };
 
-  const postJson = async (path: string, body: unknown): Promise<void> => {
+  const postJson = async <T = void>(path: string, body: unknown): Promise<T> => {
     const response = await fetchFn(`${baseUrl}${path}`, {
       method: "POST",
       headers: {
@@ -193,20 +244,89 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       body: JSON.stringify(body),
     });
     if (!response.ok) {
-      throw new Error(`Request failed (${response.status}) ${path}`);
+      throw await responseError(response, path);
     }
+    return (await response.json()) as T;
+  };
+
+  const putJson = async <T = void>(path: string, body: unknown): Promise<T> => {
+    const response = await fetchFn(`${baseUrl}${path}`, {
+      method: "PUT",
+      headers: {
+        authorization: `Bearer ${options.token}`,
+        "content-type": "application/json",
+      },
+      body: JSON.stringify(body),
+    });
+    if (!response.ok) {
+      throw await responseError(response, path);
+    }
+    return (await response.json()) as T;
   };
 
   return {
     async loadWorkspace(): Promise<WorkspaceState> {
-      const projectPayload = await getJson<{ projects: Project[] }>("/api/projects");
+      const [projectPayload, agentPayload, pluginPayload] = await Promise.all([
+        getJson<{ projects: Project[] }>("/api/projects"),
+        getJson<{
+          agents: Array<{
+            agentProductId: AgentProductId;
+            executablePath: string;
+            executablePathOverride: string | null;
+            probe: AgentProbe;
+          }>;
+        }>("/api/agents"),
+        tryLoadPlugins(getJson),
+      ]);
       const projects: ProjectView[] = projectPayload.projects.map((project) => ({
         id: project.id,
         name: project.name,
         path: project.path,
       }));
 
-      if (projects.length === 0) {
+      const primaryProject = projects[0] ?? null;
+      const catalogPromises = new Map<string, Promise<AgentCatalog>>();
+      const loadCatalog = (
+        agentProductId: AgentProductId,
+        projectId: string,
+      ): Promise<AgentCatalog> => {
+        const key = `${projectId}:${agentProductId}`;
+        let promise = catalogPromises.get(key);
+        if (!promise) {
+          promise = tryGetCatalog(getJson, agentProductId, projectId);
+          catalogPromises.set(key, promise);
+        }
+        return promise;
+      };
+      const agents = await Promise.all(
+        agentPayload.agents
+          .filter((agent) => isPhaseOneAgentProductId(agent.agentProductId))
+          .map(async (agent): Promise<AgentSettingsView> => {
+          const projectCatalogs = Object.fromEntries(
+            await Promise.all(
+              projects.map(async (project) => [
+                project.id,
+                await loadCatalog(agent.agentProductId, project.id),
+              ] as const),
+            ),
+          );
+          return {
+            id: agent.agentProductId,
+            name: toAgentLabel(agent.agentProductId),
+            status: agent.probe.status,
+            version: agent.probe.version,
+            executablePath: agent.executablePath,
+            executablePathOverride: agent.executablePathOverride ?? undefined,
+            diagnostic: agent.probe.diagnostic,
+            catalog: primaryProject
+              ? projectCatalogs[primaryProject.id]
+              : emptyCatalog(),
+            projectCatalogs,
+          };
+        }),
+      );
+
+      if (!primaryProject) {
         return {
           projects,
           selectedProjectId: null,
@@ -214,10 +334,13 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
           selectedConversationId: null,
           conversation: null,
           inspector: emptyInspectorState(),
+          agents,
+          installedPlugins: pluginPayload.plugins,
+          pluginCandidates: pluginPayload.candidates,
+          pluginError: pluginPayload.error,
         };
       }
 
-      const availablePluginsPromise = tryListPlugins(getJson);
       const projectConversations = await Promise.all(
         projects.map(async (project) => ({
           project,
@@ -228,33 +351,24 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
           ).conversations,
         })),
       );
-      const availablePlugins = await availablePluginsPromise;
-      const catalogPromises = new Map<string, Promise<AgentCatalog | null>>();
       const conversations = await Promise.all(
         projectConversations.flatMap(({ project, conversations: projectItems }) =>
-          projectItems.map(async (conversation) => {
-            const catalogKey = `${project.id}:${conversation.agentProductId}`;
-            let catalogPromise = catalogPromises.get(catalogKey);
-            if (!catalogPromise) {
-              catalogPromise = tryGetCatalog(
-                getJson,
-                conversation.agentProductId,
-                project.id,
-              );
-              catalogPromises.set(catalogKey, catalogPromise);
-            }
+          projectItems
+            .filter((conversation) => isPhaseOneAgentProductId(conversation.agentProductId))
+            .map(async (conversation) => {
             const [detail, catalog] = await Promise.all([
               getJson<ConversationDetailResponse>(
                 `/api/conversations/${encodeURIComponent(conversation.id)}`,
               ),
-              catalogPromise,
+              loadCatalog(conversation.agentProductId, project.id),
             ]);
             return toConversationView(
               detail.conversation,
               detail,
               catalog,
-              availablePlugins,
-              readConversationDraftSettings(storage, conversation.id),
+              pluginPayload.plugins.filter((plugin) =>
+                plugin.compatibleAgents.includes(conversation.agentProductId),
+              ),
             );
           }),
         ),
@@ -277,7 +391,21 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         selectedConversationId: selectedConversation?.id ?? null,
         conversation: selectedConversation,
         inspector,
+        agents,
+        installedPlugins: pluginPayload.plugins,
+        pluginCandidates: pluginPayload.candidates,
+        pluginError: pluginPayload.error,
       };
+    },
+
+    async openProject(path): Promise<Project> {
+      const payload = await postJson<{ project: Project }>("/api/projects", { path, name: null });
+      return payload.project;
+    },
+
+    async createConversation(input): Promise<Conversation> {
+      const payload = await postJson<{ conversation: Conversation }>("/api/conversations", input);
+      return payload.conversation;
     },
 
     async queueMessage(conversationId, content): Promise<void> {
@@ -297,12 +425,23 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         },
       );
       if (!response.ok && response.status !== 404) {
-        throw new Error(`Request failed (${response.status}) delete pending message`);
+        throw await responseError(response, "delete pending message");
       }
     },
 
     async cancelActiveTurn(conversationId): Promise<void> {
       await postJson(`/api/conversations/${encodeURIComponent(conversationId)}/cancel`, {});
+    },
+
+    async continueConversation(conversationId): Promise<void> {
+      await postJson(`/api/conversations/${encodeURIComponent(conversationId)}/continue`, {});
+    },
+
+    async retryInterruptedTurn(conversationId, turnId): Promise<void> {
+      await postJson(
+        `/api/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/retry`,
+        {},
+      );
     },
 
     subscribeConversationEvents(conversationId, afterSequence, onEvent): () => void {
@@ -329,12 +468,16 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
               throw new Error(`SSE request failed (${response.status})`);
             }
 
-            attempt = 0;
+            let receivedEvent = false;
             await consumeSse(response.body, controller.signal, (event) => {
+              receivedEvent = true;
               onEvent(event);
               lastSequence = Math.max(lastSequence, event.sequence);
               storeEventSequence(storage, conversationId, event.sequence);
             });
+            if (receivedEvent) {
+              attempt = 0;
+            }
           } catch {
             if (stopped || controller.signal.aborted) {
               break;
@@ -360,8 +503,49 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       };
     },
 
-    async updateConversationDraftSettings(conversationId, settings): Promise<void> {
-      writeConversationDraftSettings(storage, conversationId, settings);
+    async updateConversationSettings(conversationId, settings): Promise<void> {
+      await putJson(`/api/conversations/${encodeURIComponent(conversationId)}/settings`, settings);
+    },
+
+    async updateAgentExecutablePath(agentProductId, executablePath): Promise<void> {
+      await putJson(`/api/agents/${encodeURIComponent(agentProductId)}/settings`, {
+        executablePath,
+      });
+    },
+
+    async installPlugin(path, type, compatibleAgents): Promise<void> {
+      await postJson("/api/plugins/install", type === "skill"
+        ? {
+            path,
+            compatibility: Object.fromEntries(
+              compatibleAgents.map((agentProductId) => [agentProductId, { kind: "skill" }]),
+            ),
+          }
+        : { path });
+    },
+
+    async refreshPluginImports(): Promise<void> {
+      await postJson("/api/plugins/scan", {});
+    },
+
+    async acceptPluginCandidate(candidateId): Promise<void> {
+      await postJson(`/api/plugins/candidates/${encodeURIComponent(candidateId)}/accept`, {});
+    },
+
+    async repairPluginMaterialization(agentProductId, plugin): Promise<void> {
+      await postJson(
+        `/api/plugins/${encodeURIComponent(plugin.pluginId)}/versions/${encodeURIComponent(plugin.versionId)}/materializations/${encodeURIComponent(agentProductId)}/repair`,
+        {},
+      );
+    },
+
+    async getPluginEnablements(scope): Promise<PluginVersion[]> {
+      const payload = await getJson<{ pluginVersions: PluginVersion[] }>(pluginScopePath(scope));
+      return payload.pluginVersions;
+    },
+
+    async setPluginEnablements(scope, pluginVersions): Promise<void> {
+      await putJson(pluginScopePath(scope), { pluginVersions });
     },
 
     async listProjectFiles(projectId, selection = null): Promise<InspectorState> {
@@ -446,28 +630,16 @@ function toConversationView(
   detail: ConversationDetailResponse,
   catalog: AgentCatalog | null,
   plugins: PluginOption[],
-  storedSettings: ConversationDraftSettings | null,
 ): ConversationView {
   const availableModels = catalog?.models ?? (conversation.modelId ? [conversation.modelId] : []);
   const availablePermissionModes =
     catalog?.permissionModes && catalog.permissionModes.length > 0
       ? catalog.permissionModes
-      : FALLBACK_PERMISSION_MODES;
+      : [conversation.permissionMode];
 
-  const modelId =
-    storedSettings?.modelId && availableModels.includes(storedSettings.modelId)
-      ? storedSettings.modelId
-      : conversation.modelId;
-
-  const permissionMode =
-    storedSettings?.permissionMode && availablePermissionModes.includes(storedSettings.permissionMode)
-      ? storedSettings.permissionMode
-      : conversation.permissionMode;
-
-  const enabledPluginIds =
-    storedSettings?.enabledPluginIds?.filter((pluginId) =>
-      plugins.some((plugin) => plugin.id === pluginId),
-    ) ?? [];
+  const enabledPluginIds = detail.pluginVersions
+    .map((version) => pluginKey(version))
+    .filter((id) => plugins.some((plugin) => plugin.id === id));
 
   return {
     id: conversation.id,
@@ -475,13 +647,14 @@ function toConversationView(
     title: `Conversation ${conversation.id.slice(0, 8)}`,
     agentProductId: conversation.agentProductId,
     agentProductLabel: toAgentLabel(conversation.agentProductId),
-    modelId,
-    permissionMode,
+    modelId: conversation.modelId,
+    permissionMode: conversation.permissionMode,
     availableModels,
     availablePermissionModes,
     enabledPluginIds,
     availablePlugins: plugins,
     activeTurnStatus: detail.activeTurn ? normalizeActiveStatus(detail.activeTurn.status) : null,
+    latestTurnId: detail.latestTurn?.id ?? null,
     latestTurnStatus: detail.latestTurn?.status ?? null,
     queuePaused: conversation.queuePaused,
     queuedMessages: detail.queuedMessages,
@@ -573,52 +746,154 @@ async function tryGetCatalog(
   getJson: <T>(path: string) => Promise<T>,
   agentProductId: AgentProductId,
   projectId: string,
-): Promise<AgentCatalog | null> {
+): Promise<AgentCatalog> {
   try {
     const payload = await getJson<{ catalog: AgentCatalog }>(
       `/api/agents/${encodeURIComponent(agentProductId)}/catalog?projectId=${encodeURIComponent(projectId)}`,
     );
     return payload.catalog;
   } catch {
-    return null;
+    return { ...emptyCatalog(), error: "Could not load Agent catalog" };
   }
 }
 
-async function tryListPlugins(
+async function tryLoadPlugins(
   getJson: <T>(path: string) => Promise<T>,
-): Promise<PluginOption[]> {
+): Promise<{ plugins: PluginOption[]; candidates: PluginCandidateView[]; error: string | null }> {
   try {
     const payload = await getJson<PluginListResponse>("/api/plugins");
-    if (!Array.isArray(payload.plugins)) {
-      return [];
-    }
-
-    return payload.plugins
-      .map((plugin) => {
-        if (!plugin || typeof plugin !== "object") {
-          return null;
-        }
-        const record = plugin as Record<string, unknown>;
-        const id =
-          (typeof record.pluginId === "string" && record.pluginId) ||
-          (typeof record.id === "string" && record.id) ||
-          null;
-        if (!id) {
-          return null;
-        }
-        const name =
-          (typeof record.name === "string" && record.name) ||
-          (typeof record.displayName === "string" && record.displayName) ||
-          id;
-        return {
-          id,
-          name,
-        };
-      })
-      .filter((plugin): plugin is PluginOption => Boolean(plugin));
-  } catch {
-    return [];
+    return {
+      plugins: Array.isArray(payload.plugins)
+        ? payload.plugins.map(parseInstalledPlugin).filter(isPresent)
+        : [],
+      candidates: Array.isArray(payload.candidates)
+        ? payload.candidates.map(parsePluginCandidate).filter(isPresent)
+        : [],
+      error: null,
+    };
+  } catch (error) {
+    return {
+      plugins: [],
+      candidates: [],
+      error: error instanceof Error ? error.message : "Could not load plugin inventory",
+    };
   }
+}
+
+async function responseError(response: Response, fallback: string): Promise<Error> {
+  try {
+    const payload = await response.json() as { error?: { code?: unknown; message?: unknown } };
+    const code = payload.error?.code;
+    const message = payload.error?.message;
+    if (typeof code === "string" && typeof message === "string") {
+      return new Error(`${code}: ${message}`);
+    }
+  } catch {
+    // Fall back to the HTTP status when the response is not normalized JSON.
+  }
+  return new Error(`Request failed (${response.status}) ${fallback}`);
+}
+
+function parseInstalledPlugin(value: unknown): PluginOption | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    typeof record.pluginId !== "string" ||
+    typeof record.versionId !== "string" ||
+    (record.type !== "skill" && record.type !== "mcp") ||
+    !Array.isArray(record.compatibleAgents)
+  ) {
+    return null;
+  }
+  const declaredAgents = record.compatibleAgents.filter(isAgentProductId);
+  const compatibleAgents = declaredAgents.filter(isPhaseOneAgentProductId);
+  if (declaredAgents.length > 0 && compatibleAgents.length === 0) {
+    return null;
+  }
+  const materializations = Array.isArray(record.materializations)
+    ? record.materializations.map(parseMaterialization).filter(isPresent)
+    : [];
+  return {
+    id: pluginKey({ pluginId: record.pluginId, versionId: record.versionId }),
+    pluginId: record.pluginId,
+    versionId: record.versionId,
+    name: `${record.pluginId} ${record.versionId.slice(0, 8)}`,
+    type: record.type,
+    compatibleAgents,
+    materializations,
+  };
+}
+
+function parseMaterialization(value: unknown): PluginMaterializationView | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  if (
+    !isPhaseOneAgentProductId(record.agentProductId) ||
+    !isMaterializationStatus(record.status) ||
+    typeof record.repairable !== "boolean"
+  ) {
+    return null;
+  }
+  return {
+    agentProductId: record.agentProductId,
+    status: record.status,
+    repairable: record.repairable,
+  };
+}
+
+function isMaterializationStatus(
+  value: unknown,
+): value is PluginMaterializationView["status"] {
+  return value === "materialized" ||
+    value === "not_materialized" ||
+    value === "conflicted" ||
+    value === "turn_scoped";
+}
+
+function parsePluginCandidate(value: unknown): PluginCandidateView | null {
+  if (!value || typeof value !== "object") {
+    return null;
+  }
+  const record = value as Record<string, unknown>;
+  const installed = parseInstalledPlugin(value);
+  if (
+    !installed ||
+    typeof record.id !== "string" ||
+    !isPhaseOneAgentProductId(record.agentProductId)
+  ) {
+    return null;
+  }
+  return {
+    ...installed,
+    candidateId: record.id,
+    sourceAgent: record.agentProductId,
+  };
+}
+
+function pluginScopePath(scope: PluginScope): string {
+  return scope.type === "global"
+    ? "/api/plugins/enablements/global"
+    : `/api/plugins/enablements/${scope.type}/${encodeURIComponent(scope.id)}`;
+}
+
+function pluginKey(version: PluginVersion): string {
+  return `${version.pluginId}@${version.versionId}`;
+}
+
+function emptyCatalog(): AgentCatalog {
+  return { models: [], permissionModes: [] };
+}
+
+function isAgentProductId(value: unknown): value is AgentProductId {
+  return value === "codex" || value === "claude" || value === "trae" || value === "opencode";
+}
+
+function isPresent<T>(value: T | null): value is T {
+  return value !== null;
 }
 
 function toAgentLabel(agentProductId: AgentProductId): string {
@@ -741,58 +1016,6 @@ function storeEventSequence(storage: StorageLike, conversationId: string, sequen
 function parentPath(path: string): string {
   const separator = path.lastIndexOf("/");
   return separator === -1 ? "." : path.slice(0, separator) || ".";
-}
-
-function readConversationDraftSettings(
-  storage: StorageLike,
-  conversationId: string,
-): ConversationDraftSettings | null {
-  try {
-    const raw = storage.getItem(draftSettingsStorageKey(conversationId));
-    if (!raw) {
-      return null;
-    }
-    const parsed = JSON.parse(raw) as Partial<ConversationDraftSettings>;
-    if (!parsed || typeof parsed !== "object") {
-      return null;
-    }
-    if (
-      !Array.isArray(parsed.enabledPluginIds) ||
-      !parsed.enabledPluginIds.every((value) => typeof value === "string")
-    ) {
-      return null;
-    }
-    if (typeof parsed.permissionMode !== "string") {
-      return null;
-    }
-    if (parsed.modelId !== null && typeof parsed.modelId !== "string") {
-      return null;
-    }
-
-    return {
-      modelId: parsed.modelId,
-      permissionMode: parsed.permissionMode as PermissionMode,
-      enabledPluginIds: parsed.enabledPluginIds,
-    };
-  } catch {
-    return null;
-  }
-}
-
-function writeConversationDraftSettings(
-  storage: StorageLike,
-  conversationId: string,
-  settings: ConversationDraftSettings,
-): void {
-  try {
-    storage.setItem(draftSettingsStorageKey(conversationId), JSON.stringify(settings));
-  } catch {
-    // Ignore storage errors so UI controls still work within this session.
-  }
-}
-
-function draftSettingsStorageKey(conversationId: string): string {
-  return `ain-one:draft-settings:${conversationId}`;
 }
 
 function eventSequenceStorageKey(conversationId: string): string {

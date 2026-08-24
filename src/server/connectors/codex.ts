@@ -1,6 +1,6 @@
 import type { AgentCatalog, AgentProbe, LiveSession, SessionInput, StartTurnInput } from "../../shared/contracts.js";
 import { BaseConnectorOptions, isMissingExecutableError, parseVersion } from "./base.js";
-import { CliJsonlConnector } from "./cli-jsonl.js";
+import { CliJsonlConnector, readMcpArtifact, renderTomlMcpOverride } from "./cli-jsonl.js";
 
 export class CodexConnector extends CliJsonlConnector {
   readonly id = "codex" as const;
@@ -18,13 +18,23 @@ export class CodexConnector extends CliJsonlConnector {
 
   async probe(): Promise<AgentProbe> {
     try {
-      const result = await this.runCommand({ args: ["--version"] });
-      if (result.exitCode !== 0) {
-        return { status: "runtime_error", diagnostic: result.stderr.trim() || result.stdout.trim() };
+      const [version, auth] = await Promise.all([
+        this.runCommand({ args: ["--version"] }),
+        this.runCommand({ args: ["login", "status"] }),
+      ]);
+      if (version.exitCode !== 0) {
+        return { status: "runtime_error", diagnostic: version.stderr.trim() || version.stdout.trim() };
+      }
+      if (auth.exitCode !== 0) {
+        return {
+          status: "authentication_required",
+          version: parseVersion(version.stdout),
+          diagnostic: auth.stderr.trim() || auth.stdout.trim(),
+        };
       }
       return {
         status: "capability_limited",
-        version: parseVersion(result.stdout),
+        version: parseVersion(version.stdout),
         diagnostic: "Interactive permission replies are not supported in non-interactive Codex exec mode",
       };
     } catch (error) {
@@ -54,6 +64,7 @@ export class CodexConnector extends CliJsonlConnector {
     const args = runtime.nativeSessionId
       ? ["exec", "resume", runtime.nativeSessionId, "--json"]
       : ["exec", "--json"];
+    args.push("--skip-git-repo-check");
 
     if (input.snapshot.modelId) {
       args.push("--model", input.snapshot.modelId);
@@ -67,6 +78,9 @@ export class CodexConnector extends CliJsonlConnector {
     }
     if (input.snapshot.permissionMode === "full_access") {
       args.push("--dangerously-bypass-approvals-and-sandbox");
+    }
+    for (const server of readMcpArtifact(input.mcpConfigPath, "codex")) {
+      args.push("-c", renderTomlMcpOverride(server));
     }
     return args;
   }

@@ -49,6 +49,39 @@ function createSkillFixtureWithContent(
 }
 
 describe("plugin hub", () => {
+  it("reports truthful per-Agent materialization status without repairing conflicts", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const localRoot = join(root, "local");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(localRoot, { recursive: true });
+    mkdirSync(codexSkillRoot, { recursive: true });
+
+    const skillDir = createSkillFixture(localRoot, "status-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+    const installed = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+
+    expect(hub.listInstalled()[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "not_materialized", repairable: true },
+    ]);
+
+    await hub.repairMaterialization("codex", {
+      pluginId: installed.pluginId,
+      versionId: installed.versionId,
+    });
+    expect(hub.listInstalled()[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "materialized", repairable: false },
+    ]);
+
+    writeFileSync(join(codexSkillRoot, installed.pluginId, "SKILL.md"), "# changed\n", "utf8");
+    expect(hub.listInstalled()[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "conflicted", repairable: false },
+    ]);
+  });
+
   it("supports same contentHash across different pluginIds without overwrite", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
@@ -72,6 +105,7 @@ describe("plugin hub", () => {
     expect(a.pluginId).not.toBe(b.pluginId);
 
     const resolved = hub.resolveForTurn({
+      agentProductId: "codex",
       global: [
         { pluginId: a.pluginId, versionId: a.versionId },
         { pluginId: b.pluginId, versionId: b.versionId },
@@ -86,6 +120,54 @@ describe("plugin hub", () => {
     expect(readlinkSync(join(codexSkillRoot, b.pluginId))).toBe(
       join(dataDir, "materialized", "codex", b.pluginId, b.versionId),
     );
+  });
+
+  it("removes obsolete managed Skill links and preserves tampered targets", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const localRoot = join(root, "local");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(localRoot, { recursive: true });
+    mkdirSync(codexSkillRoot, { recursive: true });
+
+    const skillDir = createSkillFixture(localRoot, "disable-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+    const installed = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    const target = join(codexSkillRoot, installed.pluginId);
+
+    await hub.materialize("codex", [installed]);
+    expect(existsSync(target)).toBe(true);
+    await hub.materialize("codex", []);
+    expect(existsSync(target)).toBe(false);
+
+    await hub.materialize("codex", [installed]);
+    writeFileSync(join(target, "SKILL.md"), "# user changed this\n", "utf8");
+    await expect(hub.materialize("codex", [])).rejects.toThrow("local changes");
+    expect(existsSync(target)).toBe(true);
+  });
+
+  it("switches the complete desired Skill set for one Agent", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const localRoot = join(root, "local");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(localRoot, { recursive: true });
+    mkdirSync(codexSkillRoot, { recursive: true });
+
+    const skillA = createSkillFixture(localRoot, "skill-a");
+    const skillB = createSkillFixture(localRoot, "skill-b");
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+    const a = await hub.installLocal({ path: skillA, compatibility: { codex: { kind: "skill" } } });
+    const b = await hub.installLocal({ path: skillB, compatibility: { codex: { kind: "skill" } } });
+
+    await hub.materialize("codex", [a]);
+    await hub.materialize("codex", [b]);
+
+    expect(existsSync(join(codexSkillRoot, a.pluginId))).toBe(false);
+    expect(existsSync(join(codexSkillRoot, b.pluginId))).toBe(true);
   });
 
   it("stores immutable canonical copy with content hash", async () => {
@@ -174,7 +256,12 @@ describe("plugin hub", () => {
         },
       },
     ]);
-    expect(first).toHaveLength(1);
+    expect(first).toEqual([
+      expect.objectContaining({
+        type: "skill",
+        compatibleAgents: ["claude", "codex"],
+      }),
+    ]);
 
     await hub.acceptCandidate(first[0]!.id);
     await hub.materialize("codex", [
@@ -188,6 +275,22 @@ describe("plugin hub", () => {
     expect(readlinkSync(codexTarget).length).toBeGreaterThan(0);
 
     expect(await hub.scanNative([{ agentProductId: "codex", path: codexTarget }])).toEqual([]);
+  });
+
+  it("scans configured Skill-root direct children only", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(codexSkillRoot, { recursive: true });
+    createSkillFixture(codexSkillRoot, "native-skill");
+    mkdirSync(join(codexSkillRoot, "not-a-skill"));
+    writeFileSync(join(codexSkillRoot, "README.md"), "ignore me\n", "utf8");
+
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+
+    await expect(hub.scanConfiguredRoots()).resolves.toEqual([
+      expect.objectContaining({ pluginId: "native-skill", agentProductId: "codex" }),
+    ]);
   });
 
   it("does not infer cross-agent compatibility from configured skill roots", async () => {
@@ -411,7 +514,7 @@ describe("plugin hub", () => {
     expect(readFileSync(join(nativeTarget, "SKILL.md"), "utf8")).toBe(previousBytes);
   });
 
-  it("serializes metadata mutations across hubs sharing one dataDir", async () => {
+  it("serializes complete desired-state mutations across hubs sharing one dataDir", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
     const localRoot = join(root, "local");
@@ -440,19 +543,14 @@ describe("plugin hub", () => {
     ]);
 
     const reader = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
-    expect(
-      reader.resolveForTurn({
-        global: [
-          { pluginId: installedA.pluginId, versionId: installedA.versionId },
-          { pluginId: installedB.pluginId, versionId: installedB.versionId },
-        ],
-      }),
-    ).toHaveLength(2);
+    expect(reader.listInstalled()).toHaveLength(2);
 
     const metadata = JSON.parse(readFileSync(join(dataDir, "plugins.metadata.json"), "utf8")) as {
       managedTargets: { codex: Record<string, unknown> };
     };
-    expect(Object.keys(metadata.managedTargets.codex)).toHaveLength(2);
+    expect(Object.keys(metadata.managedTargets.codex)).toEqual([
+      join(codexSkillRoot, installedB.pluginId),
+    ]);
   });
 
   it("waits for another process holding the metadata lock", async () => {
@@ -659,6 +757,7 @@ describe("plugin hub", () => {
     });
 
     const resolved = hub.resolveForTurn({
+      agentProductId: "codex",
       global: [
         {
           pluginId: v1.pluginId,
@@ -685,6 +784,36 @@ describe("plugin hub", () => {
         versionId: v3.versionId,
       },
     ]);
+  });
+
+  it("filters final scoped versions by the target Agent without broader fallback", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const localRoot = join(root, "local");
+    mkdirSync(localRoot, { recursive: true });
+    const skillDir = createSkillFixture(localRoot, "agent-scoped-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+
+    const codex = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+    writeFileSync(join(skillDir, "README.md"), "claude version\n", "utf8");
+    const claude = await hub.installLocal({
+      path: skillDir,
+      compatibility: { claude: { kind: "skill" } },
+    });
+
+    expect(hub.resolveForTurn({
+      agentProductId: "codex",
+      global: [codex],
+      conversation: [claude],
+    })).toEqual([]);
+    expect(hub.resolveForTurn({
+      agentProductId: "claude",
+      global: [codex],
+      conversation: [claude],
+    })).toEqual([{ pluginId: claude.pluginId, versionId: claude.versionId }]);
   });
 
   it("installs explicit MCP JSON and emits per-turn artifact without touching global config", async () => {
@@ -747,6 +876,35 @@ describe("plugin hub", () => {
     expect(artifact.servers[0]?.pluginId).toBe("demo-mcp");
 
     expect(readFileSync(globalConfig, "utf8")).toBe('{"unchanged":true}\n');
+  });
+
+  it("requires the claimed Turn ID before materializing MCP configuration", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const dataDir = join(root, "data");
+    const mcpPath = join(root, "demo-mcp.json");
+    writeFileSync(
+      mcpPath,
+      JSON.stringify({
+        format: "ain-one.mcp.v1",
+        pluginId: "demo-mcp",
+        compatibility: {
+          codex: {
+            kind: "mcp",
+            target: "codex.mcp.v1",
+            server: { command: "node", args: ["server.js"] },
+          },
+        },
+      }),
+      "utf8",
+    );
+    const hub = createPluginHub({ dataDir, skillRoots: {} });
+    const installed = await hub.installLocal({ path: mcpPath });
+
+    await expect(
+      hub.materialize("codex", [
+        { pluginId: installed.pluginId, versionId: installed.versionId },
+      ]),
+    ).rejects.toThrow("Turn ID is required");
   });
 
   it("rejects raw secret-like string values in MCP server config", async () => {

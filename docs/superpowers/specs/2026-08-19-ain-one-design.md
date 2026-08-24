@@ -26,7 +26,7 @@ Ain One does not implement another Agent Harness. The Agent Product remains resp
 4. Keep the Agent Product fixed for the lifetime of a Conversation.
 5. Allow model, permission mode, and plugin selection changes only between Turns.
 6. Queue messages sent during an active Turn and dispatch them in FIFO order.
-7. Connect to Codex, Claude Code, Trae, and OpenCode through their supported runtime interfaces.
+7. Expose Codex, Claude Code, and Trae through their supported runtime interfaces. Keep OpenCode backend work dormant for later activation without exposing it in the Phase 1 Web UI.
 8. Provide a shared plugin hub for compatible Skills and MCP servers.
 9. Preserve Conversations, queues, events, settings, and native session references across restarts.
 10. Deliver a usable Conversation Canvas while keeping a mounted Graph Canvas placeholder.
@@ -82,7 +82,7 @@ TypeScript / Node Control Plane
   |     |-- Codex CLI / App Server
   |     |-- Claude Code CLI / Agent SDK or ACP
   |     |-- Trae CLI / ACP
-  |     `-- OpenCode CLI / Server SDK
+  |     `-- OpenCode CLI / Server SDK (backend retained, UI deferred)
   |-- Shared Plugin Hub
   |-- SQLite event and metadata store
   |-- Plugin content store on filesystem
@@ -589,7 +589,7 @@ Tests explicitly do not validate model quality, native Agent reasoning, native t
 Phase 1 is complete when:
 
 1. A user can open a local Project and manage multiple Conversations.
-2. Codex, Claude Code, Trae, and OpenCode Connectors report truthful availability and can run a minimal Conversation when their required local software is supported and configured.
+2. Codex, Claude Code, and Trae report truthful availability in the Web UI and can run a minimal Conversation when their required local software is supported and configured. OpenCode remains hidden until a later phase.
 3. A Conversation permanently retains its Agent Product while allowing model changes between Turns.
 4. Messages sent during a Turn queue and dispatch in FIFO order after safe completion or confirmed cancellation.
 5. Restart recovery preserves history and pending messages without automatically retrying work.

@@ -198,24 +198,20 @@ export abstract class BaseConnector implements AgentConnector {
     if (!this.callbacks || !input.turnId) {
       return;
     }
-    try {
-      const sanitizedError = input.error
-        ? (deepRedactStrings(input.error as JsonLike) as {
-            code: string;
-            message: string;
-            details?: Record<string, unknown>;
-          })
-        : undefined;
-      await this.callbacks.onTerminal({
-        conversationId: redactSecrets(session.id),
-        turnId: redactSecrets(input.turnId),
-        nativeTurnId: input.nativeTurnId ? redactSecrets(input.nativeTurnId) : null,
-        status: input.status,
-        error: sanitizedError,
-      });
-    } catch {
-      return;
-    }
+    const sanitizedError = input.error
+      ? (deepRedactStrings(input.error as JsonLike) as {
+          code: string;
+          message: string;
+          details?: Record<string, unknown>;
+        })
+      : undefined;
+    await this.callbacks.onTerminal({
+      conversationId: redactSecrets(session.id),
+      turnId: redactSecrets(input.turnId),
+      nativeTurnId: input.nativeTurnId ? redactSecrets(input.nativeTurnId) : null,
+      status: input.status,
+      error: sanitizedError,
+    });
   }
 
   protected async syncNativeSessionId(

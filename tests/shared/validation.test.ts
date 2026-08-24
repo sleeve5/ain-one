@@ -1,6 +1,8 @@
 import { describe, expect, it } from "vitest";
 import {
+  parseAgentSettings,
   parseCreateConversation,
+  parsePluginEnablements,
   parseQueueMessage,
 } from "../../src/shared/validation.js";
 
@@ -53,5 +55,26 @@ describe("API validation", () => {
     expect(() =>
       parseCreateConversation({ projectId: "  ", agentProductId: "codex" }),
     ).toThrow("projectId cannot be empty");
+  });
+
+  it("parses executable overrides and rejects empty paths", () => {
+    expect(parseAgentSettings({ executablePath: "/opt/bin/codex" })).toEqual({
+      executablePath: "/opt/bin/codex",
+    });
+    expect(parseAgentSettings({ executablePath: null })).toEqual({ executablePath: null });
+    expect(() => parseAgentSettings({ executablePath: "  " })).toThrow(
+      "executablePath cannot be empty",
+    );
+  });
+
+  it("rejects duplicate plugin enablements", () => {
+    expect(() =>
+      parsePluginEnablements({
+        pluginVersions: [
+          { pluginId: "formatter", versionId: "v1" },
+          { pluginId: "formatter", versionId: "v2" },
+        ],
+      }),
+    ).toThrow("pluginId must be unique");
   });
 });

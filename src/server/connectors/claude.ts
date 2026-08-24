@@ -47,11 +47,8 @@ export class ClaudeConnector extends CliJsonlConnector {
 
   async fetchCatalog(projectPath: string): Promise<AgentCatalog> {
     const configuredModel = await this.readConfiguredModel(projectPath);
-    const standardModels = ["sonnet", "opus", "haiku", "fable"];
     return {
-      models: configuredModel
-        ? [configuredModel, ...standardModels.filter((model) => model !== configuredModel)]
-        : standardModels,
+      models: configuredModel ? [configuredModel] : [],
       permissionModes: ["request_approval", "help_me_approve", "full_access"],
     };
   }

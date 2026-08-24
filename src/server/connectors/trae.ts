@@ -103,7 +103,7 @@ export class TraeConnector extends CliJsonlConnector {
       args.push("--permission-mode", "auto");
     }
     if (input.snapshot.permissionMode === "full_access") {
-      args.push("--permission-mode", "bypass_permissions", "--dangerously-bypass-approvals-and-sandbox");
+      args.push("--dangerously-bypass-approvals-and-sandbox");
     }
     for (const server of readMcpArtifact(input.mcpConfigPath, "trae")) {
       args.push("-c", renderTomlMcpOverride(server));

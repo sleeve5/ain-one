@@ -120,7 +120,7 @@ describe("native agent connectors", () => {
         }),
       probeStatus: "capability_limited",
       catalog: {
-        models: ["sonnet", "opus", "haiku", "fable"],
+        models: [],
         permissionModes: ["request_approval", "help_me_approve", "full_access"],
       },
       startArgs: (args) => {
@@ -465,7 +465,7 @@ describe("native agent connectors", () => {
     expect(ctx.spawnCalls).toHaveLength(0);
   });
 
-  it("keeps the highest-precedence configured Claude model without hiding standard aliases", async () => {
+  it("only advertises the highest-precedence configured Claude model", async () => {
     const ctx = createFixtureContext();
     mkdirSync(join(ctx.root, ".claude"), { recursive: true });
     mkdirSync(join(ctx.projectPath, ".claude"), { recursive: true });
@@ -481,7 +481,7 @@ describe("native agent connectors", () => {
     const connector = new ClaudeConnector({ env: { HOME: ctx.root } });
 
     await expect(connector.fetchCatalog(ctx.projectPath)).resolves.toEqual({
-      models: ["local-model", "sonnet", "opus", "haiku", "fable"],
+      models: ["local-model"],
       permissionModes: ["request_approval", "help_me_approve", "full_access"],
     });
   });
@@ -566,6 +566,30 @@ describe("native agent connectors", () => {
       "--skip-git-repo-check",
       "--permission-mode",
       "auto",
+    ]);
+  });
+
+  it("maps Trae full access without conflicting permission and sandbox overrides", async () => {
+    const ctx = createFixtureContext();
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
+    });
+    const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, {
+      ...turnInput("trae", null),
+      snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
+    });
+    await waitForSettled(harness.session);
+
+    const execRecord = readRecords(ctx.recordPath).find((record) => record.commandType === "exec");
+    expect(execRecord?.args).toEqual([
+      "exec",
+      "--json",
+      "--skip-git-repo-check",
+      "--dangerously-bypass-approvals-and-sandbox",
     ]);
   });
 

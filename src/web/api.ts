@@ -17,6 +17,7 @@ import type {
   GraphRunEvent,
 } from "../shared/contracts.js";
 import { coalesceConversationEvents } from "./store.js";
+import { agentLabel } from "./agent-meta.js";
 
 type FetchFn = typeof fetch;
 
@@ -311,7 +312,7 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
           );
           return {
             id: agent.agentProductId,
-            name: toAgentLabel(agent.agentProductId),
+            name: agentLabel(agent.agentProductId),
             status: agent.probe.status,
             version: agent.probe.version,
             executablePath: agent.executablePath,
@@ -691,7 +692,7 @@ function toConversationView(
     projectId: conversation.projectId,
     title: conversation.title ?? `Conversation ${conversation.id.slice(0, 8)}`,
     agentProductId: conversation.agentProductId,
-    agentProductLabel: toAgentLabel(conversation.agentProductId),
+    agentProductLabel: agentLabel(conversation.agentProductId),
     modelId: conversation.modelId,
     permissionMode: conversation.permissionMode,
     availableModels,
@@ -865,21 +866,6 @@ function isAgentProductId(value: unknown): value is AgentProductId {
 
 function isPresent<T>(value: T | null): value is T {
   return value !== null;
-}
-
-function toAgentLabel(agentProductId: AgentProductId): string {
-  switch (agentProductId) {
-    case "codex":
-      return "Codex";
-    case "claude":
-      return "Claude Code";
-    case "trae":
-      return "Trae";
-    case "opencode":
-      return "OpenCode";
-    default:
-      return agentProductId;
-  }
 }
 
 async function consumeSse(

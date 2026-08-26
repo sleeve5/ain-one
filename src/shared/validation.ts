@@ -292,10 +292,21 @@ export function validateGraphDefinition(value: unknown): string[] {
   for (const rawNode of nodes) {
     if (!rawNode || typeof rawNode !== "object" || Array.isArray(rawNode)) continue;
     const node = rawNode as Record<string, unknown>;
-    if (node.type !== "loop_counter" || typeof node.id !== "string") continue;
-    const branches = parsedEdges.filter((edge) => edge.source === node.id).map((edge) => edge.condition?.branch);
-    if (!branches.includes("loop")) errors.push(`Loop Counter ${node.id} requires a Loop branch`);
-    if (!branches.includes("done")) errors.push(`Loop Counter ${node.id} requires a Done branch`);
+    if (typeof node.id !== "string") continue;
+    const outgoing = parsedEdges.filter((edge) => edge.source === node.id);
+    const branches = outgoing.map((edge) => edge.condition?.branch);
+    if (node.type === "loop_counter") {
+      const loopCount = branches.filter((branch) => branch === "loop").length;
+      const doneCount = branches.filter((branch) => branch === "done").length;
+      if (loopCount === 0) errors.push(`Loop Counter ${node.id} requires a Loop branch`);
+      if (doneCount === 0) errors.push(`Loop Counter ${node.id} requires a Done branch`);
+      if (loopCount > 1) errors.push(`Loop Counter ${node.id} allows only one Loop branch`);
+      if (doneCount > 1) errors.push(`Loop Counter ${node.id} allows only one Done branch`);
+      if (branches.some((branch) => branch === undefined)) errors.push(`Loop Counter ${node.id} outgoing edges require Loop or Done branches`);
+    } else {
+      if (outgoing.length > 1) errors.push(`Serial node ${node.id} allows only one outgoing edge`);
+      if (branches.some((branch) => branch !== undefined)) errors.push(`Node ${node.id} cannot use loop branches`);
+    }
   }
   return errors;
 }

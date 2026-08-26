@@ -598,6 +598,10 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
     return;
   }
 
+  if (type === "item.started") {
+    return;
+  }
+
   if (type === "item.updated" || type === "item.delta") {
     const item = objectValue(record.item);
     const delta = objectValue(record.delta);

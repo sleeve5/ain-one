@@ -4,6 +4,7 @@ import type { AgentProductId, NormalizedEvent, PermissionMode } from "../../shar
 import type { AgentSettingsView, ConversationView } from "../api.js";
 import { Composer } from "./composer.js";
 import { AgentBadge } from "./agent-badge.js";
+import { agentLabel, sortAgents } from "../agent-meta.js";
 
 interface ConversationCanvasProps {
   conversation: ConversationView | null;
@@ -95,8 +96,8 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
   const trailingControls = (
     <div className="composer-selectors composer-selectors--trailing">
       <div className="agent-selector">
-        <button type="button" aria-label="Agent" aria-haspopup={draft ? "menu" : undefined} aria-expanded={draft ? openSelector === "agent" : undefined} disabled={!draft || turnActive} onClick={() => setOpenSelector((value) => value === "agent" ? null : "agent")}><span className="selector-value">{session.agentProductLabel}</span><SelectorChevron /></button>
-        {openSelector === "agent" ? <div role="menu" className="composer-popover">{(props.availableAgents ?? []).filter(isRunnableAgent).map((agent) => <button key={agent.id} type="button" role="menuitemradio" aria-checked={draft?.agentProductId === agent.id} onClick={() => { props.onChangeAgent?.(agent.id); setOpenSelector(null); }}>{agent.name}</button>)}</div> : null}
+        <button type="button" aria-label="Agent" aria-haspopup={draft ? "menu" : undefined} aria-expanded={draft ? openSelector === "agent" : undefined} disabled={!draft || turnActive} onClick={() => setOpenSelector((value) => value === "agent" ? null : "agent")}><span className="selector-value">{agentLabel(session.agentProductId)}</span><SelectorChevron /></button>
+        {openSelector === "agent" ? <div role="menu" className="composer-popover">{sortAgents((props.availableAgents ?? []).filter(isRunnableAgent)).map((agent) => <button key={agent.id} type="button" role="menuitemradio" aria-checked={draft?.agentProductId === agent.id} onClick={() => { props.onChangeAgent?.(agent.id); setOpenSelector(null); }}>{agentLabel(agent.id)}</button>)}</div> : null}
       </div>
       <div className="composer-selector">
         <button type="button" aria-label="Model" aria-haspopup="menu" aria-expanded={openSelector === "model" && !turnActive} disabled={turnActive} onClick={() => setOpenSelector((value) => value === "model" ? null : "model")}><span className="selector-value">{session.modelId ?? (zh ? "默认模型" : "Default model")}</span><SelectorChevron /></button>
@@ -118,9 +119,9 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           ) : item.kind === "trajectory" ? (
             <section key={item.id} className="conversation-trajectory" data-open={Boolean(timelineOpen[item.id])}>
               <button type="button" className="conversation-trajectory__toggle" aria-label={(timelineOpen[item.id] ? (zh ? "收起执行轨迹" : "Collapse activity") : (zh ? "展开执行轨迹" : "Expand activity"))} onClick={() => setTimelineOpen((current) => ({ ...current, [item.id]: !current[item.id] }))}><span>⌁</span><strong>{zh ? "执行轨迹" : "Activity"}</strong><span className="conversation-trajectory__state">{zh ? `${item.events.length} 个步骤` : `${item.events.length} steps`}</span><span className="conversation-trajectory__chevron"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6" /></svg></span></button>
-              {timelineOpen[item.id] ? <ul>{item.events.map((event) => <li key={event.id} data-severity={eventSeverity(event)}><span className="conversation-canvas__event-dot"/><code>{eventLabel(event.type, zh)}</code><div className="conversation-trajectory__detail"><Markdown options={{ disableParsingRawHTML: true }}>{describeEvent(event, zh)}</Markdown></div></li>)}</ul> : null}
+              {timelineOpen[item.id] ? <ul>{item.events.map((event) => <li key={event.id} data-kind={event.type} data-severity={eventSeverity(event)}><span className="conversation-canvas__event-dot"/><code>{eventLabel(event.type, zh)}</code><div className="conversation-trajectory__detail"><Markdown options={{ disableParsingRawHTML: true }}>{describeEvent(event, zh)}</Markdown></div></li>)}</ul> : null}
             </section>
-          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh, item.completedByFinalOutput)}</span>{turnError(item.event, zh) ? <strong>{turnError(item.event, zh)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time></div>)}
+          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh, item.completedByFinalOutput)}</span>{turnError(item.event, zh) ? <strong>{turnError(item.event, zh)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time>{item.usage ? <span>{formatUsage(item.usage, zh)}</span> : null}</div>)}
           {approvals.map((event) => {
             const requestId = readString(event.payload, "requestId");
             if (!requestId || !props.onRespondToPermission) return null;
@@ -156,14 +157,15 @@ function isRunnableAgent(agent: AgentSettingsView): boolean { return agent.enabl
 function SelectorChevron() { return <span className="selector-chevron" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m4.25 9.5 3.75-4 3.75 4" /></svg></span>; }
 function PermissionIcon() { return <span className="permission-selector__icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M8 2.25 12.5 4v3.45c0 2.75-1.7 4.9-4.5 6.3-2.8-1.4-4.5-3.55-4.5-6.3V4L8 2.25Z"/><path d="m6.1 7.8 1.2 1.2 2.7-2.75"/></svg></span>; }
 
-type FlowItem = { kind: "message"; event: NormalizedEvent } | { kind: "trajectory"; id: string; events: NormalizedEvent[] } | { kind: "footer"; event: NormalizedEvent; completedByFinalOutput: boolean };
+type FlowItem = { kind: "message"; event: NormalizedEvent } | { kind: "trajectory"; id: string; events: NormalizedEvent[] } | { kind: "footer"; event: NormalizedEvent; completedByFinalOutput: boolean; usage: NormalizedEvent | null };
 function buildFlow(events: NormalizedEvent[]): FlowItem[] {
-  const flow: FlowItem[] = []; let activity: NormalizedEvent[] = []; let finalAssistantOutput = false;
+  const flow: FlowItem[] = []; let activity: NormalizedEvent[] = []; let finalAssistantOutput = false; let usage: NormalizedEvent | null = null;
   const flush = () => { if (activity.length) { const merged = mergeActivityEvents(activity); flow.push({ kind: "trajectory", id: `activity-${activity[0]!.id}`, events: merged }); activity = []; } };
   for (const event of events) {
-    if (event.type === "user_message") { flush(); finalAssistantOutput = false; flow.push({ kind: "message", event }); }
+    if (event.type === "user_message") { flush(); finalAssistantOutput = false; usage = null; flow.push({ kind: "message", event }); }
     else if (event.type === "assistant_message") { flush(); finalAssistantOutput = event.payload.final === true; flow.push({ kind: "message", event }); }
-    else if (event.type === "turn_status" && isTerminalStatus(event.payload.status)) { flush(); flow.push({ kind: "footer", event, completedByFinalOutput: finalAssistantOutput && !readErrorMessage(event.payload) }); }
+    else if (event.type === "usage") usage = event;
+    else if (event.type === "turn_status" && isTerminalStatus(event.payload.status)) { flush(); flow.push({ kind: "footer", event, completedByFinalOutput: finalAssistantOutput && !readErrorMessage(event.payload), usage }); usage = null; }
     else {
       if (event.type === "reasoning" || event.type === "tool" || event.type === "shell" || event.type === "file" || event.type === "permission" || event.type === "warning") finalAssistantOutput = false;
       if (event.type !== "turn_status" && event.type !== "queue_status" && !(event.type === "permission" && readString(event.payload, "requestId"))) activity.push(event);
@@ -223,7 +225,7 @@ function describeEvent(event: NormalizedEvent, zh: boolean): string {
   if (event.type === "shell") return summarizePayload(event.payload, ["command", "status", "exit_code", "output"], eventLabel(event.type, zh));
   if (event.type === "file") return summarizePayload(event.payload, ["path", "status", "changes", "type"], eventLabel(event.type, zh));
   if (event.type === "permission") return readString(event.payload, "request") ?? eventLabel(event.type, zh);
-  if (event.type === "warning") return readString(event.payload, "message") ?? eventLabel(event.type, zh);
+  if (event.type === "warning") return readString(event.payload, "message") ?? ([readString(event.payload, "code")?.replaceAll("_", "\\_"), readString(event.payload, "event")].filter(Boolean).join(": ") || eventLabel(event.type, zh));
   if (event.type === "turn_status") return `${readString(event.payload, "status") ?? "unknown"}${readErrorMessage(event.payload) ? `: ${readErrorMessage(event.payload)}` : ""}`;
   return readString(event.payload, "text") ?? eventLabel(event.type, zh);
 }
@@ -252,6 +254,12 @@ function turnError(event: NormalizedEvent, zh: boolean): string | null {
   }
   return message;
 }
+function formatUsage(event: NormalizedEvent, zh: boolean): string {
+  const input = readNumber(event.payload, "input_tokens") ?? readNumber(event.payload, "inputTokens");
+  const output = readNumber(event.payload, "output_tokens") ?? readNumber(event.payload, "outputTokens");
+  if (input !== null && output !== null) return zh ? `输入 ${input} · 输出 ${output} tokens` : `${input} input · ${output} output tokens`;
+  return readString(event.payload, "summary") ?? (zh ? "用量已更新" : "Usage updated");
+}
 function activeTurnLabel(status: NonNullable<ConversationView["activeTurnStatus"]>, zh: boolean): string {
   if (status === "starting") return zh ? "正在连接…" : "Connecting…";
   if (status === "cancelling") return zh ? "正在停止…" : "Stopping…";
@@ -261,4 +269,5 @@ function CopyIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x
 function BranchIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="3.5" r="1.5"/><circle cx="12" cy="5.5" r="1.5"/><circle cx="4" cy="12.5" r="1.5"/><path d="M4 5v6M5.5 8.8C8 8.8 8 5.5 10.5 5.5"/></svg>; }
 function ResendIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.2 5.3A5 5 0 1 0 13 9"/><path d="M12.3 2.8v3.1H9.2"/></svg>; }
 function readString(payload: Record<string, unknown>, key: string): string | null { const value = payload[key]; return typeof value === "string" && value ? value : null; }
+function readNumber(payload: Record<string, unknown>, key: string): number | null { const value = payload[key]; return typeof value === "number" && Number.isFinite(value) ? value : null; }
 function readErrorMessage(payload: Record<string, unknown>): string | null { const error = payload.error; return error && typeof error === "object" ? readString(error as Record<string, unknown>, "message") : null; }

@@ -5,6 +5,7 @@ import type { GraphDefinition, GraphNode, GraphNodeRun, GraphProject, GraphRun, 
 import { validateGraphDefinition } from "../../shared/validation.js";
 import type { AinOneApi, AgentSettingsView } from "../api.js";
 import { GraphNodeView, type GraphNodeData } from "./graph-node.js";
+import { agentLabel, sortAgents } from "../agent-meta.js";
 
 interface GraphCanvasProps { language?: "zh" | "en"; api?: AinOneApi; projectId?: string | null; agents?: AgentSettingsView[]; active?: boolean; }
 const nodeTypes = { workflow: GraphNodeView };
@@ -28,6 +29,7 @@ export function GraphCanvas({ language = "en", api, projectId = null, agents = [
   useEffect(() => {
     let mounted = true;
     if (!active) return;
+    setRun(null); setNodeRuns([]); setRunEvents([]); setResult(null); setSelectedNodeId(null);
     if (!api || !projectId || !api.listGraphs || !api.createGraph) { setGraphs([]); setGraph(null); return; }
     void api.listGraphs(projectId).then(async (items) => {
       if (!mounted) return;
@@ -64,6 +66,19 @@ export function GraphCanvas({ language = "en", api, projectId = null, agents = [
   }, [active, flowNodes.length]);
   const selectedNode = graph?.definition.nodes.find((node) => node.id === selectedNodeId) ?? null;
   const validation = graph ? validateGraphDefinition(graph.definition) : [];
+  const clearRunState = () => { setRun(null); setNodeRuns([]); setRunEvents([]); setResult(null); setSelectedNodeId(null); };
+  const selectGraph = async (id: string) => {
+    clearRunState();
+    try {
+      const detail = await api?.getGraph?.(id);
+      if (!detail) return;
+      setGraph(detail.graph); setRun(detail.latestRun); setResult(detail.latestRun?.output ?? null);
+      if (detail.latestRun && api?.getGraphRun) {
+        const runDetail = await api.getGraphRun(detail.latestRun.id);
+        setRun(runDetail.run); setNodeRuns(runDetail.nodeRuns); setRunEvents(runDetail.events); setResult(runDetail.run.output);
+      }
+    } catch (cause) { setError(message(cause)); }
+  };
   const updateGraph = (change: (current: GraphProject) => GraphProject) => setGraph((current) => current ? change(current) : current);
   const addNode = (type: GraphNode["type"]) => { fitAfterMeasurement.current = true; updateGraph((current) => appendNode(current, type, agents)); };
   const changeNodes = (changes: NodeChange[]) => {
@@ -81,9 +96,11 @@ export function GraphCanvas({ language = "en", api, projectId = null, agents = [
     catch (cause) { setError(message(cause)); }
   };
   const startRun = async () => {
-    if (!graph || !api?.runGraph || validation.length) { setError(validation.join(" · ")); return; }
+    if (!graph || !api?.runGraph || !api.saveGraph || validation.length) { setError(validation.join(" · ")); return; }
     try {
-      const next = await api.runGraph(graph.id, runInput); setRun(next); setNodeRuns([]); setRunEvents([]); setResult(next.output); setError(null);
+      const saved = await api.saveGraph(graph);
+      setGraph(saved); setGraphs((items) => items.map((item) => item.id === saved.id ? saved : item));
+      const next = await api.runGraph(saved.id, runInput); setRun(next); setNodeRuns([]); setRunEvents([]); setResult(next.output); setError(null);
       const detail = await api.getGraphRun?.(next.id); if (detail) { setRun(detail.run); setNodeRuns(detail.nodeRuns); setRunEvents(detail.events); setResult(detail.run.output); }
     } catch (cause) { setError(message(cause)); }
   };
@@ -92,8 +109,8 @@ export function GraphCanvas({ language = "en", api, projectId = null, agents = [
 
   return <section className="graph-canvas" data-testid="graph-canvas" aria-label="Graph Canvas">
     <aside className="graph-sidebar">
-      <header><strong>{zh ? "图工程" : "Graphs"}</strong><button type="button" aria-label={zh ? "新建图" : "New graph"} onClick={() => void createNew(api, projectId, agents, setGraphs, setGraph, setError)}>＋</button></header>
-      <div className="graph-list">{graphs.map((item) => <button type="button" key={item.id} data-active={item.id === graph?.id || undefined} onClick={() => void openGraph(api, item.id, setGraph, setRun, setError)}><span>{item.name}</span><small>{item.definition.nodes.length} {zh ? "节点" : "nodes"}</small></button>)}</div>
+      <header><strong>{zh ? "图工程" : "Graphs"}</strong><button type="button" aria-label={zh ? "新建图" : "New graph"} onClick={() => { clearRunState(); void createNew(api, projectId, agents, setGraphs, setGraph, setError); }}>＋</button></header>
+      <div className="graph-list">{graphs.map((item) => <button type="button" key={item.id} data-active={item.id === graph?.id || undefined} onClick={() => void selectGraph(item.id)}><span>{item.name}</span><small>{item.definition.nodes.length} {zh ? "节点" : "nodes"}</small></button>)}</div>
       <div className="graph-library"><h3>{zh ? "节点" : "Nodes"}</h3><button type="button" aria-label={zh ? "添加 Agent" : "Add Agent"} disabled={!graph} onClick={() => addNode("agent")}>✦ Agent</button><button type="button" aria-label={zh ? "添加循环计数器" : "Add Loop Counter"} disabled={!graph} onClick={() => addNode("loop_counter")}>↻ Loop Counter</button><button type="button" aria-label={zh ? "添加直通节点" : "Add Pass-through"} disabled={!graph} onClick={() => addNode("passthrough")}>→ Pass-through</button></div>
     </aside>
     <div className="graph-workspace">
@@ -103,18 +120,18 @@ export function GraphCanvas({ language = "en", api, projectId = null, agents = [
     </div>
     <aside className="graph-inspector" aria-label={zh ? "图检查器" : "Graph inspector"}>{selectedNode ? <NodeInspector node={selectedNode} agents={agents} zh={zh} onChange={(next) => updateGraph((current) => ({ ...current, definition: { ...current.definition, nodes: current.definition.nodes.map((node) => node.id === next.id ? next : node) } }))} onDelete={() => { updateGraph((current) => removeNodes(current, [selectedNode.id])); setSelectedNodeId(null); }} /> : <><h3>{zh ? "图设置" : "Graph settings"}</h3><label>{zh ? "描述" : "Description"}<textarea value={graph?.description ?? ""} onChange={(event) => updateGraph((current) => ({ ...current, description: event.currentTarget.value }))} /></label>{validation.length > 0 && <div className="graph-errors" role="alert">{validation.map((item) => <p key={item}>{item}</p>)}</div>}</>}{run && <section className="graph-run-state"><h3>{zh ? "最近运行" : "Latest run"}</h3><span data-status={run.status}>{run.status}</span>{result !== null && <><h4>{zh ? "最终结果" : "Final result"}</h4><pre>{result}</pre></>}{runEvents.length > 0 && <><h4>{zh ? "运行事件" : "Run events"}</h4><ol className="graph-event-log" role="log" aria-label={zh ? "运行事件" : "Run events"}>{runEvents.map((event) => <li key={event.id}><code>{event.type}</code>{event.nodeId ? <span>{graph?.definition.nodes.find((node) => node.id === event.nodeId)?.name ?? event.nodeId}</span> : null}</li>)}</ol></>}</section>}</aside>
     {error && <div className="graph-toast" role="alert"><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {confirmDelete && <div className="client-dialog"><button type="button" className="client-dialog__backdrop" aria-label={zh ? "取消删除" : "Cancel deletion"} onPointerDown={() => setConfirmDelete(false)}/><div className="client-dialog__panel" role="dialog" aria-modal="true" aria-label={zh ? "删除图" : "Delete graph"}><h2>{zh ? "删除此图？" : "Delete this graph?"}</h2><p>{zh ? "运行记录也会被删除。" : "Its run history will also be removed."}</p><div><button onClick={() => setConfirmDelete(false)}>{zh ? "取消" : "Cancel"}</button><button className="danger" onClick={() => void removeGraph(api, graph, graphs, setGraphs, setGraph, setConfirmDelete, setError)}>{zh ? "删除" : "Delete"}</button></div></div></div>}
+    {confirmDelete && <div className="client-dialog"><button type="button" className="client-dialog__backdrop" aria-label={zh ? "取消删除" : "Cancel deletion"} onPointerDown={() => setConfirmDelete(false)}/><div className="client-dialog__panel" role="dialog" aria-modal="true" aria-label={zh ? "删除图" : "Delete graph"}><h2>{zh ? "删除此图？" : "Delete this graph?"}</h2><p>{zh ? "运行记录也会被删除。" : "Its run history will also be removed."}</p><div><button onClick={() => setConfirmDelete(false)}>{zh ? "取消" : "Cancel"}</button><button className="danger" onClick={() => { clearRunState(); void removeGraph(api, graph, graphs, setGraphs, setGraph, setConfirmDelete, setError); }}>{zh ? "删除" : "Delete"}</button></div></div></div>}
   </section>;
 }
 
 function NodeInspector({ node, agents, zh, onChange, onDelete }: { node: GraphNode; agents: AgentSettingsView[]; zh: boolean; onChange(node: GraphNode): void; onDelete(): void }) {
-  const availableAgents = agents.filter(isRunnableAgent);
+  const availableAgents = sortAgents(agents.filter(isRunnableAgent));
   const selectedAgent = node.type === "agent" ? agents.find((agent) => agent.id === node.config.agentProductId) : undefined;
-  return <><h3>{zh ? "节点设置" : "Node settings"}</h3><label>{zh ? "名称" : "Name"}<input value={node.name} onChange={(event) => onChange({ ...node, name: event.currentTarget.value })} /></label>{node.type === "loop_counter" && <label>{zh ? "最大迭代次数" : "Maximum iterations"}<input type="number" min="1" aria-label={zh ? "最大迭代次数" : "Maximum iterations"} value={node.config.maxIterations} onChange={(event) => onChange({ ...node, config: { maxIterations: Number(event.currentTarget.value) } })} /></label>}{node.type === "agent" && <><label>Agent<select aria-label="Agent" value={node.config.agentProductId} onChange={(event) => { const agent = availableAgents.find((item) => item.id === event.currentTarget.value); if (agent) onChange({ ...node, config: { ...node.config, agentProductId: agent.id, modelId: agent.catalog.models[0] ?? null, permissionMode: agent.catalog.permissionModes[0] ?? "request_approval" } }); }}>{availableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agent.name}</option>)}</select></label><label>{zh ? "模型" : "Model"}<select value={node.config.modelId ?? ""} onChange={(event) => onChange({ ...node, config: { ...node.config, modelId: event.currentTarget.value || null } })}><option value="">Default</option>{selectedAgent?.catalog.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>{zh ? "权限模式" : "Permission mode"}<select aria-label={zh ? "权限模式" : "Permission mode"} value={node.config.permissionMode} onChange={(event) => onChange({ ...node, config: { ...node.config, permissionMode: event.currentTarget.value as typeof node.config.permissionMode } })}>{selectedAgent?.catalog.permissionModes.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label><label>{zh ? "提示词" : "Prompt"}<textarea value={node.config.prompt} onChange={(event) => onChange({ ...node, config: { ...node.config, prompt: event.currentTarget.value } })} /></label></>}<button type="button" className="graph-inspector__delete" aria-label={zh ? "删除节点" : "Delete node"} onClick={onDelete}>{zh ? "删除节点" : "Delete node"}</button></>;
+  return <><h3>{zh ? "节点设置" : "Node settings"}</h3><label>{zh ? "名称" : "Name"}<input value={node.name} onChange={(event) => onChange({ ...node, name: event.currentTarget.value })} /></label>{node.type === "loop_counter" && <label>{zh ? "最大迭代次数" : "Maximum iterations"}<input type="number" min="1" aria-label={zh ? "最大迭代次数" : "Maximum iterations"} value={node.config.maxIterations} onChange={(event) => onChange({ ...node, config: { maxIterations: Number(event.currentTarget.value) } })} /></label>}{node.type === "agent" && <><label>Agent<select aria-label="Agent" value={node.config.agentProductId} onChange={(event) => { const agent = availableAgents.find((item) => item.id === event.currentTarget.value); if (agent) onChange({ ...node, config: { ...node.config, agentProductId: agent.id, modelId: agent.catalog.models[0] ?? null, permissionMode: agent.catalog.permissionModes[0] ?? "request_approval" } }); }}>{availableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agentLabel(agent.id)}</option>)}</select></label><label>{zh ? "模型" : "Model"}<select value={node.config.modelId ?? ""} onChange={(event) => onChange({ ...node, config: { ...node.config, modelId: event.currentTarget.value || null } })}><option value="">Default</option>{selectedAgent?.catalog.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>{zh ? "权限模式" : "Permission mode"}<select aria-label={zh ? "权限模式" : "Permission mode"} value={node.config.permissionMode} onChange={(event) => onChange({ ...node, config: { ...node.config, permissionMode: event.currentTarget.value as typeof node.config.permissionMode } })}>{selectedAgent?.catalog.permissionModes.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label><label>{zh ? "提示词" : "Prompt"}<textarea value={node.config.prompt} onChange={(event) => onChange({ ...node, config: { ...node.config, prompt: event.currentTarget.value } })} /></label></>}<button type="button" className="graph-inspector__delete" aria-label={zh ? "删除节点" : "Delete node"} onClick={onDelete}>{zh ? "删除节点" : "Delete node"}</button></>;
 }
 
 function defaultGraph(agents: AgentSettingsView[] = []): Omit<GraphProject, "id" | "projectId" | "createdAt" | "updatedAt"> {
-  const agent = agents.find(isRunnableAgent);
+  const agent = sortAgents(agents.filter(isRunnableAgent))[0];
   return { name: "Untitled graph", description: "", definition: { nodes: [{ id: "agent-1", type: "agent", name: "Agent 1", config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", prompt: "{{input}}" } }, { id: "loop-1", type: "loop_counter", name: "Loop Counter 1", config: { maxIterations: 3 } }, { id: "end-1", type: "passthrough", name: "Result", config: {} }], edges: [{ id: "agent-loop", source: "agent-1", target: "loop-1" }, { id: "loop-agent", source: "loop-1", target: "agent-1", condition: { branch: "loop" } }, { id: "loop-end", source: "loop-1", target: "end-1", condition: { branch: "done" } }], start: ["agent-1"], end: ["end-1"] }, viewport: { x: 0, y: 0, zoom: 1 }, positions: { "agent-1": { x: 220, y: 180 }, "loop-1": { x: 440, y: 180 }, "end-1": { x: 660, y: 180 } } };
 }
 
@@ -123,7 +140,7 @@ function toFlowNodes(graph: GraphProject, nodeRuns: GraphNodeRun[], measurements
   const endId = graph.definition.end[0];
   return [
     { id: "virtual-start", type: "workflow", position: { x: 20, y: 180 }, draggable: false, selectable: false, data: { kind: "start", label: "Start", subtitle: startId } },
-    ...graph.definition.nodes.map((node, index) => ({ id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 220 + index * 210, y: 180 }, measured: measurements.get(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? node.config.agentProductId : node.type === "loop_counter" ? `× ${node.config.maxIterations}` : undefined, status: nodeRuns.findLast((item) => item.nodeId === node.id)?.status } })),
+    ...graph.definition.nodes.map((node, index) => ({ id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 220 + index * 210, y: 180 }, measured: measurements.get(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? agentLabel(node.config.agentProductId) : node.type === "loop_counter" ? `× ${node.config.maxIterations}` : undefined, status: nodeRuns.findLast((item) => item.nodeId === node.id)?.status } })),
     { id: "virtual-end", type: "workflow", position: { x: 480 + graph.definition.nodes.length * 180, y: 180 }, draggable: false, selectable: false, data: { kind: "end", label: "End", subtitle: endId } },
   ] as Node<GraphNodeData>[];
 }
@@ -139,7 +156,7 @@ function toFlowEdges(graph: GraphProject): Edge[] {
 function appendNode(graph: GraphProject, type: GraphNode["type"], agents: AgentSettingsView[]): GraphProject {
   const count = graph.definition.nodes.filter((node) => node.type === type).length + 1;
   const id = `${type}-${crypto.randomUUID()}`;
-  const agent = agents.find(isRunnableAgent);
+  const agent = sortAgents(agents.filter(isRunnableAgent))[0];
   const node: GraphNode = type === "agent"
     ? { id, type, name: `Agent ${count}`, config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", prompt: "{{input}}" } }
     : type === "loop_counter"
@@ -167,9 +184,6 @@ function removeNodes(graph: GraphProject, ids: string[]): GraphProject {
 
 async function createNew(api: AinOneApi | undefined, projectId: string, agents: AgentSettingsView[], setGraphs: Dispatch<SetStateAction<GraphProject[]>>, setGraph: Dispatch<SetStateAction<GraphProject | null>>, setError: Dispatch<SetStateAction<string | null>>) {
   try { const graph = await api?.createGraph?.(projectId, defaultGraph(agents)); if (graph) { setGraphs((items) => [graph, ...items]); setGraph(graph); } } catch (cause) { setError(message(cause)); }
-}
-async function openGraph(api: AinOneApi | undefined, id: string, setGraph: Dispatch<SetStateAction<GraphProject | null>>, setRun: Dispatch<SetStateAction<GraphRun | null>>, setError: Dispatch<SetStateAction<string | null>>) {
-  try { const detail = await api?.getGraph?.(id); if (detail) { setGraph(detail.graph); setRun(detail.latestRun); } } catch (cause) { setError(message(cause)); }
 }
 async function removeGraph(api: AinOneApi | undefined, graph: GraphProject | null, graphs: GraphProject[], setGraphs: Dispatch<SetStateAction<GraphProject[]>>, setGraph: Dispatch<SetStateAction<GraphProject | null>>, setConfirm: Dispatch<SetStateAction<boolean>>, setError: Dispatch<SetStateAction<string | null>>) {
   if (!graph) return;

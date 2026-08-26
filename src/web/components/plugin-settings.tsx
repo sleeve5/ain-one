@@ -2,11 +2,11 @@ import { useState } from "react";
 import type { AgentProductId, PluginVersion } from "../../shared/contracts.js";
 import { isPhaseOneAgentProductId, type PluginMaterializationView } from "../api.js";
 import { AgentBadge } from "./agent-badge.js";
+import { agentLabel, sortAgentIds } from "../agent-meta.js";
 
 export type PluginType = "skill" | "mcp"; export type PluginScope = "global" | "project" | "conversation";
 export interface InstalledPluginVersion extends PluginVersion { type: PluginType; compatibleAgents: AgentProductId[]; materializations: PluginMaterializationView[]; }
 interface Props { installedVersions: InstalledPluginVersion[]; error?: string | null; scope: PluginScope; conversationAgentProductId?: AgentProductId | null; enabledVersions: PluginVersion[]; enablementsLoading?: boolean; language?: "zh" | "en"; onInstallLocalPath(path:string,type:PluginType,agents:AgentProductId[]):void; onPickLocalPath(kind:"directory"|"file"):Promise<string|null>; onRefreshImports():void; onScopeChange(scope:PluginScope):void; onEnableChange(scope:PluginScope, change:PluginVersion & {enabled:boolean}):void; onRepairMaterialization(agent:AgentProductId,plugin:PluginVersion):void; }
-const labels: Record<AgentProductId,string>={codex:"Codex",claude:"Claude Code",trae:"Trae CLI",opencode:"OpenCode"};
 const agents: AgentProductId[]=["codex","claude","trae"];
 export function PluginSettings(props: Props) {
   const [type,setType]=useState<PluginType>("skill"); const [query,setQuery]=useState(""); const zh=props.language==="zh";
@@ -19,9 +19,9 @@ export function PluginSettings(props: Props) {
     <div className="plugin-settings__toolbar"><label>{zh?"生效范围":"Apply to"}<select aria-label="Plugin scope" value={props.scope} onChange={(e)=>props.onScopeChange(e.currentTarget.value as PluginScope)}><option value="global">{zh?"所有项目":"All projects"}</option><option value="project">{zh?"当前项目":"Current project"}</option><option value="conversation">{zh?"当前对话":"Current conversation"}</option></select></label><input type="search" aria-label="Search plugins" placeholder={zh?"搜索插件":"Search plugins"} value={query} onChange={(event)=>setQuery(event.currentTarget.value)}/><button type="button" onClick={()=>void choose()}>{type==="skill"?(zh?"添加 Skill":"Add Skill"):(zh?"添加 MCP":"Add MCP")}</button></div>
     <PluginList title={zh?"可用插件":"Available plugins"} ariaLabel="Installed plugin versions" empty={zh?"没有匹配的插件":"No matching plugins"} rows={installed.map((v)=>{
       const enabled=props.enabledVersions.some((e)=>e.pluginId===v.pluginId&&e.versionId===v.versionId);
-      const compatible=v.compatibleAgents.filter(isPhaseOneAgentProductId);
+      const compatible=sortAgentIds(v.compatibleAgents.filter(isPhaseOneAgentProductId));
       const incompatible=!compatible.length||(props.scope==="conversation"&&props.conversationAgentProductId!=null&&!compatible.includes(props.conversationAgentProductId));
-      return {key:`${v.pluginId}:${v.versionId}`,name:v.pluginId,kind:v.type==="skill"?"Skill":"MCP",version:short(v.versionId),action:<label className="plugin-settings__switch"><input type="checkbox" aria-label={`Enable ${v.pluginId} ${v.versionId}`} disabled={props.enablementsLoading||(!enabled&&incompatible)} checked={enabled} onChange={(e)=>props.onEnableChange(props.scope,{pluginId:v.pluginId,versionId:v.versionId,enabled:e.currentTarget.checked})}/><span aria-hidden="true"/></label>,agents:<>{compatible.map((agent)=>{const materialization=v.materializations.find((item)=>item.agentProductId===agent);return <span className="plugin-settings__agent" key={agent} title={materialization?statusText(materialization.status,zh):undefined}><AgentBadge agent={agent}/>{materialization?.repairable?<button type="button" aria-label={`Repair ${v.pluginId} ${v.versionId} for ${labels[agent]}`} onClick={()=>props.onRepairMaterialization(agent,v)}>{zh?"同步":"Sync"}</button>:null}</span>;})}</>};
+      return {key:`${v.pluginId}:${v.versionId}`,name:v.pluginId,kind:v.type==="skill"?"Skill":"MCP",version:short(v.versionId),action:<label className="plugin-settings__switch"><input type="checkbox" aria-label={`Enable ${v.pluginId} ${v.versionId}`} disabled={props.enablementsLoading||(!enabled&&incompatible)} checked={enabled} onChange={(e)=>props.onEnableChange(props.scope,{pluginId:v.pluginId,versionId:v.versionId,enabled:e.currentTarget.checked})}/><span aria-hidden="true"/></label>,agents:<>{compatible.map((agent)=>{const materialization=v.materializations.find((item)=>item.agentProductId===agent);return <span className="plugin-settings__agent" key={agent} title={materialization?statusText(materialization.status,zh):undefined}><AgentBadge agent={agent}/>{materialization?.repairable?<button type="button" aria-label={`Repair ${v.pluginId} ${v.versionId} for ${agentLabel(agent)}`} onClick={()=>props.onRepairMaterialization(agent,v)}>{zh?"同步":"Sync"}</button>:null}</span>;})}</>};
     })}/>
   </section>;
 }

@@ -142,9 +142,15 @@ export class CodexConnector extends CliJsonlConnector {
     });
     const finish = async (status: TerminalTurnStatus, error?: { code: string; message: string }): Promise<void> => {
       if (terminalSent) return;
-      await this.emitEvent(session, { type: "turn_status", payload: { turnId: input.turnId ?? null, nativeTurnId, status, error } });
+      const finishingTurn = session.activeTurn?.settled === settled ? session.activeTurn : undefined;
+      if (finishingTurn) delete session.activeTurn;
+      try {
+        await this.emitEvent(session, { type: "turn_status", payload: { turnId: input.turnId ?? null, nativeTurnId, status, error } });
+      } catch (cause) {
+        if (!session.activeTurn && finishingTurn) session.activeTurn = finishingTurn;
+        throw cause;
+      }
       terminalSent = true;
-      if (session.activeTurn?.settled === settled) delete session.activeTurn;
       settledResolve();
       if (child.exitCode === null && child.signalCode === null) this.killProcessTree(child);
       for (const waiter of pending.values()) {

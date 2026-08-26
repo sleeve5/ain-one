@@ -23,7 +23,8 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
   const [detailTab, setDetailTab] = useState<DetailTab>("summary");
   const [focusRange, setFocusRange] = useState<FocusRange | null>(null);
   const [detailsWidth, setDetailsWidth] = useState(520);
-  const timelineDrag = useRef<{ pointerId: number; start: number } | null>(null);
+  const timelineDrag = useRef<{ pointerId: number; start: number; moved: boolean } | null>(null);
+  const suppressTimelineClick = useRef(false);
   const detailsDrag = useRef<{ pointerId: number; startX: number; startWidth: number } | null>(null);
   const model = useMemo(() => searchTrajectory(projectTrajectory(events), query), [events, query]);
   const records = model.turns.flatMap((turn) => turn.records);
@@ -62,16 +63,17 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
           onPointerDown={(event) => {
             if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
             const start = timelinePoint(event.clientX, event.currentTarget);
-            timelineDrag.current = { pointerId: event.pointerId, start };
+            timelineDrag.current = { pointerId: event.pointerId, start, moved: false };
             setFocusRange({ start, end: start });
           }}
           onPointerMove={(event) => {
             const drag = timelineDrag.current;
             if (!drag || drag.pointerId !== event.pointerId) return;
             const point = timelinePoint(event.clientX, event.currentTarget);
+            if (Math.abs(point - drag.start) >= 3) drag.moved = true;
             setFocusRange({ start: Math.min(drag.start, point), end: Math.max(drag.start, point) });
           }}
-          onPointerUp={(event) => { if (timelineDrag.current?.pointerId === event.pointerId) timelineDrag.current = null; }}
+          onPointerUp={(event) => { const drag = timelineDrag.current; if (drag?.pointerId === event.pointerId) { suppressTimelineClick.current = drag.moved; timelineDrag.current = null; } }}
           onDoubleClick={(event) => { if ((event.target as HTMLElement).closest("button")) return; timelineDrag.current = null; setFocusRange(null); }}
           onKeyDown={(event) => { if (event.key === "Escape") setFocusRange(null); }}
         >
@@ -79,7 +81,7 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
             {focusRange ? <div className="trajectory-canvas__selection" style={{ left: focusRange.start, width: Math.max(2, focusRange.end - focusRange.start) }} /> : null}
             {records.map((record) => {
               const position = timelinePosition(record, records);
-              return <button key={record.id} type="button" data-kind={record.kind} data-error={record.error || undefined} data-selected={focusRange ? inRange(position.start, position.end, focusRange) : undefined} aria-label={`${record.title}: ${record.summary}`} style={{ left: position.start, width: TIMELINE_BLOCK }} onClick={() => { setFocusRange(null); selectRecord(record); }} />;
+              return <button key={record.id} type="button" data-kind={record.kind} data-error={record.error || undefined} data-selected={focusRange ? inRange(position.start, position.end, focusRange) : undefined} aria-label={`${record.title}: ${record.summary}`} style={{ left: position.start, width: TIMELINE_BLOCK }} onClick={() => { if (suppressTimelineClick.current) { suppressTimelineClick.current = false; return; } setFocusRange(null); selectRecord(record); }} />;
             })}
           </div>
         </div>

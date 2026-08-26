@@ -48,7 +48,7 @@ export class GraphRuntime {
         const nodeRun = this.options.repository.startNodeRun(run.id, nodeId, iteration, value);
         this.options.repository.appendRunEvent(run.id, "node_started", nodeId, { iteration, input: value });
         try {
-          if (node.type === "agent") value = await this.executeAgent(run.id, node, value, state);
+          if (node.type === "agent") value = await this.executeAgent(run.id, node, iteration, value, state);
           if (state.cancelled) {
             this.options.repository.finishNodeRun(nodeRun.id, "cancelled", value);
             return this.cancelled(run.id);
@@ -111,7 +111,7 @@ export class GraphRuntime {
     return count < node.config.maxIterations ? "loop" : "done";
   }
 
-  private async executeAgent(runId: string, node: Extract<GraphNode, { type: "agent" }>, input: string, state: ActiveRun): Promise<string> {
+  private async executeAgent(runId: string, node: Extract<GraphNode, { type: "agent" }>, iteration: number, input: string, state: ActiveRun): Promise<string> {
     const connector = this.options.connectors[node.config.agentProductId];
     if (!connector) throw new Error(`Agent is unavailable: ${node.config.agentProductId}`);
     let sessionState = state.sessions.get(node.id);
@@ -147,7 +147,7 @@ export class GraphRuntime {
     const starting = connector.startTurn(sessionState.session, {
       content: node.config.prompt.replaceAll("{{input}}", input),
       snapshot: { modelId: node.config.modelId, permissionMode: node.config.permissionMode, pluginVersions: [] },
-      turnId: `graph:${runId}:${node.id}`,
+      turnId: `graph:${runId}:${node.id}:${iteration}`,
     });
     const started = await Promise.race([
       starting.then((native) => ({ native })),

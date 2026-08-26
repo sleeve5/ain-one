@@ -633,6 +633,14 @@ export function App(props: AppProps) {
             selectedConversationId={state.workspace.selectedConversationId}
             unreadConversationIds={unreadConversationIds}
             onOpenProject={openProject}
+            onRestartWorkspace={async () => {
+              try {
+                await props.api.restartWorkspace?.();
+                if (await loadWorkspace()) clearActionError();
+              } catch {
+                showActionError(preferences.language === "zh" ? "无法重启工作区" : "Could not restart workspace");
+              }
+            }}
             onCreateConversation={startNewConversation}
             onSelectProject={(projectId) => {
               selectProject(projectId);
@@ -822,32 +830,6 @@ export function App(props: AppProps) {
                     clearActionError();
                   } catch {
                     showActionError("Could not stop active Turn");
-                  }
-              }}
-              onContinueConversation={async () => {
-                  if (!conversation) {
-                    return;
-                  }
-                  try {
-                    await props.api.continueConversation(conversation.id);
-                    if (await loadWorkspace()) {
-                      clearActionError();
-                    }
-                  } catch {
-                    showActionError("Could not continue sending");
-                  }
-              }}
-              onRetryInterruptedTurn={async (turnId) => {
-                  if (!conversation) {
-                    return;
-                  }
-                  try {
-                    await props.api.retryInterruptedTurn(conversation.id, turnId);
-                    if (await loadWorkspace()) {
-                      clearActionError();
-                    }
-                  } catch {
-                    showActionError("Could not retry interrupted Turn");
                   }
               }}
               onRespondToPermission={async (requestId, decision) => {

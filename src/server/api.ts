@@ -32,6 +32,7 @@ interface TurnCoordinatorLike {
   cancelActiveTurn(conversationId: string): Promise<boolean>;
   continueConversation(conversationId: string): Promise<boolean>;
   retryInterruptedTurn(conversationId: string, turnId: string): Promise<boolean>;
+  restartWorkspace?(): Promise<void>;
   resolveUncertainDelivery?(conversationId: string, messageId: string, action: "retry" | "accept"): Promise<boolean>;
   respondToPermission?(conversationId: string, requestId: string, decision: PermissionDecision): Promise<boolean>;
 }
@@ -617,6 +618,16 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       }
       await options.turnCoordinator.continueConversation(conversationId);
       sendJson(response, 200, { accepted: true });
+      return;
+    }
+
+    if (request.method === "POST" && pathname === "/api/workspace/restart") {
+      if (!options.turnCoordinator.restartWorkspace) {
+        sendError(response, 501, "workspace_restart_unsupported", "Workspace restart is unavailable");
+        return;
+      }
+      await options.turnCoordinator.restartWorkspace();
+      sendJson(response, 200, { restarted: true });
       return;
     }
 

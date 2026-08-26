@@ -16,8 +16,8 @@ interface ConversationCanvasProps {
   onResolveUncertainMessage?(messageId: string, action: "retry" | "accept"): Promise<void>;
   onQueueMessage(content: string): Promise<void>;
   onCancelTurn(): Promise<void>;
-  onContinueConversation(): Promise<void>;
-  onRetryInterruptedTurn(turnId: string): Promise<void>;
+  onContinueConversation?(): Promise<void>;
+  onRetryInterruptedTurn?(turnId: string): Promise<void>;
   onRespondToPermission?(requestId: string, decision: "allow_once" | "deny_once"): Promise<void>;
   onForkConversation?(): Promise<void>;
   language?: "zh" | "en";
@@ -83,8 +83,6 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     return <section className="conversation-canvas" data-testid="conversation-canvas" aria-label="Conversation Canvas"><div className="workspace-empty">{zh ? "新建一个对话以开始。" : "Create a conversation to start."}</div></section>;
   }
 
-  const recoveryStatus = conversation?.latestTurnStatus ?? null;
-  const recoveryRequired = Boolean(conversation?.queuePaused && recoveryStatus !== null && ["start_failed", "failed", "interrupted", "cancel_failed"].includes(recoveryStatus));
   const leadingControls = (
     <div className="composer-selectors composer-selectors--leading" ref={selectorRef}>
       <button type="button" className="composer__attach" disabled title={zh ? "当前版本暂不支持附件" : "Attachments are not supported in this version"} aria-label={zh ? "添加附件（当前版本暂不支持）" : "Add attachment (not supported in this version)"}>+</button>
@@ -111,7 +109,6 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     <section className="conversation-canvas" data-testid="conversation-canvas" aria-label="Conversation Canvas">
       {props.showHeader !== false ? <header className="conversation-canvas__header"><h2>{conversation?.title ?? (zh ? "新对话" : "New conversation")}</h2><AgentBadge className="conversation-canvas__agent" agent={session.agentProductId}/></header> : null}
       <div className="conversation-canvas__scroll" ref={scrollRef}>
-        {recoveryRequired && conversation?.latestTurnId ? <section className="conversation-canvas__recovery"><p>{zh ? `上一个 Turn 以 ${recoveryStatus} 结束。继续前请确认本地 Agent 已停止工作。` : `The last Turn ended with ${recoveryStatus}. Confirm native work is inactive before continuing.`}</p><div><button type="button" onClick={props.onContinueConversation}>{zh ? "继续发送" : "Continue sending"}</button>{recoveryStatus === "interrupted" ? <button type="button" onClick={() => props.onRetryInterruptedTurn(conversation.latestTurnId!)}>{zh ? "重试中断的 Turn" : "Retry interrupted Turn"}</button> : null}</div></section> : null}
         <div className="conversation-canvas__messages">
           {flow.map((item) => item.kind === "message" ? (
             <article key={item.event.id} data-message-role={item.event.type === "user_message" ? "user" : "assistant"} className={`conversation-message conversation-message--${item.event.type === "user_message" ? "user" : "assistant"}`}>
@@ -123,7 +120,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
               <button type="button" className="conversation-trajectory__toggle" aria-label={(timelineOpen[item.id] ? (zh ? "收起执行轨迹" : "Collapse activity") : (zh ? "展开执行轨迹" : "Expand activity"))} onClick={() => setTimelineOpen((current) => ({ ...current, [item.id]: !current[item.id] }))}><span>⌁</span><strong>{zh ? "执行轨迹" : "Activity"}</strong><span className="conversation-trajectory__state">{zh ? `${item.events.length} 个步骤` : `${item.events.length} steps`}</span><span className="conversation-trajectory__chevron"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6" /></svg></span></button>
               {timelineOpen[item.id] ? <ul>{item.events.map((event) => <li key={event.id} data-severity={eventSeverity(event)}><span className="conversation-canvas__event-dot"/><code>{eventLabel(event.type, zh)}</code><div className="conversation-trajectory__detail"><Markdown options={{ disableParsingRawHTML: true }}>{describeEvent(event, zh)}</Markdown></div></li>)}</ul> : null}
             </section>
-          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh)}</span>{turnError(item.event) ? <strong>{turnError(item.event)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time></div>)}
+          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh)}</span>{turnError(item.event, zh) ? <strong>{turnError(item.event, zh)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time></div>)}
           {approvals.map((event) => {
             const requestId = readString(event.payload, "requestId");
             if (!requestId || !props.onRespondToPermission) return null;
@@ -242,7 +239,16 @@ function turnStatusLabel(event: NormalizedEvent, zh: boolean): string {
   if (status === "cancelled") return zh ? "已停止" : "Stopped";
   return `${zh ? "结束" : "Ended"}: ${status}`;
 }
-function turnError(event: NormalizedEvent): string | null { return readErrorMessage(event.payload); }
+function turnError(event: NormalizedEvent, zh: boolean): string | null {
+  const message = readErrorMessage(event.payload);
+  if (!message) return null;
+  if (/thread-store conflict:[\s\S]*already has an active writer/i.test(message)) {
+    return zh
+      ? "Agent 会话仍被其他进程占用，请重启工作区后重试。"
+      : "This Agent session is still in use. Restart the workspace and try again.";
+  }
+  return message;
+}
 function activeTurnLabel(status: NonNullable<ConversationView["activeTurnStatus"]>, zh: boolean): string {
   if (status === "starting") return zh ? "正在连接…" : "Connecting…";
   if (status === "cancelling") return zh ? "正在停止…" : "Stopping…";

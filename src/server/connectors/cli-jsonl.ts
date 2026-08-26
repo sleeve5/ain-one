@@ -133,9 +133,12 @@ export abstract class CliJsonlConnector extends BaseConnector {
         ) {
           const startError = new Error(
             effectiveError?.message ?? "Native turn failed before start",
-          );
+          ) as Error & { code?: string; definiteStartRejection?: boolean };
+          if (effectiveError?.code) {
+            startError.code = effectiveError.code;
+          }
           if (effectiveStatus === "start_failed") {
-            (startError as Error & { definiteStartRejection: boolean }).definiteStartRejection = true;
+            startError.definiteStartRejection = true;
           }
           rejectStart(startError);
         } else {
@@ -415,6 +418,13 @@ export abstract class CliJsonlConnector extends BaseConnector {
         }
 
         if ((code ?? 0) !== 0) {
+          if (!nativeTurnStarted && isSessionInUseError(stderrText)) {
+            await finalize("start_failed", {
+              code: "session_in_use",
+              message: "This Agent session is still in use by another process. Restart the workspace and try again.",
+            });
+            return;
+          }
           await finalize("failed", {
             code: "process_exit",
             message: stderrText.trim() || `Process exited with code ${code}`,
@@ -448,6 +458,10 @@ export abstract class CliJsonlConnector extends BaseConnector {
 
     return started;
   }
+}
+
+function isSessionInUseError(stderr: string): boolean {
+  return /thread-store conflict:[\s\S]*already has an active writer/i.test(stderr);
 }
 
 interface McpArtifactServer {

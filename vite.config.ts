@@ -1,6 +1,11 @@
-import { defineConfig, type Plugin, type UserConfig, type ViteDevServer } from "vite";
+import { defineConfig, type Plugin, type UserConfig } from "vite";
 import react from "@vitejs/plugin-react";
 import { startServer } from "./src/server/main.js";
+
+interface ControlPlane { token: string; url: string; stop(): Promise<void> }
+interface ControlPlaneState { current?: ControlPlane }
+const globals = globalThis as typeof globalThis & { __ainOneControlPlane?: ControlPlaneState };
+const controlPlaneState = globals.__ainOneControlPlane ?? (globals.__ainOneControlPlane = {});
 
 export default defineConfig(async ({ command }) => {
   if (command === "build") {
@@ -9,28 +14,12 @@ export default defineConfig(async ({ command }) => {
 
   const webPort = resolveWebPort(process.env.AIN_ONE_WEB_PORT);
   const webOrigin = `http://127.0.0.1:${webPort}`;
-  const api = await startServer({ allowedOrigins: [webOrigin] });
+  const api = await replaceControlPlane(
+    controlPlaneState,
+    () => startServer({ allowedOrigins: [webOrigin] }),
+  );
 
-  const controlPlanePlugin: Plugin = {
-    name: "ain-one-control-plane",
-    transformIndexHtml: {
-      order: "pre",
-      handler() {
-        return [
-          {
-            tag: "meta",
-            attrs: { name: "ain-one-token", content: api.token },
-            injectTo: "head",
-          },
-        ];
-      },
-    },
-    configureServer(server: ViteDevServer) {
-      server.httpServer?.once("close", () => {
-        void api.stop();
-      });
-    },
-  };
+  const controlPlanePlugin = createControlPlanePlugin(api);
 
   return {
     plugins: [
@@ -49,6 +38,39 @@ export default defineConfig(async ({ command }) => {
     },
   } satisfies UserConfig;
 });
+
+export async function replaceControlPlane(
+  state: ControlPlaneState,
+  start: () => Promise<ControlPlane>,
+): Promise<ControlPlane> {
+  await state.current?.stop();
+  const next = await start();
+  state.current = next;
+  return next;
+}
+
+export function createControlPlanePlugin(api: { token: string; stop(): Promise<void> }): Plugin {
+  let stopping: Promise<void> | null = null;
+  return {
+    name: "ain-one-control-plane",
+    transformIndexHtml: {
+      order: "pre",
+      handler() {
+        return [
+          {
+            tag: "meta",
+            attrs: { name: "ain-one-token", content: api.token },
+            injectTo: "head",
+          },
+        ];
+      },
+    },
+    closeBundle() {
+      stopping ??= api.stop();
+      return stopping;
+    },
+  };
+}
 
 function readPort(value: string | undefined, fallback: number): number {
   const parsed = value ? Number.parseInt(value, 10) : fallback;

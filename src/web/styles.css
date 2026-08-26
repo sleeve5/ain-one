@@ -146,9 +146,6 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .conversation-canvas__header { display: flex; flex: none; align-items: center; gap: 10px; min-height: 48px; padding: 8px 24px; border-bottom: 1px solid var(--line); }
 .conversation-canvas__header h2, .graph-canvas__heading { margin: 0; font-size: 15px; letter-spacing: -0.015em; }
 .conversation-canvas__agent { display: inline-flex; height: 20px; align-items: center; border-radius: 999px; background: var(--accent-soft); color: #496a91; padding: 0 7px; font-size: 10px; font-weight: 700; }
-.conversation-canvas__recovery { margin-bottom: 12px; padding: 12px 14px; border: 1px solid #dbe1f7; border-radius: 9px; background: var(--accent-soft); }
-.conversation-canvas__recovery p { margin: 0 0 8px; }
-.conversation-canvas__recovery div { display: flex; gap: 7px; }
 .conversation-canvas__scroll { flex: 1; min-height: 0; overflow-y: auto; }
 .conversation-canvas__scroll-bottom { position: sticky; z-index: 8; right: 20px; bottom: 112px; float: right; display: grid; width: 34px; height: 34px; place-items: center; margin: -46px 20px 12px auto; border: 1px solid var(--line-strong); border-radius: 50%; background: var(--panel); color: var(--text-soft); box-shadow: var(--shadow); }
 .conversation-canvas__messages { width: min(748px, calc(100% - 48px)); min-height: calc(100% - 144px); margin: 0 auto; padding: 24px 0; }

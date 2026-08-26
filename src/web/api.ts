@@ -129,6 +129,7 @@ export interface AinOneApi {
   cancelActiveTurn(conversationId: string): Promise<void>;
   continueConversation(conversationId: string): Promise<void>;
   retryInterruptedTurn(conversationId: string, turnId: string): Promise<void>;
+  restartWorkspace?(): Promise<void>;
   respondToPermission(conversationId: string, requestId: string, decision: "allow_once" | "deny_once"): Promise<void>;
   subscribeConversationEvents(
     conversationId: string,
@@ -522,6 +523,10 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         `/api/conversations/${encodeURIComponent(conversationId)}/turns/${encodeURIComponent(turnId)}/retry`,
         {},
       );
+    },
+
+    async restartWorkspace(): Promise<void> {
+      await postJson("/api/workspace/restart", {});
     },
 
     subscribeConversationEvents(conversationId, afterSequence, onEvent): () => void {

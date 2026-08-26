@@ -132,6 +132,13 @@ export class TraeConnector extends CliJsonlConnector {
     return super.cancelTurn(session, nativeTurnId);
   }
 
+  override async closeSession(session: LiveSession): Promise<void> {
+    if (session.nativeSessionId) {
+      await cancelTraeQueueWait({ home: this.queueHome, sessionId: session.nativeSessionId });
+    }
+    await super.closeSession(session);
+  }
+
   private async watchQueueStatus(session: LiveSession): Promise<void> {
     const runtime = this.asRuntimeSession(session);
     let previous = "";

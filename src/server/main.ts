@@ -310,13 +310,17 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
     await shutdown().catch(() => undefined);
     throw error;
   }
+  let stopPromise: Promise<void> | null = null;
 
   return {
     url: api.url,
     token: config.token,
     async stop() {
-      await api.stop();
-      await shutdown();
+      stopPromise ??= (async () => {
+        await api.stop();
+        await shutdown();
+      })();
+      await stopPromise;
     },
   };
 }

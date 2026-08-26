@@ -63,6 +63,7 @@ export class TurnCoordinator {
   private readonly agentPreparationQueues = new Map<AgentProductId, Promise<void>>();
   private readonly continuationQueues = new Map<string, Promise<void>>();
   private shuttingDown = false;
+  private restartPromise: Promise<void> | null = null;
 
   constructor(options: TurnCoordinatorOptions) {
     this.repositories = options.repositories;
@@ -129,6 +130,7 @@ export class TurnCoordinator {
 
   async enqueueMessage(conversationId: string, content: string): Promise<void> {
     this.repositories.enqueueMessage(conversationId, content);
+    if (this.restartPromise) return;
     await this.tryContinuePending(conversationId);
     const live = this.liveSessions.get(conversationId);
     if (this.repositories.getActiveTurn(conversationId) || live?.reusableLease) return;
@@ -144,7 +146,7 @@ export class TurnCoordinator {
   }
 
   async dispatchNext(conversationId: string): Promise<void> {
-    if (this.shuttingDown) {
+    if (this.shuttingDown || this.restartPromise) {
       return;
     }
 
@@ -447,6 +449,42 @@ export class TurnCoordinator {
     if (!this.repositories.resolveUncertainMessage(conversationId, messageId, action)) return false;
     await this.dispatchNext(conversationId);
     return true;
+  }
+
+  async restartWorkspace(): Promise<void> {
+    if (this.shuttingDown) return;
+    if (this.restartPromise) return this.restartPromise;
+    const restart = async () => {
+      const sessions = [...this.liveSessions.entries()];
+      const results = await Promise.allSettled(
+        sessions.map(([, { connector, session }]) => connector.closeSession(session)),
+      );
+      for (let index = 0; index < sessions.length; index += 1) {
+        const [conversationId, live] = sessions[index]!;
+        if (results[index]?.status === "fulfilled" && this.liveSessions.get(conversationId) === live) {
+          this.liveSessions.delete(conversationId);
+        }
+      }
+      const failed = results.find(
+        (result): result is PromiseRejectedResult => result.status === "rejected",
+      );
+      if (failed) throw failed.reason;
+
+      this.repositories.interruptActiveTurns();
+      if (!this.shuttingDown) {
+        for (const project of this.repositories.listProjects()) {
+          for (const conversation of this.repositories.listConversations(project.id)) {
+            this.repositories.setConversationQueuePaused(conversation.id, false);
+          }
+        }
+      }
+    };
+    this.restartPromise = restart();
+    try {
+      await this.restartPromise;
+    } finally {
+      this.restartPromise = null;
+    }
   }
 
   async shutdown(): Promise<void> {

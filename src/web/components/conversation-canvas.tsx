@@ -77,7 +77,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     conversation.events.filter((event) => event.type !== "user_message" || !conversation.queuedMessages.some((message) => message.id === event.payload.messageId)),
   ) : [], [conversation]);
   const approvals = useMemo(() => conversation ? pendingPermissions(conversation.events) : [], [conversation]);
-  const sendBlocked = turnActive;
+  const sendBlocked = turnActive || submitting;
   const draftUnavailable = Boolean(draft && !(props.availableAgents ?? []).some(isRunnableAgent));
   if (!session) {
     return <section className="conversation-canvas" data-testid="conversation-canvas" aria-label="Conversation Canvas"><div className="workspace-empty">{zh ? "新建一个对话以开始。" : "Create a conversation to start."}</div></section>;
@@ -113,7 +113,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           {flow.map((item) => item.kind === "message" ? (
             <article key={item.event.id} data-message-role={item.event.type === "user_message" ? "user" : "assistant"} className={`conversation-message conversation-message--${item.event.type === "user_message" ? "user" : "assistant"}`}>
               <div className="conversation-message__body"><Markdown options={{ disableParsingRawHTML: true }}>{readString(item.event.payload, "text") ?? ""}</Markdown></div>
-              {item.event.type === "assistant_message" ? <div className="conversation-message__actions"><button type="button" data-tooltip={zh ? "复制输出" : "Copy output"} aria-label={zh ? "复制输出" : "Copy output"} onClick={() => void navigator.clipboard?.writeText(readString(item.event.payload, "text") ?? "")}><CopyIcon /></button>{props.onForkConversation ? <><button type="button" data-tooltip={zh ? "新对话分支" : "Branch conversation"} aria-label={zh ? "新对话分支" : "Branch conversation"} aria-busy={branchingEventId === item.event.id} disabled={branchingEventId !== null} onClick={() => { setBranchingEventId(item.event.id); void props.onForkConversation?.().finally(() => setBranchingEventId(null)); }}><BranchIcon /></button>{branchingEventId === item.event.id ? <span className="conversation-message__progress" role="status">{zh ? "正在创建分支…" : "Creating branch…"}</span> : null}</> : null}</div> : null}
+              <div className="conversation-message__actions"><button type="button" data-tooltip={item.event.type === "user_message" ? (zh ? "复制消息" : "Copy message") : (zh ? "复制输出" : "Copy output")} aria-label={item.event.type === "user_message" ? (zh ? "复制消息" : "Copy message") : (zh ? "复制输出" : "Copy output")} onClick={() => void navigator.clipboard?.writeText(readString(item.event.payload, "text") ?? "")}><CopyIcon /></button>{item.event.type === "user_message" ? <button type="button" data-tooltip={zh ? "重新发送消息" : "Send again"} aria-label={zh ? "重新发送消息" : "Send message again"} disabled={turnActive || submitting} onClick={() => { setSubmitting(true); void props.onQueueMessage(readString(item.event.payload, "text") ?? "").catch(() => undefined).finally(() => setSubmitting(false)); }}><ResendIcon /></button> : props.onForkConversation ? <><button type="button" data-tooltip={zh ? "新对话分支" : "Branch conversation"} aria-label={zh ? "新对话分支" : "Branch conversation"} aria-busy={branchingEventId === item.event.id} disabled={branchingEventId !== null} onClick={() => { setBranchingEventId(item.event.id); void props.onForkConversation?.().finally(() => setBranchingEventId(null)); }}><BranchIcon /></button>{branchingEventId === item.event.id ? <span className="conversation-message__progress" role="status">{zh ? "正在创建分支…" : "Creating branch…"}</span> : null}</> : null}</div>
             </article>
           ) : item.kind === "trajectory" ? (
             <section key={item.id} className="conversation-trajectory" data-open={Boolean(timelineOpen[item.id])}>
@@ -145,7 +145,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
             stopControl={turnActive ? <button type="button" className="composer__stop" onClick={props.onCancelTurn}>{zh ? "停止" : "Stop"}</button> : null}
             value={drafts[conversation?.id ?? `new:${draft!.projectId}`] ?? ""}
             onChange={(value) => { const id = conversation?.id ?? `new:${draft!.projectId}`; setDrafts((current) => ({ ...current, [id]: value })); }}
-            onSubmit={async (content) => { const id = conversation?.id ?? `new:${draft!.projectId}`; const value = drafts[id] ?? ""; setSubmitting(true); try { await props.onQueueMessage(content); setDrafts((current) => current[id] === value ? { ...current, [id]: "" } : current); } finally { setSubmitting(false); } }}
+            onSubmit={async (content) => { const id = conversation?.id ?? `new:${draft!.projectId}`; const value = drafts[id] ?? ""; setDrafts((current) => ({ ...current, [id]: "" })); setSubmitting(true); try { await props.onQueueMessage(content); } catch (error) { setDrafts((current) => current[id] ? current : { ...current, [id]: value }); throw error; } finally { setSubmitting(false); } }}
           />
         </div>
       </div>
@@ -259,5 +259,6 @@ function activeTurnLabel(status: NonNullable<ConversationView["activeTurnStatus"
 }
 function CopyIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><rect x="5.25" y="5.25" width="8" height="8" rx="1.5"/><path d="M10.75 5.25V4.5A1.75 1.75 0 0 0 9 2.75H4.5A1.75 1.75 0 0 0 2.75 4.5V9A1.75 1.75 0 0 0 4.5 10.75h.75"/></svg>; }
 function BranchIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><circle cx="4" cy="3.5" r="1.5"/><circle cx="12" cy="5.5" r="1.5"/><circle cx="4" cy="12.5" r="1.5"/><path d="M4 5v6M5.5 8.8C8 8.8 8 5.5 10.5 5.5"/></svg>; }
+function ResendIcon() { return <svg viewBox="0 0 16 16" aria-hidden="true"><path d="M12.2 5.3A5 5 0 1 0 13 9"/><path d="M12.3 2.8v3.1H9.2"/></svg>; }
 function readString(payload: Record<string, unknown>, key: string): string | null { const value = payload[key]; return typeof value === "string" && value ? value : null; }
 function readErrorMessage(payload: Record<string, unknown>): string | null { const error = payload.error; return error && typeof error === "object" ? readString(error as Record<string, unknown>, "message") : null; }

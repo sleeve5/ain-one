@@ -63,6 +63,11 @@ button, input, select, textarea { color: inherit; font: inherit; }
 button { cursor: pointer; }
 button:disabled { cursor: not-allowed; opacity: 0.55; }
 button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-visible { outline: 2px solid rgb(77 107 254 / 40%); outline-offset: 2px; }
+[data-tooltip] { position: relative; }
+[data-tooltip]::after { position: absolute; z-index: 50; bottom: calc(100% + 7px); left: 50%; max-width: 220px; border: 1px solid var(--line-strong); border-radius: 6px; background: #253143; color: white; padding: 5px 7px; box-shadow: var(--shadow); content: attr(data-tooltip); font-size: 11px; font-weight: 500; line-height: 1.2; opacity: 0; pointer-events: none; transform: translate(-50%, 2px); transition: opacity 100ms ease, transform 100ms ease; white-space: nowrap; }
+[data-tooltip]:hover::after, [data-tooltip]:focus-visible::after { opacity: 1; transform: translate(-50%, 0); }
+[data-tooltip-side="bottom"]::after { top: calc(100% + 7px); right: 0; bottom: auto; left: auto; transform: translateY(-2px); }
+[data-tooltip-side="bottom"]:hover::after, [data-tooltip-side="bottom"]:focus-visible::after { transform: translateY(0); }
 .composer__input:focus-visible { outline: 0; }
 
 .workspace { height: 100vh; overflow: hidden; background: var(--panel); }
@@ -251,11 +256,11 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .trajectory-canvas__ledger tr[data-turn-start="true"] td { border-top: 2px solid var(--line); }
 .trajectory-row__rail { position: absolute; inset: -1px auto -1px 0; width: 2px; background: color-mix(in srgb, var(--accent) 22%, var(--panel)); }
 .trajectory-row__turn { position: absolute; top: 0; left: 0; padding: 1px 5px; border-radius: 0 0 2px; background: var(--subtle); color: var(--text-muted); font: 8px/10px var(--mono); }
-.trajectory-row__tag { display: inline-flex; height: 19px; align-items: center; padding: 0 5px; border-radius: 4px; background: var(--subtle); color: var(--text-soft); font-size: 10px; font-weight: 700; letter-spacing: .035em; }
-.trajectory-row__tag--user { color: #3157ca; background: #e9efff; }
-.trajectory-row__tag--assistant, .trajectory-row__tag--reasoning { color: #7255c5; background: #f1edff; }
-.trajectory-row__tag--tool, .trajectory-row__tag--file { color: #8a610d; background: #fff3d2; }.trajectory-row__tag--shell { color: #087968; background: #dcf6f0; }
-.trajectory-row__tag--warning { color: #b74a18; background: #ffeadc; }.trajectory-row__tag--status { color: #596273; background: #eef1f6; }
+.trajectory-row__tag { --tag-color: var(--text-soft); --tag-background: var(--subtle); display: inline-flex; height: 19px; align-items: center; padding: 0 5px; border-radius: 4px; background: var(--tag-background); color: var(--tag-color); font-size: 10px; font-weight: 700; letter-spacing: .035em; }
+.trajectory-row__tag--user { --tag-color: #3157ca; --tag-background: #e9efff; }
+.trajectory-row__tag--assistant, .trajectory-row__tag--reasoning { --tag-color: #7255c5; --tag-background: #f1edff; }
+.trajectory-row__tag--tool, .trajectory-row__tag--file { --tag-color: #8a610d; --tag-background: #fff3d2; }.trajectory-row__tag--shell { --tag-color: #087968; --tag-background: #dcf6f0; }
+.trajectory-row__tag--warning { --tag-color: #b74a18; --tag-background: #ffeadc; }.trajectory-row__tag--status { --tag-color: #596273; --tag-background: #eef1f6; }
 .trajectory-canvas__ledger tr[data-error="true"] .trajectory-row__rail { background: #d54941; }
 .trajectory-canvas__ledger td:nth-child(2) { padding-right: 154px; padding-left: 4px; }
 .trajectory-canvas__ledger td:nth-child(2) > span { display: block; overflow: hidden; text-overflow: ellipsis; }
@@ -267,6 +272,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .trajectory-details__resize:focus-visible, .trajectory-details__resize:hover { background: color-mix(in srgb, var(--accent) 42%, transparent); outline: 0; }
 .trajectory-details > header { display: flex; height: 38px; align-items: center; justify-content: space-between; padding: 0 10px 0 12px; border-bottom: 1px solid var(--line); }
 .trajectory-details > header div { display: flex; min-width: 0; gap: 8px; } .trajectory-details > header span { overflow: hidden; color: var(--text-muted); text-overflow: ellipsis; white-space: nowrap; }
+.trajectory-details > header .trajectory-row__tag { color: var(--tag-color); background: var(--tag-background); }
 .trajectory-details > header button { width: 24px; height: 24px; border: 0; border-radius: 4px; background: transparent; color: var(--text-muted); font-size: 18px; }
 .trajectory-details__tabs { display: flex; height: 32px; padding: 0 8px; border-bottom: 1px solid var(--line); gap: 8px; }
 .trajectory-details__tabs button { border: 0; border-bottom: 2px solid transparent; background: transparent; color: var(--text-muted); font-size: 11px; }

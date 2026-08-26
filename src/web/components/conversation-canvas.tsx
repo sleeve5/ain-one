@@ -85,7 +85,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
 
   const leadingControls = (
     <div className="composer-selectors composer-selectors--leading" ref={selectorRef}>
-      <button type="button" className="composer__attach" disabled title={zh ? "当前版本暂不支持附件" : "Attachments are not supported in this version"} aria-label={zh ? "添加附件（当前版本暂不支持）" : "Add attachment (not supported in this version)"}>+</button>
+      <button type="button" className="composer__attach" disabled data-tooltip={zh ? "当前版本暂不支持附件" : "Attachments are not supported in this version"} aria-label={zh ? "添加附件（当前版本暂不支持）" : "Add attachment (not supported in this version)"}>+</button>
       <div className="permission-selector">
         <button type="button" aria-label="Permission mode" aria-haspopup="menu" aria-expanded={openSelector === "permission" && !turnActive} disabled={turnActive} onClick={() => setOpenSelector((value) => value === "permission" ? null : "permission")}><PermissionIcon /><span className="selector-value">{permissionLabel(session.permissionMode, zh)}</span><SelectorChevron /></button>
         {openSelector === "permission" && !turnActive ? <div role="menu" className="composer-popover">{session.availablePermissionModes.map((mode) => <button key={mode} type="button" role="menuitemradio" aria-checked={session.permissionMode === mode} onClick={() => { props.onChangePermissionMode(mode); setOpenSelector(null); }}>{permissionLabel(mode, zh)}</button>)}</div> : null}
@@ -113,14 +113,14 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           {flow.map((item) => item.kind === "message" ? (
             <article key={item.event.id} data-message-role={item.event.type === "user_message" ? "user" : "assistant"} className={`conversation-message conversation-message--${item.event.type === "user_message" ? "user" : "assistant"}`}>
               <div className="conversation-message__body"><Markdown options={{ disableParsingRawHTML: true }}>{readString(item.event.payload, "text") ?? ""}</Markdown></div>
-              {item.event.type === "assistant_message" ? <div className="conversation-message__actions"><button type="button" aria-label={zh ? "复制输出" : "Copy output"} onClick={() => void navigator.clipboard?.writeText(readString(item.event.payload, "text") ?? "")}><CopyIcon /></button>{props.onForkConversation ? <><button type="button" aria-label={zh ? "新对话分支" : "Branch conversation"} aria-busy={branchingEventId === item.event.id} disabled={branchingEventId !== null} onClick={() => { setBranchingEventId(item.event.id); void props.onForkConversation?.().finally(() => setBranchingEventId(null)); }}><BranchIcon /></button>{branchingEventId === item.event.id ? <span className="conversation-message__progress" role="status">{zh ? "正在创建分支…" : "Creating branch…"}</span> : null}</> : null}</div> : null}
+              {item.event.type === "assistant_message" ? <div className="conversation-message__actions"><button type="button" data-tooltip={zh ? "复制输出" : "Copy output"} aria-label={zh ? "复制输出" : "Copy output"} onClick={() => void navigator.clipboard?.writeText(readString(item.event.payload, "text") ?? "")}><CopyIcon /></button>{props.onForkConversation ? <><button type="button" data-tooltip={zh ? "新对话分支" : "Branch conversation"} aria-label={zh ? "新对话分支" : "Branch conversation"} aria-busy={branchingEventId === item.event.id} disabled={branchingEventId !== null} onClick={() => { setBranchingEventId(item.event.id); void props.onForkConversation?.().finally(() => setBranchingEventId(null)); }}><BranchIcon /></button>{branchingEventId === item.event.id ? <span className="conversation-message__progress" role="status">{zh ? "正在创建分支…" : "Creating branch…"}</span> : null}</> : null}</div> : null}
             </article>
           ) : item.kind === "trajectory" ? (
             <section key={item.id} className="conversation-trajectory" data-open={Boolean(timelineOpen[item.id])}>
               <button type="button" className="conversation-trajectory__toggle" aria-label={(timelineOpen[item.id] ? (zh ? "收起执行轨迹" : "Collapse activity") : (zh ? "展开执行轨迹" : "Expand activity"))} onClick={() => setTimelineOpen((current) => ({ ...current, [item.id]: !current[item.id] }))}><span>⌁</span><strong>{zh ? "执行轨迹" : "Activity"}</strong><span className="conversation-trajectory__state">{zh ? `${item.events.length} 个步骤` : `${item.events.length} steps`}</span><span className="conversation-trajectory__chevron"><svg viewBox="0 0 16 16" aria-hidden="true"><path d="m4.5 6 3.5 3.5L11.5 6" /></svg></span></button>
               {timelineOpen[item.id] ? <ul>{item.events.map((event) => <li key={event.id} data-severity={eventSeverity(event)}><span className="conversation-canvas__event-dot"/><code>{eventLabel(event.type, zh)}</code><div className="conversation-trajectory__detail"><Markdown options={{ disableParsingRawHTML: true }}>{describeEvent(event, zh)}</Markdown></div></li>)}</ul> : null}
             </section>
-          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh)}</span>{turnError(item.event, zh) ? <strong>{turnError(item.event, zh)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time></div>)}
+          ) : <div key={item.event.id} className="conversation-turn-footer"><span>{turnStatusLabel(item.event, zh, item.completedByFinalOutput)}</span>{turnError(item.event, zh) ? <strong>{turnError(item.event, zh)}</strong> : null}<time dateTime={item.event.createdAt}>{formatEventTime(item.event.createdAt, props.language)}</time></div>)}
           {approvals.map((event) => {
             const requestId = readString(event.payload, "requestId");
             if (!requestId || !props.onRespondToPermission) return null;
@@ -156,15 +156,18 @@ function isRunnableAgent(agent: AgentSettingsView): boolean { return agent.enabl
 function SelectorChevron() { return <span className="selector-chevron" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m4.25 9.5 3.75-4 3.75 4" /></svg></span>; }
 function PermissionIcon() { return <span className="permission-selector__icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M8 2.25 12.5 4v3.45c0 2.75-1.7 4.9-4.5 6.3-2.8-1.4-4.5-3.55-4.5-6.3V4L8 2.25Z"/><path d="m6.1 7.8 1.2 1.2 2.7-2.75"/></svg></span>; }
 
-type FlowItem = { kind: "message"; event: NormalizedEvent } | { kind: "trajectory"; id: string; events: NormalizedEvent[] } | { kind: "footer"; event: NormalizedEvent };
+type FlowItem = { kind: "message"; event: NormalizedEvent } | { kind: "trajectory"; id: string; events: NormalizedEvent[] } | { kind: "footer"; event: NormalizedEvent; completedByFinalOutput: boolean };
 function buildFlow(events: NormalizedEvent[]): FlowItem[] {
-  const flow: FlowItem[] = []; let activity: NormalizedEvent[] = [];
+  const flow: FlowItem[] = []; let activity: NormalizedEvent[] = []; let finalAssistantOutput = false;
   const flush = () => { if (activity.length) { const merged = mergeActivityEvents(activity); flow.push({ kind: "trajectory", id: `activity-${activity[0]!.id}`, events: merged }); activity = []; } };
   for (const event of events) {
-    if (event.type === "user_message") { flush(); flow.push({ kind: "message", event }); }
-    else if (event.type === "assistant_message") { flush(); flow.push({ kind: "message", event }); }
-    else if (event.type === "turn_status" && isTerminalStatus(event.payload.status)) { flush(); flow.push({ kind: "footer", event }); }
-    else if (event.type !== "turn_status" && event.type !== "queue_status" && !(event.type === "permission" && readString(event.payload, "requestId"))) activity.push(event);
+    if (event.type === "user_message") { flush(); finalAssistantOutput = false; flow.push({ kind: "message", event }); }
+    else if (event.type === "assistant_message") { flush(); finalAssistantOutput = event.payload.final === true; flow.push({ kind: "message", event }); }
+    else if (event.type === "turn_status" && isTerminalStatus(event.payload.status)) { flush(); flow.push({ kind: "footer", event, completedByFinalOutput: finalAssistantOutput && !readErrorMessage(event.payload) }); }
+    else {
+      if (event.type === "reasoning" || event.type === "tool" || event.type === "shell" || event.type === "file" || event.type === "permission" || event.type === "warning") finalAssistantOutput = false;
+      if (event.type !== "turn_status" && event.type !== "queue_status" && !(event.type === "permission" && readString(event.payload, "requestId"))) activity.push(event);
+    }
   }
   flush(); return flow;
 }
@@ -233,9 +236,9 @@ function formatPayloadValue(value: unknown): string {
   return text.length > 500 ? `${text.slice(0, 497)}…` : text;
 }
 function isTerminalStatus(status: unknown): boolean { return typeof status === "string" && ["completed", "cancelled", "start_failed", "failed", "interrupted", "cancel_failed"].includes(status); }
-function turnStatusLabel(event: NormalizedEvent, zh: boolean): string {
+function turnStatusLabel(event: NormalizedEvent, zh: boolean, completedByFinalOutput = false): string {
   const status = readString(event.payload, "status") ?? "completed";
-  if (status === "completed") return zh ? "已完成" : "Completed";
+  if (status === "completed" || completedByFinalOutput) return zh ? "已完成" : "Completed";
   if (status === "cancelled") return zh ? "已停止" : "Stopped";
   return `${zh ? "结束" : "Ended"}: ${status}`;
 }

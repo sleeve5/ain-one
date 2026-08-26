@@ -162,13 +162,11 @@ export class TraeConnector extends CliJsonlConnector {
     const args = runtime.nativeSessionId
       ? ["exec", "resume", runtime.nativeSessionId, "--json"]
       : ["exec", "--json"];
-    args.push("--skip-git-repo-check");
+    args.push("--skip-git-repo-check", "-c", "plugins.trae-queue@local.enabled=false");
     if (input.snapshot.autoQueue) {
       const hook = fileURLToPath(new URL("./trae-queue-hook.mjs", import.meta.url));
       const hookCommand = `${process.execPath} ${hook} ${this.queueLeases.get(session)}`;
       args.push(
-        "-c",
-        "plugins.trae-queue@local.enabled=false",
         "-c",
         `hooks.Stop=[{hooks=[{type="command",command=${JSON.stringify(hookCommand)},timeout="5h5m",statusMessage="等待用户新输入中"}]}]`,
         "-c",

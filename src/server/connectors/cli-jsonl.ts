@@ -87,6 +87,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
     let stderrBytes = 0;
     let cancelled = false;
     let closing = false;
+    let finalAssistantOutput = false;
     let killTimer: NodeJS.Timeout | null = null;
     let abortError: TurnError | null = null;
     let nativeTerminal: { status: TerminalTurnStatus; error?: TurnError } | null = null;
@@ -259,6 +260,8 @@ export abstract class CliJsonlConnector extends BaseConnector {
       turnId: input.turn.turnId,
       emit: async (event) => {
         await this.emitEvent(input.session, event);
+        if (event.type === "assistant_message") finalAssistantOutput = event.payload.final === true;
+        else if (event.type === "reasoning" || event.type === "tool" || event.type === "shell" || event.type === "file" || event.type === "permission" || event.type === "warning") finalAssistantOutput = false;
       },
       setNativeSessionId: async (nextNativeSessionId) => {
         try {
@@ -413,7 +416,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
         }
 
         if (closing) {
-          await finalize("interrupted");
+          await finalize(finalAssistantOutput ? "completed" : "interrupted");
           return;
         }
 

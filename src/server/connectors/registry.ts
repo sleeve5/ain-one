@@ -7,7 +7,7 @@ import { createOfficialOpenCodeSdkAdapter } from "./opencode-sdk.js";
 import { TraeConnector } from "./trae.js";
 
 export interface ConnectorRegistryOptions {
-  codex?: BaseConnectorOptions;
+  codex?: BaseConnectorOptions & { useAppServer?: boolean };
   claude?: BaseConnectorOptions;
   trae?: BaseConnectorOptions;
   opencode?: OpenCodeConnectorOptions;

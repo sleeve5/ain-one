@@ -7,7 +7,11 @@ import type { AgentConnector, AgentProductId } from "../shared/contracts.js";
 import { createServerConfig, type ServerConfig } from "./config.js";
 import { createConnectorRegistry } from "./connectors/registry.js";
 import { createDatabase } from "./db.js";
-import { createProjectFilesService, pickProjectDirectory } from "./files.js";
+import { createProjectFilesService, pickLocalPath, pickProjectDirectory } from "./files.js";
+import { createGraphRepository } from "./graph-repository.js";
+import { GraphRuntime } from "./graph-runtime.js";
+import { discoverNativeMcpDefinitions } from "./mcp-discovery.js";
+import { discoverNativeSkillRoots } from "./skill-discovery.js";
 import {
   createPluginHub,
   type InstallLocalInput,
@@ -25,6 +29,7 @@ export interface RunningServer {
 export interface StartServerOptions extends Partial<ServerConfig> {
   connectors?: Partial<Record<AgentProductId, AgentConnector>>;
   pluginHub?: PluginHub;
+  discoverLocalPlugins?: boolean;
   allowedOrigins?: string[];
 }
 
@@ -34,23 +39,52 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
 
   const database = createDatabase(config.sqlitePath);
   const repositories = createRepositories(database);
+  const graphRepository = createGraphRepository(database);
   const executablePaths = repositories.getAgentExecutablePaths();
   const connectors: Partial<Record<AgentProductId, AgentConnector>> =
     overrides.connectors ?? createConnectorRegistry({
-      codex: { executable: executablePaths.codex },
+      codex: { executable: executablePaths.codex, useAppServer: true },
       claude: { executable: executablePaths.claude },
       trae: { executable: executablePaths.trae },
       opencode: { executable: executablePaths.opencode },
     });
+  const discoverLocalPlugins = overrides.discoverLocalPlugins ?? true;
   const pluginHub = overrides.pluginHub ?? createPluginHub({
     dataDir: config.dataDir,
-    skillRoots: {
+    skillRoots: discoverLocalPlugins ? {
       codex: join(homedir(), ".codex", "skills"),
       claude: join(homedir(), ".claude", "skills"),
       trae: join(homedir(), ".trae", "skills"),
       opencode: join(homedir(), ".config", "opencode", "skills"),
-    },
+    } : {},
+    discoverSkillRoots: discoverLocalPlugins ? () => discoverNativeSkillRoots({
+      codexExecutable: executablePaths.codex ?? "codex",
+    }) : undefined,
+    discoverMcpDefinitions: discoverLocalPlugins ? () => discoverNativeMcpDefinitions({
+      dataDir: config.dataDir,
+      executables: {
+        codex: executablePaths.codex ?? "codex",
+        trae: executablePaths.trae ?? "traecli",
+      },
+    }) : undefined,
   });
+  const importLocalPlugins = async () => {
+    const before = new Set(pluginHub.listInstalled().map(pluginVersionKey));
+    const plugins = await pluginHub.importConfiguredRoots();
+    const globalScope = { type: "global" } as const;
+    const firstImport = !repositories.isPluginScopeConfigured(globalScope);
+    const added = plugins.filter((plugin) =>
+      plugin.compatibleAgents.length > 0 && (firstImport || !before.has(pluginVersionKey(plugin))),
+    );
+    if (added.length > 0) {
+      const enabled = new Map(
+        repositories.listPluginEnablements(globalScope).map((plugin) => [plugin.pluginId, plugin]),
+      );
+      for (const plugin of added) enabled.set(plugin.pluginId, plugin);
+      repositories.setPluginEnablements(globalScope, [...enabled.values()]);
+    }
+    return plugins;
+  };
   const resolvePluginVersions = (input: {
     projectId: string;
     conversationId: string;
@@ -67,10 +101,20 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       return pluginHub.materialize(agentProductId, plugins, { turnId });
     },
   });
+  const graphRuntime = new GraphRuntime({
+    repository: graphRepository,
+    connectors,
+    projectPath: (graphId) => {
+      const graph = graphRepository.getGraph(graphId);
+      const project = graph ? repositories.getProject(graph.projectId) : null;
+      if (!project) throw new Error("Graph project not found");
+      return project.path;
+    },
+  });
 
   const shutdown = async (): Promise<void> => {
     try {
-      await turnCoordinator.shutdown();
+      await Promise.all([turnCoordinator.shutdown(), graphRuntime.shutdown()]);
     } finally {
       database.close();
     }
@@ -79,7 +123,8 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
   try {
     await turnCoordinator.recoverInterruptedTurns();
     await turnCoordinator.recoverPendingQueues();
-    await pluginHub.scanConfiguredRoots();
+    graphRepository.interruptActiveRuns();
+    await importLocalPlugins();
   } catch (error) {
     await shutdown().catch(() => undefined);
     throw error;
@@ -91,6 +136,8 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
     token: config.token,
     repositories,
     turnCoordinator,
+    graphRepository,
+    graphRuntime,
     resolvePluginVersions,
     validatePluginVersions: (scope, pluginVersions) => {
       const installed = new Map(
@@ -132,6 +179,7 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
     },
     files: createProjectFilesService(),
     pickProjectDirectory,
+    pickLocalPath: (kind, purpose) => pickLocalPath(kind, purpose),
     allowedOrigins: [
       `http://127.0.0.1:${config.port}`,
       `http://localhost:${config.port}`,
@@ -147,15 +195,20 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
             agentProductId: id,
             executablePath: executablePathOverride ?? defaultExecutable(id),
             executablePathOverride,
+            enabled: repositories.isAgentEnabled(id),
             probe: await connector.probe(),
           };
         }),
       ),
     updateAgentSettings: overrides.connectors
       ? undefined
-      : async ({ agentProductId, executablePath }) => {
+      : async ({ agentProductId, executablePath, enabled }) => {
+          if (executablePath === undefined) {
+            repositories.setAgentEnabled(agentProductId, enabled ?? true);
+            return "updated";
+          }
           const registry = createConnectorRegistry({
-            [agentProductId]: { executable: executablePath ?? undefined },
+            [agentProductId]: { executable: executablePath ?? undefined, ...(agentProductId === "codex" ? { useAppServer: true } : {}) },
           });
           const connector = registry[agentProductId];
           const probe = await connector.probe();
@@ -176,6 +229,7 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
             return result;
           }
           repositories.setAgentExecutablePath(agentProductId, executablePath);
+          repositories.setAgentEnabled(agentProductId, enabled ?? true);
           return "updated";
         },
     catalogProvider: async ({ agentProductId, projectPath }) => {
@@ -200,11 +254,21 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
         const sourcePath = readRequiredString(input, "path");
         const compatibility = readCompatibility(input.compatibility);
         const plugin = await pluginHub.installLocal({ path: sourcePath, compatibility });
+        const installed = pluginHub.listInstalled().find(
+          (item) => pluginVersionKey(item) === pluginVersionKey(plugin),
+        );
+        if (installed?.compatibleAgents.length) {
+          const enabled = new Map(
+            repositories.listPluginEnablements({ type: "global" }).map((item) => [item.pluginId, item]),
+          );
+          enabled.set(plugin.pluginId, plugin);
+          repositories.setPluginEnablements({ type: "global" }, [...enabled.values()]);
+        }
         return { status: 201, body: { plugin } };
       }
       if (method === "POST" && path === "/api/plugins/scan") {
-        const candidates = await pluginHub.scanConfiguredRoots();
-        return { status: 200, body: { candidates } };
+        const plugins = await importLocalPlugins();
+        return { status: 200, body: { plugins, candidates: pluginHub.listCandidates() } };
       }
       const acceptMatch = /^\/api\/plugins\/candidates\/([^/]+)\/accept$/.exec(path);
       if (method === "POST" && acceptMatch) {
@@ -259,6 +323,10 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
 
 function defaultExecutable(agentProductId: AgentProductId): string {
   return agentProductId === "trae" ? "traecli" : agentProductId;
+}
+
+function pluginVersionKey(plugin: { pluginId: string; versionId: string }): string {
+  return `${plugin.pluginId}\0${plugin.versionId}`;
 }
 
 function readObject(value: unknown, message: string): Record<string, unknown> {

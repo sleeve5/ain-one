@@ -191,14 +191,26 @@ export function createProjectFilesService(options: FilesServiceOptions = {}): Pr
   };
 }
 
-export async function pickProjectDirectory(spawn: GitRunner = defaultSpawn): Promise<string | null> {
+export async function pickLocalPath(
+  kind: "directory" | "file",
+  purpose: "project" | "plugin" | "agent",
+  spawn: GitRunner = defaultSpawn,
+): Promise<string | null> {
+  const noun = kind === "directory" ? "folder" : "file";
+  const prompt = purpose === "project"
+    ? "Choose an Ain One project folder"
+    : purpose === "plugin"
+      ? `Choose an Ain One plugin ${noun}`
+      : "Choose an Agent executable";
   const child = spawn(
     "osascript",
     [
       "-e",
+      "activate",
+      "-e",
       "try",
       "-e",
-      'POSIX path of (choose folder with prompt "Choose an Ain One project folder")',
+      `POSIX path of (choose ${kind === "directory" ? "folder" : "file"} with prompt ${JSON.stringify(prompt)})`,
       "-e",
       "on error number -128",
       "-e",
@@ -226,6 +238,10 @@ export async function pickProjectDirectory(spawn: GitRunner = defaultSpawn): Pro
   }
 
   return Buffer.concat(stdout).toString("utf8").trim() || null;
+}
+
+export async function pickProjectDirectory(spawn: GitRunner = defaultSpawn): Promise<string | null> {
+  return pickLocalPath("directory", "project", spawn);
 }
 
 interface ResolvedPath {

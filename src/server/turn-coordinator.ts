@@ -1,8 +1,10 @@
+import { randomUUID } from "node:crypto";
 import type {
   AgentConnector,
   AgentProductId,
   LiveSession,
   NormalizedError,
+  PermissionDecision,
   PluginVersion,
   TerminalTurnStatus,
   TurnSnapshot,
@@ -56,9 +58,10 @@ export class TurnCoordinator {
   private readonly materializePlugins?: TurnCoordinatorOptions["materializePlugins"];
   private readonly liveSessions = new Map<
     string,
-    { connector: AgentConnector; session: LiveSession }
+    { connector: AgentConnector; session: LiveSession; ownerTurnId: string; reusableLease: boolean }
   >();
   private readonly agentPreparationQueues = new Map<AgentProductId, Promise<void>>();
+  private readonly continuationQueues = new Map<string, Promise<void>>();
   private shuttingDown = false;
 
   constructor(options: TurnCoordinatorOptions) {
@@ -126,6 +129,9 @@ export class TurnCoordinator {
 
   async enqueueMessage(conversationId: string, content: string): Promise<void> {
     this.repositories.enqueueMessage(conversationId, content);
+    await this.tryContinuePending(conversationId);
+    const live = this.liveSessions.get(conversationId);
+    if (this.repositories.getActiveTurn(conversationId) || live?.reusableLease) return;
     try {
       await this.dispatchNext(conversationId);
     } catch (error) {
@@ -161,6 +167,9 @@ export class TurnCoordinator {
   private async prepareTurn(conversationId: string): Promise<PreparedTurn | null> {
     const conversation = this.repositories.getConversation(conversationId);
     if (!conversation || conversation.queuePaused) {
+      return null;
+    }
+    if (!this.repositories.isAgentEnabled(conversation.agentProductId)) {
       return null;
     }
 
@@ -243,20 +252,54 @@ export class TurnCoordinator {
   private async startPreparedTurn(prepared: PreparedTurn): Promise<void> {
     let session: LiveSession;
     try {
-      const sessionRecord = this.repositories.getNativeSession(prepared.conversationId);
-      session = await prepared.connector.createOrResumeSession({
-        projectPath: prepared.projectPath,
-        conversationId: prepared.conversationId,
-        nativeSessionId: sessionRecord?.nativeSessionId ?? null,
-        onEvent: async (event) => {
+      const existing = this.liveSessions.get(prepared.conversationId);
+      if (existing?.connector === prepared.connector && existing.reusableLease) {
+        session = existing.session;
+        existing.ownerTurnId = prepared.turnId;
+        existing.reusableLease = false;
+      } else {
+        const sessionRecord = this.repositories.getNativeSession(prepared.conversationId);
+        session = await prepared.connector.createOrResumeSession({
+          projectPath: prepared.projectPath,
+          conversationId: prepared.conversationId,
+          nativeSessionId: sessionRecord?.nativeSessionId ?? null,
+          onEvent: async (event) => {
           this.repositories.appendEvent(prepared.conversationId, event);
-        },
-        onNativeSessionId: async (nativeSessionId) => {
-          this.repositories.upsertNativeSession(prepared.conversationId, nativeSessionId);
-        },
-      });
-      this.repositories.upsertNativeSession(prepared.conversationId, session.nativeSessionId);
-      this.liveSessions.set(prepared.conversationId, { connector: prepared.connector, session });
+          const currentLive = this.liveSessions.get(prepared.conversationId);
+          if (event.type === "queue_status" && currentLive?.session === session) {
+            currentLive.reusableLease = event.payload.status !== "inactive";
+          }
+          const acknowledged = readAcknowledgement(event.payload);
+          if (event.type === "queue_status" && acknowledged) {
+            const conversation = this.repositories.getConversation(prepared.conversationId);
+            if (conversation) this.repositories.acknowledgeMessageDelivery(
+              prepared.conversationId, acknowledged.messageId, acknowledged.deliveryId, {
+                modelId: conversation.modelId, permissionMode: conversation.permissionMode,
+                pluginVersions: this.resolvePluginVersions({ projectId: conversation.projectId, conversationId: conversation.id, agentProductId: conversation.agentProductId }),
+                autoQueue: true,
+              },
+            );
+          }
+          if (event.type === "queue_status" && event.payload.status === "waiting" && event.payload.hasPendingInput === false) {
+            this.repositories.completeActiveTurnAtSafePoint(prepared.conversationId);
+          }
+          if (
+            event.type === "queue_status"
+            && event.payload.acceptingInput === true
+            && event.payload.hasPendingInput === false
+          ) {
+            await this.tryContinuePending(prepared.conversationId);
+          }
+          },
+          onNativeSessionId: async (nativeSessionId) => {
+            this.repositories.upsertNativeSession(prepared.conversationId, nativeSessionId);
+          },
+        });
+        this.repositories.upsertNativeSession(prepared.conversationId, session.nativeSessionId);
+        this.liveSessions.set(prepared.conversationId, {
+          connector: prepared.connector, session, ownerTurnId: prepared.turnId, reusableLease: false,
+        });
+      }
     } catch (error) {
       const normalized = normalizeError(error);
       if (isDefinitePreStartFailure(error)) {
@@ -325,7 +368,9 @@ export class TurnCoordinator {
       throw new Error(`No connector registered for ${conversation.agentProductId}`);
     }
 
-    this.repositories.markTurnCancelling(activeTurn.id);
+    if (!this.repositories.markTurnCancelling(activeTurn.id)) {
+      return false;
+    }
 
     const session =
       this.liveSessions.get(conversationId)?.session ?? {
@@ -359,6 +404,17 @@ export class TurnCoordinator {
     return true;
   }
 
+  async respondToPermission(
+    conversationId: string,
+    requestId: string,
+    decision: PermissionDecision,
+  ): Promise<boolean> {
+    const live = this.liveSessions.get(conversationId);
+    if (!live || !this.repositories.getActiveTurn(conversationId)) return false;
+    await live.connector.respondToPermission(live.session, requestId, decision);
+    return true;
+  }
+
   async continueConversation(conversationId: string): Promise<boolean> {
     const conversation = this.repositories.getConversation(conversationId);
     if (!conversation) {
@@ -383,13 +439,28 @@ export class TurnCoordinator {
     return true;
   }
 
+  async resolveUncertainDelivery(
+    conversationId: string,
+    messageId: string,
+    action: "retry" | "accept",
+  ): Promise<boolean> {
+    if (!this.repositories.resolveUncertainMessage(conversationId, messageId, action)) return false;
+    await this.dispatchNext(conversationId);
+    return true;
+  }
+
   async shutdown(): Promise<void> {
     this.shuttingDown = true;
-    const sessions = [...this.liveSessions.values()];
-    this.liveSessions.clear();
+    const sessions = [...this.liveSessions.entries()];
     const results = await Promise.allSettled(
-      sessions.map(({ connector, session }) => connector.closeSession(session)),
+      sessions.map(([, { connector, session }]) => connector.closeSession(session)),
     );
+    for (let index = 0; index < sessions.length; index += 1) {
+      const [conversationId, live] = sessions[index]!;
+      if (results[index]?.status === "fulfilled" && this.liveSessions.get(conversationId) === live) {
+        this.liveSessions.delete(conversationId);
+      }
+    }
     const failed = results.find(
       (result): result is PromiseRejectedResult => result.status === "rejected",
     );
@@ -399,11 +470,6 @@ export class TurnCoordinator {
   }
 
   async recoverInterruptedTurns(): Promise<number> {
-    const affectedConversationIds = this.repositories.listConversationIdsWithActiveTurns();
-    if (affectedConversationIds.length === 0) {
-      return 0;
-    }
-
     return this.repositories.interruptActiveTurns();
   }
 
@@ -431,8 +497,16 @@ export class TurnCoordinator {
     error?: NormalizedError;
   }): Promise<void> {
     const { conversationId, status } = input;
-    const result = await this.commitTerminalWithRetry(input);
-    if (result === "stale") {
+    const live = this.liveSessions.get(conversationId);
+    let result = await this.commitTerminalWithRetry(input);
+    const releasedLease = result === "stale" && live?.ownerTurnId === input.turnId;
+    if (releasedLease) {
+      this.liveSessions.delete(conversationId);
+      const active = this.repositories.getActiveTurn(conversationId);
+      if (active) result = await this.commitTerminalWithRetry({ ...input, turnId: active.id });
+      this.repositories.markConversationStagedMessageUncertain(conversationId);
+    }
+    if (result === "stale" && !releasedLease) {
       return;
     }
 
@@ -510,6 +584,41 @@ export class TurnCoordinator {
       },
     });
   }
+
+  private async tryContinuePending(conversationId: string): Promise<void> {
+    const previous = this.continuationQueues.get(conversationId) ?? Promise.resolve();
+    const current = previous.catch(() => undefined).then(async () => {
+      const activeTurn = this.repositories.getActiveTurn(conversationId);
+      const live = this.liveSessions.get(conversationId);
+      const message = this.repositories.listQueuedMessages(conversationId)[0];
+      if (!live?.reusableLease || !live.connector.continueTurn || !message || message.status !== "pending") return;
+      const deliveryId = randomUUID();
+      const staged = this.repositories.stageMessage(conversationId, message.id, deliveryId);
+      if (!staged) return;
+      try {
+        if (!await live.connector.continueTurn(live.session, { messageId: message.id, deliveryId, content: message.content })) {
+          this.repositories.rollbackStagedMessage(conversationId, message.id, deliveryId);
+        }
+      } catch {
+        this.repositories.rollbackStagedMessage(conversationId, message.id, deliveryId);
+      }
+    });
+    this.continuationQueues.set(conversationId, current);
+    try {
+      await current;
+    } finally {
+      if (this.continuationQueues.get(conversationId) === current) {
+        this.continuationQueues.delete(conversationId);
+      }
+    }
+  }
+}
+
+function readAcknowledgement(payload: Record<string, unknown>): { messageId: string; deliveryId: string } | null {
+  const value = payload.acknowledged;
+  if (!value || typeof value !== "object") return null;
+  const { messageId, deliveryId } = value as Record<string, unknown>;
+  return typeof messageId === "string" && typeof deliveryId === "string" ? { messageId, deliveryId } : null;
 }
 
 function normalizeError(error: unknown): NormalizedError {

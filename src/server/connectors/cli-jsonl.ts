@@ -13,6 +13,7 @@ type TurnError = { code: string; message: string; details?: Record<string, unkno
 const MAX_STDOUT_RECORD_BYTES = 1024 * 1024;
 
 export interface JsonlEventContext {
+  readonly turnId: string | undefined;
   emit(event: ConnectorEvent): Promise<void>;
   setNativeSessionId(nativeSessionId: string | null): Promise<void>;
   setNativeTurnId(nativeTurnId: string | null): void;
@@ -252,6 +253,7 @@ export abstract class CliJsonlConnector extends BaseConnector {
     let processing = Promise.resolve();
 
     const context: JsonlEventContext = {
+      turnId: input.turn.turnId,
       emit: async (event) => {
         await this.emitEvent(input.session, event);
       },
@@ -361,6 +363,13 @@ export abstract class CliJsonlConnector extends BaseConnector {
       const portion = sanitized.slice(0, remaining);
       stderrText += portion;
       stderrBytes += Buffer.byteLength(portion);
+    });
+
+    child.stdin?.on("error", (error) => {
+      abortTurn({
+        code: "stdin_write_failed",
+        message: error instanceof Error ? error.message : "Failed to write to child process",
+      });
     });
 
     child.once("error", (error) => {
@@ -572,6 +581,18 @@ async function mapCommonEvent(event: unknown, context: JsonlEventContext): Promi
     return;
   }
 
+  if (type === "item.updated" || type === "item.delta") {
+    const item = objectValue(record.item);
+    const delta = objectValue(record.delta);
+    const itemType = item ? stringValue(item.type) : null;
+    const text = stringValue(delta?.text) ?? stringValue(record.text);
+    const itemId = stringValue(item?.id) ?? stringValue(record.item_id) ?? stringValue(record.itemId);
+    if (itemType === "agent_message" && text && itemId) {
+      await context.emit({ type: "assistant_message", payload: { text, role: "assistant", streamId: itemId, delta: true } });
+      return;
+    }
+  }
+
   if (type === "message" || type === "assistant_message") {
     const role = stringValue(record.role) ?? "assistant";
     const text = stringValue(record.content) ?? stringValue(record.text) ?? "";
@@ -684,7 +705,7 @@ async function mapCompletedItem(
   if (type === "agent_message") {
     await context.emit({
       type: "assistant_message",
-      payload: { text: stringValue(item.text) ?? "", role: "assistant" },
+      payload: { text: stringValue(item.text) ?? "", role: "assistant", ...(stringValue(item.id) ? { streamId: stringValue(item.id), final: true } : {}) },
     });
     return;
   }

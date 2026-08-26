@@ -81,6 +81,15 @@ export class ClaudeConnector extends CliJsonlConnector {
     }
 
     if (type === "stream_event") {
+      const streamEvent = objectValue(record.event);
+      const delta = streamEvent ? objectValue(streamEvent.delta) : null;
+      const text = delta?.type === "text_delta" ? stringValue(delta.text) : null;
+      if (text) {
+        await context.emit({
+          type: "assistant_message",
+          payload: { text, role: "assistant", streamId: claudeStreamId(context, sessionId), delta: true },
+        });
+      }
       return;
     }
     if (type === "system") {
@@ -90,7 +99,7 @@ export class ClaudeConnector extends CliJsonlConnector {
       return;
     }
     if (type === "assistant") {
-      await emitAssistantContent(record.message, context);
+      await emitAssistantContent(record.message, context, claudeStreamId(context, sessionId));
       return;
     }
     if (type === "user") {
@@ -186,7 +195,11 @@ export class ClaudeConnector extends CliJsonlConnector {
   }
 }
 
-async function emitAssistantContent(value: unknown, context: JsonlEventContext): Promise<void> {
+function claudeStreamId(context: JsonlEventContext, sessionId: string | null): string {
+  return `claude:${context.turnId ?? sessionId ?? "current"}:assistant`;
+}
+
+async function emitAssistantContent(value: unknown, context: JsonlEventContext, streamId?: string): Promise<void> {
   const message = objectValue(value);
   const content = message && Array.isArray(message.content) ? message.content : [];
   for (const value of content) {
@@ -202,7 +215,7 @@ async function emitAssistantContent(value: unknown, context: JsonlEventContext):
     } else if (item.type === "text") {
       const text = stringValue(item.text);
       if (text) {
-        await context.emit({ type: "assistant_message", payload: { text, role: "assistant" } });
+        await context.emit({ type: "assistant_message", payload: { text, role: "assistant", ...(streamId ? { streamId, final: true } : {}) } });
       }
     } else if (item.type === "tool_use") {
       await context.emit({

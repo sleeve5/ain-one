@@ -41,6 +41,7 @@ export interface BaseConnectorOptions {
   commandTimeoutMs?: number;
   maxStderrBytes?: number;
   modelsCachePath?: string;
+  queueHome?: string;
 }
 
 export interface ActiveTurnController {

@@ -40,15 +40,19 @@ export interface TurnSnapshot {
   modelId: string | null;
   permissionMode: PermissionMode;
   pluginVersions: PluginVersion[];
+  autoQueue?: boolean;
 }
 
 export interface Conversation {
   id: string;
   projectId: string;
+  title?: string | null;
   agentProductId: AgentProductId;
   modelId: string | null;
   permissionMode: PermissionMode;
   queuePaused: boolean;
+  autoQueue?: boolean;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -57,6 +61,7 @@ export interface Project {
   id: string;
   path: string;
   name: string;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }
@@ -84,7 +89,15 @@ export interface QueuedMessage {
   id: string;
   conversationId: string;
   content: string;
+  status: "pending" | "staged" | "uncertain";
+  deliveryId: string | null;
   createdAt: string;
+}
+
+export interface ContinuationInput {
+  messageId: string;
+  deliveryId: string;
+  content: string;
 }
 
 export type NormalizedEventType =
@@ -97,6 +110,7 @@ export type NormalizedEventType =
   | "permission"
   | "usage"
   | "warning"
+  | "queue_status"
   | "turn_status";
 
 export interface NormalizedEvent {
@@ -177,6 +191,7 @@ export interface AgentConnector {
   fetchCatalog(projectPath: string): Promise<AgentCatalog>;
   createOrResumeSession(input: SessionInput): Promise<LiveSession>;
   startTurn(session: LiveSession, input: StartTurnInput): Promise<NativeTurn>;
+  continueTurn?(session: LiveSession, input: ContinuationInput): Promise<boolean>;
   respondToPermission(
     session: LiveSession,
     requestId: string,
@@ -195,6 +210,7 @@ export interface CreateConversationRequest {
   projectId: string;
   agentProductId: AgentProductId;
   modelId: string | null;
+  autoQueue?: boolean;
 }
 
 export interface CreateConversationInput extends CreateConversationRequest {
@@ -204,10 +220,12 @@ export interface CreateConversationInput extends CreateConversationRequest {
 export interface ConversationSettingsInput {
   modelId: string | null;
   permissionMode: PermissionMode;
+  autoQueue?: boolean;
 }
 
 export interface AgentSettingsInput {
-  executablePath: string | null;
+  executablePath?: string | null;
+  enabled?: boolean;
 }
 
 export interface PluginEnablementsInput {
@@ -216,4 +234,75 @@ export interface PluginEnablementsInput {
 
 export interface QueueMessageRequest {
   content: string;
+}
+
+export type GraphNode =
+  | { id: string; type: "agent"; name: string; config: { agentProductId: AgentProductId; modelId: string | null; permissionMode: PermissionMode; prompt: string } }
+  | { id: string; type: "loop_counter"; name: string; config: { maxIterations: number } }
+  | { id: string; type: "passthrough"; name: string; config: Record<string, never> };
+
+export interface GraphEdge {
+  id: string;
+  source: string;
+  target: string;
+  condition?: { branch: "loop" | "done" };
+}
+
+export interface GraphDefinition {
+  nodes: GraphNode[];
+  edges: GraphEdge[];
+  start: string[];
+  end: string[];
+}
+
+export interface GraphViewport { x: number; y: number; zoom: number; }
+export interface GraphNodePosition { x: number; y: number; }
+
+export interface GraphProject {
+  id: string;
+  projectId: string;
+  name: string;
+  description: string;
+  definition: GraphDefinition;
+  viewport: GraphViewport;
+  positions: Record<string, GraphNodePosition>;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export type GraphRunStatus = "running" | "completed" | "failed" | "cancelled" | "interrupted";
+export type GraphNodeRunStatus = "running" | "completed" | "failed" | "cancelled";
+
+export interface GraphRun {
+  id: string;
+  graphId: string;
+  status: GraphRunStatus;
+  input: string;
+  output: string | null;
+  error: NormalizedError | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GraphNodeRun {
+  id: string;
+  runId: string;
+  nodeId: string;
+  iteration: number;
+  status: GraphNodeRunStatus;
+  input: string;
+  output: string | null;
+  error: NormalizedError | null;
+  createdAt: string;
+  updatedAt: string;
+}
+
+export interface GraphRunEvent {
+  id: string;
+  runId: string;
+  sequence: number;
+  type: string;
+  nodeId: string | null;
+  payload: Record<string, unknown>;
+  createdAt: string;
 }

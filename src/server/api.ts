@@ -4,20 +4,25 @@ import type { IncomingMessage, ServerResponse } from "node:http";
 import { createServer } from "node:http";
 import { access, realpath, stat } from "node:fs/promises";
 import { basename } from "node:path";
-import type { AgentCatalog, AgentProbe, AgentProductId, PermissionDecision, PluginVersion } from "../shared/contracts.js";
+import type { AgentCatalog, AgentProbe, AgentProductId, GraphDefinition, GraphRun, PermissionDecision, PluginVersion } from "../shared/contracts.js";
 import {
   parseAgentSettings,
   parseConversationSettings,
+  parseConversationManagementPatch,
   parseCreateConversation,
   parseCreateProject,
   parsePermissionDecision,
   parsePluginEnablements,
+  parseProjectManagementPatch,
   parseQueueMessage,
+  parseUncertainMessageResolution,
   ValidationError,
+  validateGraphDefinition,
 } from "../shared/validation.js";
 import type { ProjectFilesService } from "./files.js";
 import { FilesServiceError } from "./files.js";
 import type { PluginScope, Repositories } from "./repositories.js";
+import type { CreateGraphInput, GraphRepository } from "./graph-repository.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
 const SUPPORTED_AGENTS: AgentProductId[] = ["codex", "claude", "trae", "opencode"];
@@ -27,6 +32,8 @@ interface TurnCoordinatorLike {
   cancelActiveTurn(conversationId: string): Promise<boolean>;
   continueConversation(conversationId: string): Promise<boolean>;
   retryInterruptedTurn(conversationId: string, turnId: string): Promise<boolean>;
+  resolveUncertainDelivery?(conversationId: string, messageId: string, action: "retry" | "accept"): Promise<boolean>;
+  respondToPermission?(conversationId: string, requestId: string, decision: PermissionDecision): Promise<boolean>;
 }
 
 interface PermissionResponderInput {
@@ -43,7 +50,8 @@ interface AgentCatalogProviderInput {
 
 interface AgentSettingsUpdate {
   agentProductId: AgentProductId;
-  executablePath: string | null;
+  executablePath?: string | null;
+  enabled?: boolean;
 }
 
 interface PluginRequest {
@@ -65,6 +73,7 @@ interface ApiServerOptions {
   turnCoordinator: TurnCoordinatorLike;
   files: ProjectFilesService;
   pickProjectDirectory?: () => Promise<string | null>;
+  pickLocalPath?: (kind: "directory" | "file", purpose: "plugin" | "agent") => Promise<string | null>;
   allowedOrigins?: string[];
   bodyLimitBytes?: number;
   ssePollMs?: number;
@@ -76,6 +85,7 @@ interface ApiServerOptions {
     agentProductId: AgentProductId;
     executablePath: string;
     executablePathOverride: string | null;
+    enabled: boolean;
     probe: AgentProbe;
   }>>;
   updateAgentSettings?: (
@@ -88,6 +98,8 @@ interface ApiServerOptions {
   }) => PluginVersion[];
   validatePluginVersions?: (scope: PluginScope, pluginVersions: PluginVersion[]) => void;
   pluginHandler?: (request: PluginRequest) => Promise<PluginResponse>;
+  graphRepository?: GraphRepository;
+  graphRuntime?: { run(graphId: string, input: string): Promise<GraphRun>; cancel(runId: string): Promise<boolean> };
 }
 
 interface OriginRules {
@@ -145,7 +157,8 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     const canonicalPath = await canonicalProjectPath(path);
     const existing = options.repositories.getProjectByPath(canonicalPath);
     if (existing) {
-      return { status: 200, project: existing } as const;
+      if (existing.archivedAt) options.repositories.archiveProject(existing.id, false);
+      return { status: 200, project: options.repositories.getProject(existing.id)! } as const;
     }
     return {
       status: 201,
@@ -216,8 +229,89 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       return;
     }
 
+    const projectGraphsMatch = match(pathname, /^\/api\/projects\/([^/]+)\/graphs$/);
+    if (projectGraphsMatch && request.method === "GET") {
+      if (!options.graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
+      if (!options.repositories.getProject(projectGraphsMatch[0])) { sendError(response, 404, "project_not_found", "Project not found"); return; }
+      sendJson(response, 200, { graphs: options.graphRepository.listGraphs(projectGraphsMatch[0]) });
+      return;
+    }
+    if (projectGraphsMatch && request.method === "POST") {
+      if (!options.graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
+      if (!options.repositories.getProject(projectGraphsMatch[0])) { sendError(response, 404, "project_not_found", "Project not found"); return; }
+      const input = parseGraphWrite(await readJsonBody(request, bodyLimitBytes), true);
+      sendJson(response, 201, { graph: options.graphRepository.createGraph({ ...input as CreateGraphInput, projectId: projectGraphsMatch[0] }) });
+      return;
+    }
+
+    const graphMatch = match(pathname, /^\/api\/graphs\/([^/]+)$/);
+    if (graphMatch && request.method === "GET") {
+      const graph = options.graphRepository?.getGraph(graphMatch[0]);
+      if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      sendJson(response, 200, { graph, latestRun: options.graphRepository?.getLatestRun(graph.id) ?? null });
+      return;
+    }
+    if (graphMatch && request.method === "PUT") {
+      const current = options.graphRepository?.getGraph(graphMatch[0]);
+      if (!current) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      const patch = parseGraphWrite(await readJsonBody(request, bodyLimitBytes), false);
+      sendJson(response, 200, { graph: options.graphRepository!.updateGraph(current.id, patch) });
+      return;
+    }
+    if (graphMatch && request.method === "DELETE") {
+      if (options.graphRepository?.getLatestRun(graphMatch[0])?.status === "running") { sendError(response, 409, "graph_run_active", "A running Graph cannot be deleted"); return; }
+      if (!options.graphRepository?.deleteGraph(graphMatch[0])) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      response.writeHead(204); response.end(); return;
+    }
+
+    const graphRunsMatch = match(pathname, /^\/api\/graphs\/([^/]+)\/runs$/);
+    if (graphRunsMatch && request.method === "POST") {
+      const graph = options.graphRepository?.getGraph(graphRunsMatch[0]);
+      if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      if (!options.graphRuntime) { sendError(response, 501, "graph_runtime_unsupported", "Graph runtime is unavailable"); return; }
+      const graphRepository = options.graphRepository;
+      if (!graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
+      const body = readRecord(await readJsonBody(request, bodyLimitBytes), "Invalid graph run payload");
+      if (typeof body.input !== "string") throw new ValidationError("input must be a string");
+      const runPromise = options.graphRuntime.run(graph.id, body.input);
+      await new Promise((resolve) => setImmediate(resolve));
+      const run = graphRepository.getLatestRun(graph.id) ?? await runPromise;
+      void runPromise.catch(() => undefined);
+      sendJson(response, 202, { run });
+      return;
+    }
+
+    const graphRunMatch = match(pathname, /^\/api\/graph-runs\/([^/]+)$/);
+    if (graphRunMatch && request.method === "GET") {
+      const run = options.graphRepository?.getRun(graphRunMatch[0]);
+      if (!run) { sendError(response, 404, "graph_run_not_found", "Graph Run not found"); return; }
+      sendJson(response, 200, { run, nodeRuns: options.graphRepository!.listNodeRuns(run.id), events: options.graphRepository!.eventsAfter(run.id, 0) });
+      return;
+    }
+    const graphCancelMatch = match(pathname, /^\/api\/graph-runs\/([^/]+)\/cancel$/);
+    if (graphCancelMatch && request.method === "POST") {
+      const cancelled = await options.graphRuntime?.cancel(graphCancelMatch[0]) ?? false;
+      sendJson(response, 200, { cancelled }); return;
+    }
+    const graphEventsMatch = match(pathname, /^\/api\/graph-runs\/([^/]+)\/events$/);
+    if (graphEventsMatch && request.method === "GET") {
+      const runId = graphEventsMatch[0];
+      if (!options.graphRepository?.getRun(runId)) { sendError(response, 404, "graph_run_not_found", "Graph Run not found"); return; }
+      response.writeHead(200, { "content-type": "text/event-stream; charset=utf-8", "cache-control": "no-cache, no-transform", connection: "keep-alive" });
+      let last = parseAfterSequence(requestUrl.searchParams.get("after"), request.headers["last-event-id"]);
+      let closed = false;
+      const flush = () => { for (const event of options.graphRepository!.eventsAfter(runId, last, replayBatchSize)) { response.write(`id: ${event.sequence}\ndata: ${JSON.stringify(event)}\n\n`); last = event.sequence; } };
+      flush();
+      const timer = setInterval(flush, pollMs);
+      const close = () => { if (closed) return; closed = true; clearInterval(timer); activeSseClosers.delete(close); if (!response.writableEnded) response.end(); };
+      activeSseClosers.add(close); request.once("close", close); response.once("close", close);
+      return;
+    }
+
     if (request.method === "GET" && pathname === "/api/projects") {
-      sendJson(response, 200, { projects: options.repositories.listProjects() });
+      sendJson(response, 200, {
+        projects: options.repositories.listProjects(requestUrl.searchParams.get("archived") === "true"),
+      });
       return;
     }
 
@@ -243,6 +337,47 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       return;
     }
 
+    if (request.method === "GET" && pathname === "/api/host/pick-path") {
+      if (!options.pickLocalPath) {
+        sendError(response, 501, "path_picker_unsupported", "Path picker is not available");
+        return;
+      }
+      const kind = requestUrl.searchParams.get("kind");
+      const purpose = requestUrl.searchParams.get("purpose");
+      if ((kind !== "directory" && kind !== "file") || (purpose !== "plugin" && purpose !== "agent")) {
+        sendError(response, 400, "invalid_path_picker", "Invalid path picker request");
+        return;
+      }
+      sendJson(response, 200, { path: await options.pickLocalPath(kind, purpose) });
+      return;
+    }
+
+    const projectMatch = match(pathname, /^\/api\/projects\/([^/]+)$/);
+    if (request.method === "PATCH" && projectMatch) {
+      const projectId = projectMatch[0];
+      const body = parseProjectManagementPatch(await readJsonBody(request, bodyLimitBytes));
+      if (!options.repositories.getProject(projectId)) {
+        sendError(response, 404, "project_not_found", "Project not found");
+        return;
+      }
+      if (body.name !== undefined) options.repositories.renameProject(projectId, body.name);
+      if (body.archived !== undefined && options.repositories.archiveProject(projectId, body.archived) === "turn_active") {
+        sendError(response, 409, "turn_active", "A Project with an active Turn cannot be archived");
+        return;
+      }
+      sendJson(response, 200, { project: options.repositories.getProject(projectId) });
+      return;
+    }
+    if (request.method === "DELETE" && projectMatch) {
+      const result = options.repositories.deleteArchivedProject(projectMatch[0]);
+      if (result === "not_found") { sendError(response, 404, "project_not_found", "Project not found"); return; }
+      if (result === "not_archived") { sendError(response, 409, "project_not_archived", "Only archived Projects can be deleted"); return; }
+      if (result === "turn_active") { sendError(response, 409, "turn_active", "A Project with an active Turn cannot be deleted"); return; }
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+
     const projectConversationsMatch = match(pathname, /^\/api\/projects\/([^/]+)\/conversations$/);
     if (request.method === "GET" && projectConversationsMatch) {
       const projectId = projectConversationsMatch[0];
@@ -252,7 +387,10 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         return;
       }
       sendJson(response, 200, {
-        conversations: options.repositories.listConversations(projectId),
+        conversations: options.repositories.listConversations(
+          projectId,
+          requestUrl.searchParams.get("archived") === "true",
+        ),
       });
       return;
     }
@@ -279,6 +417,46 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     }
 
     const conversationMatch = match(pathname, /^\/api\/conversations\/([^/]+)$/);
+    if (request.method === "DELETE" && conversationMatch) {
+      const result = options.repositories.deleteArchivedConversation(conversationMatch[0]);
+      if (result === "not_found") { sendError(response, 404, "conversation_not_found", "Conversation not found"); return; }
+      if (result === "not_archived") { sendError(response, 409, "conversation_not_archived", "Only archived Conversations can be deleted"); return; }
+      if (result === "turn_active") { sendError(response, 409, "turn_active", "An active Conversation cannot be deleted"); return; }
+      response.writeHead(204);
+      response.end();
+      return;
+    }
+    if (request.method === "PATCH" && conversationMatch) {
+      const conversationId = conversationMatch[0];
+      const body = parseConversationManagementPatch(await readJsonBody(request, bodyLimitBytes));
+      const current = options.repositories.getConversation(conversationId);
+      if (!current) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      if (body.title !== undefined) {
+        options.repositories.renameConversation(conversationId, body.title);
+      }
+      if (body.archived !== undefined) {
+        if (options.repositories.archiveConversation(conversationId, body.archived) === "turn_active") {
+          sendError(response, 409, "turn_active", "An active Conversation cannot be archived");
+          return;
+        }
+      }
+      sendJson(response, 200, { conversation: options.repositories.getConversation(conversationId) });
+      return;
+    }
+
+    const forkConversationMatch = match(pathname, /^\/api\/conversations\/([^/]+)\/fork$/);
+    if (request.method === "POST" && forkConversationMatch) {
+      const conversation = options.repositories.forkConversation(forkConversationMatch[0]);
+      if (!conversation) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      sendJson(response, 201, { conversation });
+      return;
+    }
     if (request.method === "GET" && conversationMatch) {
       const conversationId = conversationMatch[0];
       const conversation = options.repositories.getConversation(conversationId);
@@ -293,6 +471,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         queuedMessages: options.repositories.listQueuedMessages(conversationId),
         activeTurn: options.repositories.getActiveTurn(conversationId),
         latestTurn: options.repositories.getLatestTurn(conversationId),
+        events: options.repositories.eventsAfter(conversationId, 0),
       });
       return;
     }
@@ -357,8 +536,13 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
     if (messagesMatch && request.method === "POST") {
       const conversationId = messagesMatch[0];
-      if (!options.repositories.getConversation(conversationId)) {
+      const conversation = options.repositories.getConversation(conversationId);
+      if (!conversation) {
         sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      if (!options.repositories.isAgentEnabled(conversation.agentProductId)) {
+        sendError(response, 409, "agent_disabled", "This Agent is disabled");
         return;
       }
 
@@ -372,6 +556,22 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       pathname,
       /^\/api\/conversations\/([^/]+)\/messages\/([^/]+)$/,
     );
+    const resolveMessageMatch = match(
+      pathname,
+      /^\/api\/conversations\/([^/]+)\/messages\/([^/]+)\/resolve$/,
+    );
+    if (request.method === "POST" && resolveMessageMatch) {
+      const action = parseUncertainMessageResolution(await readJsonBody(request, bodyLimitBytes));
+      const resolved = await options.turnCoordinator.resolveUncertainDelivery?.(
+        resolveMessageMatch[0], resolveMessageMatch[1], action,
+      );
+      if (!resolved) {
+        sendError(response, 409, "message_not_uncertain", "Message is no longer awaiting confirmation");
+        return;
+      }
+      sendJson(response, 200, { resolved: true });
+      return;
+    }
     if (request.method === "DELETE" && deleteMessageMatch) {
       const conversationId = deleteMessageMatch[0];
       const messageId = deleteMessageMatch[1];
@@ -455,7 +655,13 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         return;
       }
 
-      if (!options.permissionResponder) {
+      const respond = options.permissionResponder ?? (options.turnCoordinator.respondToPermission
+        ? async (input: PermissionResponderInput) => {
+            const accepted = await options.turnCoordinator.respondToPermission!(input.conversationId, input.requestId, input.decision);
+            if (!accepted) throw new InputError(409, "permission_not_active", "Permission request is no longer active");
+          }
+        : undefined);
+      if (!respond) {
         sendError(
           response,
           501,
@@ -466,7 +672,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       }
 
       const decision = parsePermissionDecision(await readJsonBody(request, bodyLimitBytes));
-      await options.permissionResponder({
+      await respond({
         conversationId,
         requestId,
         decision,
@@ -587,6 +793,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
             agentProductId,
             executablePath: agentProductId === "trae" ? "traecli" : agentProductId,
             executablePathOverride: null,
+            enabled: true,
             probe: {
               status: "not_installed" as const,
               diagnostic: "Connector not installed yet",
@@ -613,15 +820,19 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       }
 
       const settings = parseAgentSettings(await readJsonBody(request, bodyLimitBytes));
-      const executablePath = settings.executablePath
+      const executablePath = typeof settings.executablePath === "string"
         ? await canonicalExecutablePath(settings.executablePath)
-        : null;
-      const result = await options.updateAgentSettings({ agentProductId, executablePath });
+        : settings.executablePath;
+      const result = await options.updateAgentSettings({
+        agentProductId,
+        ...(executablePath !== undefined ? { executablePath } : {}),
+        ...(settings.enabled !== undefined ? { enabled: settings.enabled } : {}),
+      });
       if (result === "turn_active") {
         sendError(response, 409, "turn_active", "Agent settings can change only between Turns");
         return;
       }
-      sendJson(response, 200, { agentProductId, executablePath });
+      sendJson(response, 200, { agentProductId, executablePath, enabled: settings.enabled });
       return;
     }
 
@@ -667,10 +878,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       if (request.method === "PUT") {
         const input = parsePluginEnablements(await readJsonBody(request, bodyLimitBytes));
         options.validatePluginVersions?.(pluginScope, input.pluginVersions);
-        if (options.repositories.setPluginEnablements(pluginScope, input.pluginVersions) === "turn_active") {
-          sendError(response, 409, "turn_active", "Plugin settings can change only between Turns");
-          return;
-        }
+        options.repositories.setPluginEnablements(pluginScope, input.pluginVersions);
       }
       sendJson(response, 200, {
         pluginVersions: options.repositories.listPluginEnablements(pluginScope),
@@ -1224,6 +1432,9 @@ async function validateConversationCatalog(
     permissionMode?: import("../shared/contracts.js").PermissionMode;
   },
 ): Promise<import("../shared/contracts.js").PermissionMode> {
+  if (!options.repositories.isAgentEnabled(input.agentProductId)) {
+    throw new InputError(409, "agent_disabled", "This Agent is disabled");
+  }
   if (!options.catalogProvider) {
     throw new InputError(501, "catalog_unsupported", "Catalog capability is not available");
   }
@@ -1266,4 +1477,44 @@ function isUncommittedTerminalEvent(
   }
   const turn = repositories.getTurn(turnId);
   return turn?.status === "starting" || turn?.status === "running" || turn?.status === "cancelling";
+}
+
+function readRecord(value: unknown, message: string): Record<string, unknown> {
+  if (!value || typeof value !== "object" || Array.isArray(value)) throw new ValidationError(message);
+  return value as Record<string, unknown>;
+}
+
+function parseGraphWrite(value: unknown, complete: boolean): Partial<Omit<CreateGraphInput, "projectId">> {
+  const body = readRecord(value, "Invalid graph payload");
+  const patch: Partial<Omit<CreateGraphInput, "projectId">> = {};
+  if (body.name !== undefined) {
+    if (typeof body.name !== "string" || !body.name.trim()) throw new ValidationError("name must be a non-empty string");
+    patch.name = body.name.trim();
+  }
+  if (body.description !== undefined) {
+    if (typeof body.description !== "string") throw new ValidationError("description must be a string");
+    patch.description = body.description;
+  }
+  if (body.definition !== undefined) {
+    const errors = validateGraphDefinition(body.definition);
+    if (errors.length) throw new ValidationError(errors.join("; "));
+    patch.definition = body.definition as GraphDefinition;
+  }
+  if (body.viewport !== undefined) {
+    const viewport = readRecord(body.viewport, "viewport must be an object");
+    if (![viewport.x, viewport.y, viewport.zoom].every((item) => typeof item === "number" && Number.isFinite(item)) || (viewport.zoom as number) <= 0) throw new ValidationError("viewport requires finite x, y, and positive zoom");
+    patch.viewport = viewport as unknown as CreateGraphInput["viewport"];
+  }
+  if (body.positions !== undefined) {
+    const positions = readRecord(body.positions, "positions must be an object");
+    for (const [nodeId, rawPosition] of Object.entries(positions)) {
+      const position = readRecord(rawPosition, `position for ${nodeId} must be an object`);
+      if (![position.x, position.y].every((item) => typeof item === "number" && Number.isFinite(item))) throw new ValidationError(`position for ${nodeId} requires finite x and y`);
+    }
+    patch.positions = positions as CreateGraphInput["positions"];
+  }
+  if (complete && (!patch.name || !patch.definition || !patch.viewport || !patch.positions)) {
+    throw new ValidationError("name, definition, viewport, and positions are required");
+  }
+  return patch;
 }

@@ -9,6 +9,7 @@ import type {
   PluginEnablementsInput,
   PluginVersion,
   QueueMessageRequest,
+  GraphDefinition,
 } from "./contracts.js";
 
 const SUPPORTED_AGENT_PRODUCTS: AgentProductId[] = [
@@ -107,29 +108,43 @@ export function parseCreateConversation(input: unknown): CreateConversationInput
   if (value.permissionMode !== undefined) {
     parsed.permissionMode = parsePermissionMode(value.permissionMode);
   }
+  if (value.autoQueue !== undefined) {
+    if (typeof value.autoQueue !== "boolean") throw new ValidationError("autoQueue must be a boolean");
+    parsed.autoQueue = value.autoQueue;
+  }
   return parsed;
 }
 
 export function parseConversationSettings(input: unknown): ConversationSettingsInput {
   const value = assertObject(input, "Invalid conversation settings payload");
+  if (value.autoQueue !== undefined && typeof value.autoQueue !== "boolean") {
+    throw new ValidationError("autoQueue must be a boolean");
+  }
 
   return {
     modelId: readNullableString(value, "modelId", "modelId must be a string or null"),
     permissionMode: parsePermissionMode(value.permissionMode),
+    ...(typeof value.autoQueue === "boolean" ? { autoQueue: value.autoQueue } : {}),
   };
 }
 
 export function parseAgentSettings(input: unknown): AgentSettingsInput {
   const value = assertObject(input, "Invalid Agent settings payload");
-  const executablePath = readNullableString(
-    value,
-    "executablePath",
-    "executablePath must be a string or null",
-  );
-  if (executablePath !== null && executablePath.trim().length === 0) {
+  const executablePath = value.executablePath === undefined ? undefined : readNullableString(value, "executablePath", "executablePath must be a string or null");
+  if (typeof executablePath === "string" && executablePath.trim().length === 0) {
     throw new ValidationError("executablePath cannot be empty");
   }
-  return { executablePath: executablePath?.trim() ?? null };
+  const enabled = value.enabled;
+  if (enabled !== undefined && typeof enabled !== "boolean") {
+    throw new ValidationError("enabled must be a boolean");
+  }
+  if (executablePath === undefined && enabled === undefined) {
+    throw new ValidationError("Agent settings cannot be empty");
+  }
+  return {
+    ...(executablePath !== undefined ? { executablePath: executablePath?.trim() ?? null } : {}),
+    ...(enabled !== undefined ? { enabled } : {}),
+  };
 }
 
 export function parsePluginEnablements(input: unknown): PluginEnablementsInput {
@@ -147,9 +162,58 @@ export function parseQueueMessage(input: unknown): QueueMessageRequest {
   return { content };
 }
 
+export function parseUncertainMessageResolution(input: unknown): "retry" | "accept" {
+  const value = assertObject(input, "Invalid uncertain message resolution");
+  if (value.action !== "retry" && value.action !== "accept") {
+    throw new ValidationError("action must be retry or accept");
+  }
+  return value.action;
+}
+
 export interface CreateProjectRequest {
   path: string;
   name: string | null;
+}
+
+export interface ProjectManagementPatch {
+  name?: string;
+  archived?: boolean;
+}
+
+export interface ConversationManagementPatch {
+  title?: string;
+  archived?: boolean;
+}
+
+function parseManagementPatch(
+  input: unknown,
+  textField: "name" | "title",
+): ProjectManagementPatch | ConversationManagementPatch {
+  const value = assertObject(input, "Invalid workspace management payload");
+  const patch: Record<string, string | boolean> = {};
+  if (textField in value) {
+    const text = readString(value, textField, `${textField} must be a string`).trim();
+    if (!text) throw new ValidationError(`${textField} cannot be empty`);
+    patch[textField] = text;
+  }
+  if ("archived" in value) {
+    if (typeof value.archived !== "boolean") {
+      throw new ValidationError("archived must be a boolean");
+    }
+    patch.archived = value.archived;
+  }
+  if (!(textField in patch) && !("archived" in patch)) {
+    throw new ValidationError("Workspace management patch is empty");
+  }
+  return patch;
+}
+
+export function parseProjectManagementPatch(input: unknown): ProjectManagementPatch {
+  return parseManagementPatch(input, "name");
+}
+
+export function parseConversationManagementPatch(input: unknown): ConversationManagementPatch {
+  return parseManagementPatch(input, "title");
 }
 
 export function parseCreateProject(input: unknown): CreateProjectRequest {
@@ -177,4 +241,61 @@ export function parsePermissionDecision(input: unknown): PermissionDecision {
     throw new ValidationError("Unsupported decision");
   }
   return decision;
+}
+
+export function validateGraphDefinition(value: unknown): string[] {
+  const errors: string[] = [];
+  if (!value || typeof value !== "object" || Array.isArray(value)) return ["Graph definition must be an object"];
+  const graph = value as { nodes?: unknown; edges?: unknown; start?: unknown; end?: unknown };
+  if (!Array.isArray(graph.nodes)) errors.push("Graph nodes must be an array");
+  if (!Array.isArray(graph.edges)) errors.push("Graph edges must be an array");
+  if (!Array.isArray(graph.start)) errors.push("Graph start must be an array");
+  if (!Array.isArray(graph.end)) errors.push("Graph end must be an array");
+  if (errors.length) return errors;
+  const ids = new Set<string>();
+  const nodes = graph.nodes as unknown[];
+  const edges = graph.edges as unknown[];
+  const start = graph.start as unknown[];
+  const end = graph.end as unknown[];
+  for (const rawNode of nodes) {
+    if (!rawNode || typeof rawNode !== "object" || Array.isArray(rawNode)) { errors.push("Every node must be an object"); continue; }
+    const node = rawNode as Record<string, unknown>;
+    if (typeof node.id !== "string" || !node.id || typeof node.name !== "string") { errors.push("Every node requires a string id and name"); continue; }
+    if (ids.has(node.id)) errors.push(`Node IDs must be unique: ${node.id}`);
+    ids.add(node.id);
+    if (node.type !== "agent" && node.type !== "loop_counter" && node.type !== "passthrough") errors.push(`Unsupported node type: ${String(node.type)}`);
+    if (!node.config || typeof node.config !== "object" || Array.isArray(node.config)) { errors.push(`Node ${node.id} config must be an object`); continue; }
+    const config = node.config as Record<string, unknown>;
+    if (node.type === "agent" && (!SUPPORTED_AGENT_PRODUCTS.includes(config.agentProductId as AgentProductId) || (config.modelId !== null && typeof config.modelId !== "string") || !["request_approval", "help_me_approve", "full_access"].includes(String(config.permissionMode)) || typeof config.prompt !== "string")) errors.push(`Agent node ${node.id} has invalid config`);
+    if (node.type === "loop_counter" && (!Number.isInteger(config.maxIterations) || (config.maxIterations as number) < 1)) {
+      errors.push(`Loop Counter ${node.id} maxIterations must be >= 1`);
+    }
+  }
+  if (start.length === 0) errors.push("Graph requires at least one start node");
+  if (end.length === 0) errors.push("Graph requires at least one end node");
+  for (const id of start) if (typeof id !== "string" || !ids.has(id)) errors.push(`Start references unknown node: ${String(id)}`);
+  for (const id of end) if (typeof id !== "string" || !ids.has(id)) errors.push(`End references unknown node: ${String(id)}`);
+  const edgeIds = new Set<string>();
+  const parsedEdges: Array<{ id: string; source: string; target: string; condition?: { branch?: unknown } }> = [];
+  for (const rawEdge of edges) {
+    if (!rawEdge || typeof rawEdge !== "object" || Array.isArray(rawEdge)) { errors.push("Every edge must be an object"); continue; }
+    const edge = rawEdge as Record<string, unknown>;
+    if (typeof edge.id !== "string" || !edge.id || typeof edge.source !== "string" || typeof edge.target !== "string") { errors.push("Every edge requires string id, source, and target"); continue; }
+    const condition = edge.condition && typeof edge.condition === "object" && !Array.isArray(edge.condition) ? edge.condition as { branch?: unknown } : undefined;
+    parsedEdges.push({ id: edge.id, source: edge.source, target: edge.target, ...(condition ? { condition } : {}) });
+    if (edgeIds.has(edge.id)) errors.push(`Edge IDs must be unique: ${edge.id}`);
+    edgeIds.add(edge.id);
+    if (!ids.has(edge.source)) errors.push(`Edge ${edge.id} has unknown source: ${edge.source}`);
+    if (!ids.has(edge.target)) errors.push(`Edge ${edge.id} has unknown target: ${edge.target}`);
+    if (edge.condition !== undefined && (!condition || (condition.branch !== "loop" && condition.branch !== "done"))) errors.push(`Edge ${edge.id} has invalid branch`);
+  }
+  for (const rawNode of nodes) {
+    if (!rawNode || typeof rawNode !== "object" || Array.isArray(rawNode)) continue;
+    const node = rawNode as Record<string, unknown>;
+    if (node.type !== "loop_counter" || typeof node.id !== "string") continue;
+    const branches = parsedEdges.filter((edge) => edge.source === node.id).map((edge) => edge.condition?.branch);
+    if (!branches.includes("loop")) errors.push(`Loop Counter ${node.id} requires a Loop branch`);
+    if (!branches.includes("done")) errors.push(`Loop Counter ${node.id} requires a Done branch`);
+  }
+  return errors;
 }

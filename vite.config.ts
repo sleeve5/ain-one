@@ -7,7 +7,7 @@ export default defineConfig(async ({ command }) => {
     return { plugins: react() } satisfies UserConfig;
   }
 
-  const webPort = readPort(process.env.AIN_ONE_WEB_PORT, 5173);
+  const webPort = resolveWebPort(process.env.AIN_ONE_WEB_PORT);
   const webOrigin = `http://127.0.0.1:${webPort}`;
   const api = await startServer({ allowedOrigins: [webOrigin] });
 
@@ -53,4 +53,14 @@ export default defineConfig(async ({ command }) => {
 function readPort(value: string | undefined, fallback: number): number {
   const parsed = value ? Number.parseInt(value, 10) : fallback;
   return Number.isInteger(parsed) && parsed > 0 && parsed <= 65_535 ? parsed : fallback;
+}
+
+export function resolveWebPort(
+  configuredPort: string | undefined,
+  argv: string[] = process.argv,
+): number {
+  const inlinePort = argv.findLast((argument) => argument.startsWith("--port="))?.slice(7);
+  const portIndex = argv.findLastIndex((argument) => argument === "--port");
+  const cliPort = inlinePort ?? (portIndex >= 0 ? argv[portIndex + 1] : undefined);
+  return readPort(cliPort ?? configuredPort, 5173);
 }

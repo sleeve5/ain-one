@@ -13,6 +13,7 @@ function migrate(db: DatabaseSync): void {
       id TEXT PRIMARY KEY,
       path TEXT NOT NULL UNIQUE,
       name TEXT NOT NULL,
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -24,6 +25,9 @@ function migrate(db: DatabaseSync): void {
       model_id TEXT,
       permission_mode TEXT NOT NULL,
       queue_paused INTEGER NOT NULL DEFAULT 0,
+      auto_queue INTEGER NOT NULL DEFAULT 0,
+      title TEXT,
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -64,7 +68,8 @@ function migrate(db: DatabaseSync): void {
       turn_id TEXT PRIMARY KEY REFERENCES turns(id) ON DELETE CASCADE,
       model_id TEXT,
       permission_mode TEXT NOT NULL,
-      plugin_versions_json TEXT NOT NULL
+      plugin_versions_json TEXT NOT NULL,
+      auto_queue INTEGER NOT NULL DEFAULT 0
     );
 
     CREATE TABLE IF NOT EXISTS events (
@@ -99,12 +104,101 @@ function migrate(db: DatabaseSync): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS agent_settings (
+      agent_product_id TEXT PRIMARY KEY,
+      enabled INTEGER NOT NULL DEFAULT 1,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS graphs (
+      id TEXT PRIMARY KEY,
+      project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
+      name TEXT NOT NULL,
+      description TEXT NOT NULL,
+      definition_json TEXT NOT NULL,
+      viewport_json TEXT NOT NULL,
+      positions_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS graph_runs (
+      id TEXT PRIMARY KEY,
+      graph_id TEXT NOT NULL REFERENCES graphs(id) ON DELETE CASCADE,
+      status TEXT NOT NULL,
+      input TEXT NOT NULL,
+      output TEXT,
+      error_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS graph_node_runs (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES graph_runs(id) ON DELETE CASCADE,
+      node_id TEXT NOT NULL,
+      iteration INTEGER NOT NULL,
+      status TEXT NOT NULL,
+      input TEXT NOT NULL,
+      output TEXT,
+      error_json TEXT,
+      created_at TEXT NOT NULL,
+      updated_at TEXT NOT NULL
+    );
+
+    CREATE TABLE IF NOT EXISTS graph_run_events (
+      id TEXT PRIMARY KEY,
+      run_id TEXT NOT NULL REFERENCES graph_runs(id) ON DELETE CASCADE,
+      sequence INTEGER NOT NULL,
+      type TEXT NOT NULL,
+      node_id TEXT,
+      payload_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      UNIQUE (run_id, sequence)
+    );
+
+    CREATE UNIQUE INDEX IF NOT EXISTS graph_runs_one_active_per_graph
+    ON graph_runs(graph_id) WHERE status = 'running';
+
     CREATE UNIQUE INDEX IF NOT EXISTS turns_one_active_per_conversation
     ON turns(conversation_id)
     WHERE status IN ('starting', 'running', 'cancelling');
   `);
 
   migrateQueuedMessageSequence(db);
+  migrateWorkspaceManagement(db);
+  migrateTraeQueue(db);
+  migrateQueueDeliveries(db);
+}
+
+function migrateQueueDeliveries(db: DatabaseSync): void {
+  const columns = new Set((db.prepare("PRAGMA table_info(queued_messages)").all() as Array<{ name: string }>).map((item) => item.name));
+  if (!columns.has("delivery_id")) db.exec("ALTER TABLE queued_messages ADD COLUMN delivery_id TEXT");
+  db.exec(`
+    CREATE UNIQUE INDEX IF NOT EXISTS queued_messages_one_staged_idx
+    ON queued_messages(conversation_id)
+    WHERE status = 'staged'
+  `);
+}
+
+function migrateTraeQueue(db: DatabaseSync): void {
+  for (const [table, column] of [["conversations", "auto_queue"], ["turn_snapshots", "auto_queue"]] as const) {
+    const exists = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .some((item) => item.name === column);
+    if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} INTEGER NOT NULL DEFAULT 0`);
+  }
+}
+
+function migrateWorkspaceManagement(db: DatabaseSync): void {
+  for (const [table, column, definition] of [
+    ["projects", "archived_at", "TEXT"],
+    ["conversations", "title", "TEXT"],
+    ["conversations", "archived_at", "TEXT"],
+  ] as const) {
+    const exists = (db.prepare(`PRAGMA table_info(${table})`).all() as Array<{ name: string }>)
+      .some((item) => item.name === column);
+    if (!exists) db.exec(`ALTER TABLE ${table} ADD COLUMN ${column} ${definition}`);
+  }
 }
 
 function migrateQueuedMessageSequence(db: DatabaseSync): void {
@@ -130,18 +224,18 @@ function migrateQueuedMessageSequence(db: DatabaseSync): void {
     }
 
     db.exec(`
-      WITH ranked AS (
+      WITH current AS (
+        SELECT COALESCE(MAX(enqueue_seq), 0) AS max_seq
+        FROM queued_messages
+      ), ranked AS (
         SELECT
           rowid AS message_rowid,
-          ROW_NUMBER() OVER (
+          (SELECT max_seq FROM current) + ROW_NUMBER() OVER (
             PARTITION BY conversation_id
-            ORDER BY
-              CASE WHEN enqueue_seq IS NULL THEN 1 ELSE 0 END,
-              enqueue_seq ASC,
-              created_at ASC,
-              rowid ASC
+            ORDER BY created_at ASC, rowid ASC
           ) AS enqueue_seq
         FROM queued_messages
+        WHERE enqueue_seq IS NULL
       )
       UPDATE queued_messages
       SET enqueue_seq = (
@@ -149,6 +243,7 @@ function migrateQueuedMessageSequence(db: DatabaseSync): void {
         FROM ranked
         WHERE ranked.message_rowid = queued_messages.rowid
       )
+      WHERE enqueue_seq IS NULL
     `);
 
     const incomplete = db

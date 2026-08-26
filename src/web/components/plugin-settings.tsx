@@ -1,246 +1,31 @@
 import { useState } from "react";
 import type { AgentProductId, PluginVersion } from "../../shared/contracts.js";
 import { isPhaseOneAgentProductId, type PluginMaterializationView } from "../api.js";
+import { AgentBadge } from "./agent-badge.js";
 
-export type PluginType = "skill" | "mcp";
-export type PluginScope = "global" | "project" | "conversation";
-
-export interface InstalledPluginVersion extends PluginVersion {
-  type: PluginType;
-  compatibleAgents: AgentProductId[];
-  materializations: PluginMaterializationView[];
+export type PluginType = "skill" | "mcp"; export type PluginScope = "global" | "project" | "conversation";
+export interface InstalledPluginVersion extends PluginVersion { type: PluginType; compatibleAgents: AgentProductId[]; materializations: PluginMaterializationView[]; }
+interface Props { installedVersions: InstalledPluginVersion[]; error?: string | null; scope: PluginScope; conversationAgentProductId?: AgentProductId | null; enabledVersions: PluginVersion[]; enablementsLoading?: boolean; language?: "zh" | "en"; onInstallLocalPath(path:string,type:PluginType,agents:AgentProductId[]):void; onPickLocalPath(kind:"directory"|"file"):Promise<string|null>; onRefreshImports():void; onScopeChange(scope:PluginScope):void; onEnableChange(scope:PluginScope, change:PluginVersion & {enabled:boolean}):void; onRepairMaterialization(agent:AgentProductId,plugin:PluginVersion):void; }
+const labels: Record<AgentProductId,string>={codex:"Codex",claude:"Claude Code",trae:"Trae CLI",opencode:"OpenCode"};
+const agents: AgentProductId[]=["codex","claude","trae"];
+export function PluginSettings(props: Props) {
+  const [type,setType]=useState<PluginType>("skill"); const [query,setQuery]=useState(""); const zh=props.language==="zh";
+  const installed=[...props.installedVersions].filter((v)=>v.type===type&&v.pluginId.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())).sort(byName);
+  const choose=async()=>{ const path=await props.onPickLocalPath(type==="skill"?"directory":"file"); if(path) props.onInstallLocalPath(path,type,type==="skill"?agents:[]); };
+  return <section className="plugin-settings" aria-label="Plugin settings">
+    <div className="plugin-settings__heading"><div><h1>{zh?"插件":"Plugins"}</h1><p>{zh?"已自动发现本机 Skills 与 MCP。开关决定它们是否在所选范围生效；只有添加其他位置时才需要选择文件。":"Installed Skills and MCP are automatically discovered. Use the switch for the selected scope; choose a file only to add another location."}</p></div><button type="button" onClick={props.onRefreshImports}>{zh?"自动导入":"Auto import"}</button></div>
+    {props.error?<p role="alert">{zh?"插件清单不可用":"Plugin inventory unavailable"}: {props.error}</p>:null}
+    <div className="plugin-settings__tabs" role="group" aria-label="Plugin types"><button type="button" data-active={type==="skill"} onClick={()=>setType("skill")}>Skills</button><button type="button" data-active={type==="mcp"} onClick={()=>setType("mcp")}>MCP</button></div>
+    <div className="plugin-settings__toolbar"><label>{zh?"生效范围":"Apply to"}<select aria-label="Plugin scope" value={props.scope} onChange={(e)=>props.onScopeChange(e.currentTarget.value as PluginScope)}><option value="global">{zh?"所有项目":"All projects"}</option><option value="project">{zh?"当前项目":"Current project"}</option><option value="conversation">{zh?"当前对话":"Current conversation"}</option></select></label><input type="search" aria-label="Search plugins" placeholder={zh?"搜索插件":"Search plugins"} value={query} onChange={(event)=>setQuery(event.currentTarget.value)}/><button type="button" onClick={()=>void choose()}>{type==="skill"?(zh?"添加 Skill":"Add Skill"):(zh?"添加 MCP":"Add MCP")}</button></div>
+    <PluginList title={zh?"可用插件":"Available plugins"} ariaLabel="Installed plugin versions" empty={zh?"没有匹配的插件":"No matching plugins"} rows={installed.map((v)=>{
+      const enabled=props.enabledVersions.some((e)=>e.pluginId===v.pluginId&&e.versionId===v.versionId);
+      const compatible=v.compatibleAgents.filter(isPhaseOneAgentProductId);
+      const incompatible=!compatible.length||(props.scope==="conversation"&&props.conversationAgentProductId!=null&&!compatible.includes(props.conversationAgentProductId));
+      return {key:`${v.pluginId}:${v.versionId}`,name:v.pluginId,kind:v.type==="skill"?"Skill":"MCP",version:short(v.versionId),action:<label className="plugin-settings__switch"><input type="checkbox" aria-label={`Enable ${v.pluginId} ${v.versionId}`} disabled={props.enablementsLoading||(!enabled&&incompatible)} checked={enabled} onChange={(e)=>props.onEnableChange(props.scope,{pluginId:v.pluginId,versionId:v.versionId,enabled:e.currentTarget.checked})}/><span aria-hidden="true"/></label>,agents:<>{compatible.map((agent)=>{const materialization=v.materializations.find((item)=>item.agentProductId===agent);return <span className="plugin-settings__agent" key={agent} title={materialization?statusText(materialization.status,zh):undefined}><AgentBadge agent={agent}/>{materialization?.repairable?<button type="button" aria-label={`Repair ${v.pluginId} ${v.versionId} for ${labels[agent]}`} onClick={()=>props.onRepairMaterialization(agent,v)}>{zh?"同步":"Sync"}</button>:null}</span>;})}</>};
+    })}/>
+  </section>;
 }
-
-export interface PluginImportCandidate extends PluginVersion {
-  type: PluginType;
-  compatibleAgents: AgentProductId[];
-  candidateId: string;
-  sourceAgent: AgentProductId;
-}
-
-interface PluginSettingsProps {
-  installedVersions: InstalledPluginVersion[];
-  importCandidates: PluginImportCandidate[];
-  error?: string | null;
-  scope: PluginScope;
-  conversationAgentProductId?: AgentProductId | null;
-  enabledVersions: PluginVersion[];
-  enablementsLoading?: boolean;
-  enablementsLocked: boolean;
-  onAcceptCandidate(candidateId: string): void;
-  onInstallLocalPath(path: string, type: PluginType, compatibleAgents: AgentProductId[]): void;
-  onRefreshImports(): void;
-  onScopeChange(scope: PluginScope): void;
-  onEnableChange(
-    scope: PluginScope,
-    change: PluginVersion & { enabled: boolean },
-  ): void;
-  onRepairMaterialization(agentProductId: AgentProductId, plugin: PluginVersion): void;
-}
-
-const agentLabels: Record<AgentProductId, string> = {
-  codex: "Codex",
-  claude: "Claude Code",
-  trae: "Trae",
-  opencode: "OpenCode",
-};
-
-const phaseOneAgentProducts: AgentProductId[] = ["codex", "claude", "trae"];
-
-export function PluginSettings(props: PluginSettingsProps) {
-  const [installType, setInstallType] = useState<PluginType>("skill");
-
-  return (
-    <section className="plugin-settings" aria-label="Plugin settings">
-      <h1>Plugins</h1>
-      {props.error ? <p role="alert">Plugin inventory unavailable: {props.error}</p> : null}
-      <button type="button" onClick={props.onRefreshImports}>
-        Refresh imports
-      </button>
-
-      <form
-        className="plugin-settings__install"
-        onSubmit={(event) => {
-          event.preventDefault();
-          const path = new FormData(event.currentTarget).get("path");
-          const compatibleAgents = new FormData(event.currentTarget)
-            .getAll("compatibleAgents")
-            .filter(isAgentProductId);
-          if (
-            typeof path === "string" &&
-            path.trim() &&
-            (installType === "mcp" || compatibleAgents.length > 0)
-          ) {
-            props.onInstallLocalPath(path.trim(), installType, compatibleAgents);
-          }
-        }}
-      >
-        <label htmlFor="local-plugin-type">Local plugin type</label>
-        <select
-          id="local-plugin-type"
-          value={installType}
-          onChange={(event) => setInstallType(event.currentTarget.value as PluginType)}
-        >
-          <option value="skill">Skill directory</option>
-          <option value="mcp">Ain One MCP definition</option>
-        </select>
-        <label htmlFor="local-plugin-path">Local plugin path</label>
-        <input id="local-plugin-path" name="path" type="text" required />
-        <fieldset>
-          <legend>Compatible Agent Products</legend>
-          {phaseOneAgentProducts.map((agentProductId) => (
-            <label key={agentProductId}>
-              <input
-                type="checkbox"
-                name="compatibleAgents"
-                value={agentProductId}
-                aria-label={`Compatible with ${agentLabels[agentProductId]}`}
-                disabled={installType === "mcp"}
-              />
-              {agentLabels[agentProductId]}
-            </label>
-          ))}
-        </fieldset>
-        <button type="submit">Install local plugin</button>
-      </form>
-
-      <label htmlFor="plugin-scope">Plugin scope</label>
-      <select
-        id="plugin-scope"
-        value={props.scope}
-        onChange={(event) => props.onScopeChange(event.currentTarget.value as PluginScope)}
-      >
-        <option value="global">Global</option>
-        <option value="project">Project</option>
-        <option value="conversation">Conversation</option>
-      </select>
-      {props.enablementsLocked ? (
-        <p role="status">Active Turns must finish before changing this plugin scope.</p>
-      ) : null}
-
-      <section aria-label="Installed plugin versions">
-        <h2>Installed versions</h2>
-        <ul className="plugin-settings__versions">
-          {props.installedVersions.map((version) => {
-            const unavailable = !version.compatibleAgents.some(isPhaseOneAgentProductId);
-            const incompatible =
-              props.scope === "conversation" &&
-              props.conversationAgentProductId != null &&
-              !version.compatibleAgents.includes(props.conversationAgentProductId);
-            return (
-            <li key={`${version.pluginId}:${version.versionId}`}>
-              <article className="plugin-settings__version">
-                <p>Plugin: {version.pluginId}</p>
-                <p>Version: {version.versionId}</p>
-                <p>Type: {version.type}</p>
-                <p>{compatibilityText(version.compatibleAgents)}</p>
-                <ul aria-label={`Materialization status for ${version.pluginId} ${version.versionId}`}>
-                  {version.materializations
-                    .filter((materialization) =>
-                      isPhaseOneAgentProductId(materialization.agentProductId)
-                    )
-                    .map((materialization) => (
-                    <li key={materialization.agentProductId}>
-                      {agentLabels[materialization.agentProductId]}: {statusLabel(materialization.status)}
-                      {materialization.repairable ? (
-                        <button
-                          type="button"
-                          aria-label={`Repair ${version.pluginId} ${version.versionId} for ${agentLabels[materialization.agentProductId]}`}
-                          onClick={() => props.onRepairMaterialization(materialization.agentProductId, version)}
-                        >
-                          Repair
-                        </button>
-                      ) : null}
-                    </li>
-                    ))}
-                </ul>
-                <label>
-                  <input
-                    type="checkbox"
-                    aria-label={`Enable ${version.pluginId} ${version.versionId}`}
-                    disabled={
-                      props.enablementsLoading ||
-                      props.enablementsLocked ||
-                      unavailable ||
-                      incompatible
-                    }
-                    checked={props.enabledVersions.some(
-                      (enabled) =>
-                        enabled.pluginId === version.pluginId &&
-                        enabled.versionId === version.versionId,
-                    )}
-                    onChange={(event) =>
-                      props.onEnableChange(props.scope, {
-                        pluginId: version.pluginId,
-                        versionId: version.versionId,
-                        enabled: event.currentTarget.checked,
-                      })
-                    }
-                  />
-                  Enabled for {props.scope}
-                </label>
-                {incompatible ? (
-                  <p>Incompatible with {agentLabels[props.conversationAgentProductId!]}</p>
-                ) : null}
-                {unavailable ? <p>Unavailable in Phase 1</p> : null}
-              </article>
-            </li>
-            );
-          })}
-        </ul>
-      </section>
-
-      <section aria-label="Plugin import candidates">
-        <h2>Import candidates</h2>
-        <ul className="plugin-settings__candidates">
-          {props.importCandidates
-            .filter((candidate) => isPhaseOneAgentProductId(candidate.sourceAgent))
-            .map((candidate) => (
-            <li key={`${candidate.pluginId}:${candidate.versionId}:${candidate.sourceAgent}`}>
-              <article className="plugin-settings__candidate">
-                <p>Plugin: {candidate.pluginId}</p>
-                <p>Version: {candidate.versionId}</p>
-                <p>Type: {candidate.type}</p>
-                <p>Source agent: {agentLabels[candidate.sourceAgent]}</p>
-                <p>{compatibilityText(candidate.compatibleAgents)}</p>
-                <button
-                  type="button"
-                  aria-label={`Accept ${candidate.pluginId} ${candidate.versionId}`}
-                  onClick={() => props.onAcceptCandidate(candidate.candidateId)}
-                >
-                  Accept
-                </button>
-              </article>
-            </li>
-            ))}
-        </ul>
-      </section>
-    </section>
-  );
-}
-
-function compatibilityText(agents: AgentProductId[]): string {
-  const visibleAgents = agents.filter(isPhaseOneAgentProductId);
-  return `Compatible agents: ${
-    visibleAgents.length > 0
-      ? visibleAgents.map((agent) => agentLabels[agent]).join(", ")
-      : "None declared"
-  }`;
-}
-
-function statusLabel(status: PluginMaterializationView["status"]): string {
-  switch (status) {
-    case "materialized":
-      return "Materialized";
-    case "not_materialized":
-      return "Not materialized";
-    case "conflicted":
-      return "Conflict";
-    case "turn_scoped":
-      return "Generated per Turn";
-  }
-}
-
-function isAgentProductId(value: FormDataEntryValue): value is AgentProductId {
-  return isPhaseOneAgentProductId(value);
-}
+function PluginList({title,ariaLabel,empty,rows}:{title:string;ariaLabel:string;empty:string;rows:Array<{key:string;name:string;kind:string;version:string;action:React.ReactNode;agents:React.ReactNode}>}) { return <section aria-label={ariaLabel} className="plugin-settings__section"><h2>{title}<span>{rows.length}</span></h2>{rows.length?<ul className="plugin-settings__list">{rows.map((row)=><li key={row.key}><div className="plugin-settings__card"><div className="plugin-settings__name"><span className="plugin-settings__kind">{row.kind}</span><strong>{row.name}</strong></div><span className="plugin-settings__version">{row.version}</span><div className="plugin-settings__agents">{row.agents}</div></div>{row.action}</li>)}</ul>:<p className="plugin-settings__empty">{empty}</p>}</section>; }
+function byName<T extends PluginVersion>(a:T,b:T){return a.pluginId.localeCompare(b.pluginId)||a.versionId.localeCompare(b.versionId);}
+function short(value:string){return value.length>12?`${value.slice(0,12)}…`:value;}
+function statusText(status:PluginMaterializationView["status"],zh:boolean){if(status==="materialized")return zh?"可用":"Ready";if(status==="not_materialized")return zh?"待同步":"Needs sync";if(status==="turn_scoped")return zh?"按对话使用":"Per turn";return zh?"冲突":"Conflict";}

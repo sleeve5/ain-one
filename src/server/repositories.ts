@@ -20,25 +20,47 @@ import type {
 
 export interface Repositories {
   createProject(path: string, name: string): Project;
-  listProjects(): Project[];
+  listProjects(archived?: boolean): Project[];
+  renameProject(projectId: string, name: string): "updated" | "not_found";
+  archiveProject(projectId: string, archived: boolean): "updated" | "not_found" | "turn_active";
+  deleteArchivedProject(projectId: string): "deleted" | "not_found" | "not_archived" | "turn_active";
   getProject(projectId: string): Project | null;
   getProjectByPath(path: string): Project | null;
   createConversation(input: CreateConversationInput): Conversation;
-  listConversations(projectId: string): Conversation[];
+  listConversations(projectId: string, archived?: boolean): Conversation[];
+  renameConversation(conversationId: string, title: string): "updated" | "not_found";
+  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active";
+  deleteArchivedConversation(conversationId: string): "deleted" | "not_found" | "not_archived" | "turn_active";
+  forkConversation(conversationId: string): Conversation | null;
   getConversation(conversationId: string): Conversation | null;
   getAgentExecutablePaths(): Partial<Record<AgentProductId, string>>;
   setAgentExecutablePath(agentProductId: AgentProductId, executablePath: string | null): void;
+  isAgentEnabled(agentProductId: AgentProductId): boolean;
+  setAgentEnabled(agentProductId: AgentProductId, enabled: boolean): void;
   hasActiveTurnForAgent(agentProductId: AgentProductId): boolean;
   updateConversationSettings(
     conversationId: string,
     settings: ConversationSettingsInput,
   ): "updated" | "not_found" | "turn_active";
-  setPluginEnablements(scope: PluginScope, plugins: PluginVersion[]): "updated" | "turn_active";
+  setPluginEnablements(scope: PluginScope, plugins: PluginVersion[]): "updated";
   listPluginEnablements(scope: PluginScope): PluginVersion[];
+  isPluginScopeConfigured(scope: PluginScope): boolean;
   resolvePluginVersions(projectId: string, conversationId: string): PluginVersion[];
   setConversationQueuePaused(conversationId: string, queuePaused: boolean): void;
   recordQueueDispatchFailure(conversationId: string, error: NormalizedError): void;
   enqueueMessage(conversationId: string, content: string): QueuedMessage;
+  stageMessage(conversationId: string, messageId: string, deliveryId: string): QueuedMessage | null;
+  rollbackStagedMessage(conversationId: string, messageId: string, deliveryId: string): boolean;
+  acknowledgeMessageDelivery(conversationId: string, messageId: string, deliveryId: string, snapshot: TurnSnapshot): { turnId: string; alreadyAcknowledged: boolean } | null;
+  completeActiveTurnAtSafePoint(conversationId: string): string | null;
+  markStagedMessagesUncertain(): number;
+  markConversationStagedMessageUncertain(conversationId: string): boolean;
+  resolveUncertainMessage(
+    conversationId: string,
+    messageId: string,
+    action: "retry" | "accept",
+  ): boolean;
+  consumePendingMessage(conversationId: string, messageId: string): boolean;
   enqueueInterruptedTurnRetry(
     conversationId: string,
     turnId: string,
@@ -53,7 +75,7 @@ export interface Repositories {
     snapshot: TurnSnapshot,
   ): { message: QueuedMessage; turn: Turn } | null;
   markTurnRunning(turnId: string, nativeTurnId: string | null): boolean;
-  markTurnCancelling(turnId: string): void;
+  markTurnCancelling(turnId: string): boolean;
   finishTurn(turnId: string, status: TerminalTurnStatus, error?: NormalizedError): void;
   commitTerminalTurn(input: {
     conversationId: string;
@@ -92,24 +114,26 @@ class SqliteRepositories implements Repositories {
       id: randomUUID(),
       path,
       name,
+      archivedAt: null,
       createdAt: now,
       updatedAt: now,
     };
 
     this.db
       .prepare(
-        `INSERT INTO projects (id, path, name, created_at, updated_at)
-         VALUES (?, ?, ?, ?, ?)`,
+        `INSERT INTO projects (id, path, name, archived_at, created_at, updated_at)
+         VALUES (?, ?, ?, NULL, ?, ?)`,
       )
       .run(project.id, project.path, project.name, project.createdAt, project.updatedAt);
 
     return project;
   }
 
-  listProjects(): Project[] {
+  listProjects(archived = false): Project[] {
     const rows = this.getRows<DbProjectRow>(
-      `SELECT id, path, name, created_at, updated_at
+      `SELECT id, path, name, archived_at, created_at, updated_at
        FROM projects
+       WHERE archived_at IS ${archived ? "NOT " : ""}NULL
        ORDER BY updated_at DESC, rowid DESC`,
     );
     return rows.map(mapProject);
@@ -117,7 +141,7 @@ class SqliteRepositories implements Repositories {
 
   getProject(projectId: string): Project | null {
     const row = this.getRow<DbProjectRow>(
-      `SELECT id, path, name, created_at, updated_at
+      `SELECT id, path, name, archived_at, created_at, updated_at
        FROM projects
        WHERE id = ?`,
       projectId,
@@ -128,7 +152,7 @@ class SqliteRepositories implements Repositories {
 
   getProjectByPath(path: string): Project | null {
     const row = this.getRow<DbProjectRow>(
-      `SELECT id, path, name, created_at, updated_at
+      `SELECT id, path, name, archived_at, created_at, updated_at
        FROM projects
        WHERE path = ?`,
       path,
@@ -136,15 +160,47 @@ class SqliteRepositories implements Repositories {
     return row ? mapProject(row) : null;
   }
 
+  renameProject(projectId: string, name: string): "updated" | "not_found" {
+    return this.updateNamedRecord("projects", projectId, "name", name);
+  }
+
+  archiveProject(projectId: string, archived: boolean): "updated" | "not_found" | "turn_active" {
+    if (archived && this.listProjectConversationIds(projectId).some((id) => this.getActiveTurn(id))) {
+      return "turn_active";
+    }
+    return this.updateArchive("projects", projectId, archived);
+  }
+
+  deleteArchivedProject(projectId: string): "deleted" | "not_found" | "not_archived" | "turn_active" {
+    return this.immediateTransaction(() => {
+      const project = this.getProject(projectId);
+      if (!project) return "not_found";
+      if (!project.archivedAt) return "not_archived";
+      const conversationIds = this.listProjectConversationIds(projectId);
+      if (conversationIds.some((id) => this.getActiveTurn(id))) return "turn_active";
+      this.deletePluginScopes("conversation", conversationIds);
+      this.deletePluginScopes("project", [projectId]);
+      if (conversationIds.length > 0) {
+        const placeholders = conversationIds.map(() => "?").join(", " );
+        this.db.prepare(`DELETE FROM turns WHERE conversation_id IN (${placeholders})`).run(...conversationIds);
+      }
+      this.db.prepare("DELETE FROM projects WHERE id = ?").run(projectId);
+      return "deleted";
+    });
+  }
+
   createConversation(input: CreateConversationInput): Conversation {
     const now = isoNow();
     const conversation: Conversation = {
       id: randomUUID(),
       projectId: input.projectId,
+      title: null,
       agentProductId: input.agentProductId,
       modelId: input.modelId,
       permissionMode: input.permissionMode ?? "request_approval",
       queuePaused: false,
+      autoQueue: input.agentProductId === "trae" && input.autoQueue === true,
+      archivedAt: null,
       createdAt: now,
       updatedAt: now,
     };
@@ -153,8 +209,8 @@ class SqliteRepositories implements Repositories {
       .prepare(
         `INSERT INTO conversations (
             id, project_id, agent_product_id, model_id, permission_mode,
-            queue_paused, created_at, updated_at
-         ) VALUES (?, ?, ?, ?, ?, ?, ?, ?)`,
+            queue_paused, auto_queue, title, archived_at, created_at, updated_at
+         ) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, NULL, ?, ?)`,
       )
       .run(
         conversation.id,
@@ -163,6 +219,7 @@ class SqliteRepositories implements Repositories {
         conversation.modelId,
         conversation.permissionMode,
         conversation.queuePaused ? 1 : 0,
+        conversation.autoQueue ? 1 : 0,
         conversation.createdAt,
         conversation.updatedAt,
       );
@@ -170,7 +227,7 @@ class SqliteRepositories implements Repositories {
     return conversation;
   }
 
-  listConversations(projectId: string): Conversation[] {
+  listConversations(projectId: string, archived = false): Conversation[] {
     const rows = this.getRows<DbConversationRow>(
       `SELECT
          id,
@@ -179,10 +236,13 @@ class SqliteRepositories implements Repositories {
          model_id,
          permission_mode,
          queue_paused,
+         auto_queue,
+         title,
+         archived_at,
          created_at,
          updated_at
        FROM conversations
-       WHERE project_id = ?
+       WHERE project_id = ? AND archived_at IS ${archived ? "NOT " : ""}NULL
        ORDER BY updated_at DESC, rowid DESC`,
       projectId,
     );
@@ -199,6 +259,9 @@ class SqliteRepositories implements Repositories {
          model_id,
          permission_mode,
          queue_paused,
+         auto_queue,
+         title,
+         archived_at,
          created_at,
          updated_at
        FROM conversations
@@ -207,6 +270,57 @@ class SqliteRepositories implements Repositories {
     );
 
     return row ? mapConversation(row) : null;
+  }
+
+  renameConversation(conversationId: string, title: string): "updated" | "not_found" {
+    return this.updateNamedRecord("conversations", conversationId, "title", title);
+  }
+
+  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active" {
+    if (archived && this.getActiveTurn(conversationId)) return "turn_active";
+    return this.updateArchive("conversations", conversationId, archived);
+  }
+
+  deleteArchivedConversation(conversationId: string): "deleted" | "not_found" | "not_archived" | "turn_active" {
+    return this.immediateTransaction(() => {
+      const conversation = this.getConversation(conversationId);
+      if (!conversation) return "not_found";
+      if (!conversation.archivedAt) return "not_archived";
+      if (this.getActiveTurn(conversationId)) return "turn_active";
+      this.db.prepare("DELETE FROM plugin_enablements WHERE scope_type = 'conversation' AND scope_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM plugin_enablement_scopes WHERE scope_type = 'conversation' AND scope_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM turns WHERE conversation_id = ?").run(conversationId);
+      this.db.prepare("DELETE FROM conversations WHERE id = ?").run(conversationId);
+      return "deleted";
+    });
+  }
+
+  forkConversation(conversationId: string): Conversation | null {
+    return this.immediateTransaction(() => {
+      const source = this.getConversation(conversationId);
+      if (!source) return null;
+      const fork = this.createConversation({
+        projectId: source.projectId, agentProductId: source.agentProductId,
+        modelId: source.modelId, permissionMode: source.permissionMode, autoQueue: source.autoQueue,
+      });
+      this.renameConversation(fork.id, `${source.title ?? "Conversation"} (branch)`);
+      const pendingMessages = new Set(this.listQueuedMessages(source.id).map((message) => message.id));
+      const events = this.eventsAfter(source.id, 0).filter((event) =>
+        event.type !== "user_message" || !pendingMessages.has(String(event.payload.messageId)),
+      );
+      for (const event of events) {
+        this.insertEvent(fork.id, { type: event.type, payload: event.payload }, event.createdAt);
+      }
+      const sourceScope = { type: "conversation", id: source.id } as const;
+      if (this.isPluginScopeConfigured(sourceScope)) {
+        const forkScope = { type: "conversation", id: fork.id } as const;
+        this.replacePluginEnablements(forkScope, this.listPluginEnablements(sourceScope));
+        this.db.prepare(
+          `INSERT INTO plugin_enablement_scopes (scope_type, scope_id, updated_at) VALUES (?, ?, ?)`,
+        ).run(forkScope.type, forkScope.id, isoNow());
+      }
+      return this.getConversation(fork.id);
+    });
   }
 
   getAgentExecutablePaths(): Partial<Record<AgentProductId, string>> {
@@ -236,6 +350,21 @@ class SqliteRepositories implements Repositories {
       .run(agentProductId, executablePath, isoNow());
   }
 
+  isAgentEnabled(agentProductId: AgentProductId): boolean {
+    const row = this.getRow<{ enabled: number }>(
+      "SELECT enabled FROM agent_settings WHERE agent_product_id = ?",
+      agentProductId,
+    );
+    return row?.enabled !== 0;
+  }
+
+  setAgentEnabled(agentProductId: AgentProductId, enabled: boolean): void {
+    this.db.prepare(
+      `INSERT INTO agent_settings (agent_product_id, enabled, updated_at) VALUES (?, ?, ?)
+       ON CONFLICT(agent_product_id) DO UPDATE SET enabled = excluded.enabled, updated_at = excluded.updated_at`,
+    ).run(agentProductId, enabled ? 1 : 0, isoNow());
+  }
+
   hasActiveTurnForAgent(agentProductId: AgentProductId): boolean {
     return Boolean(this.getRow(
       `SELECT t.id
@@ -253,7 +382,8 @@ class SqliteRepositories implements Repositories {
     settings: ConversationSettingsInput,
   ): "updated" | "not_found" | "turn_active" {
     return this.immediateTransaction(() => {
-      if (!this.getConversation(conversationId)) {
+      const conversation = this.getConversation(conversationId);
+      if (!conversation) {
         return "not_found";
       }
       if (this.getActiveTurn(conversationId)) {
@@ -263,19 +393,22 @@ class SqliteRepositories implements Repositories {
       this.db
         .prepare(
           `UPDATE conversations
-           SET model_id = ?, permission_mode = ?, updated_at = ?
+           SET model_id = ?, permission_mode = ?, auto_queue = ?, updated_at = ?
            WHERE id = ?`,
         )
-        .run(settings.modelId, settings.permissionMode, isoNow(), conversationId);
+        .run(
+          settings.modelId,
+          settings.permissionMode,
+          conversation.agentProductId === "trae" && (settings.autoQueue ?? conversation.autoQueue) ? 1 : 0,
+          isoNow(),
+          conversationId,
+        );
       return "updated";
     });
   }
 
-  setPluginEnablements(scope: PluginScope, plugins: PluginVersion[]): "updated" | "turn_active" {
+  setPluginEnablements(scope: PluginScope, plugins: PluginVersion[]): "updated" {
     return this.immediateTransaction(() => {
-      if (this.hasActiveTurnForPluginScope(scope)) {
-        return "turn_active";
-      }
       this.replacePluginEnablements(scope, plugins);
       this.db
         .prepare(
@@ -356,6 +489,9 @@ class SqliteRepositories implements Repositories {
 
   enqueueMessage(conversationId: string, content: string): QueuedMessage {
     return this.immediateTransaction(() => {
+      this.db.prepare(
+        `UPDATE conversations SET title = COALESCE(title, ?), updated_at = ? WHERE id = ?`,
+      ).run(compactTitle(content), isoNow(), conversationId);
       const nextSequenceRow = this.getRow<{ enqueue_seq: number }>(
         `SELECT COALESCE(MAX(enqueue_seq), 0) + 1 AS enqueue_seq
          FROM queued_messages
@@ -371,6 +507,8 @@ class SqliteRepositories implements Repositories {
         id: randomUUID(),
         conversationId,
         content,
+        status: "pending",
+        deliveryId: null,
         createdAt: now,
       };
 
@@ -395,9 +533,152 @@ class SqliteRepositories implements Repositories {
           message.createdAt,
           now,
         );
-
+      this.insertEvent(conversationId, {
+        type: "user_message", payload: { text: content, role: "user", messageId: message.id },
+      });
       return message;
     });
+  }
+
+  stageMessage(conversationId: string, messageId: string, deliveryId: string): QueuedMessage | null {
+    return this.immediateTransaction(() => {
+      const occupied = this.getRow<{ id: string }>(
+        "SELECT id FROM queued_messages WHERE conversation_id = ? AND status = 'staged' AND id <> ? LIMIT 1",
+        conversationId, messageId,
+      );
+      if (occupied) return null;
+      const existing = this.getRow<DbQueuedMessageRow>(
+        `SELECT id, conversation_id, content, status, delivery_id, created_at
+         FROM queued_messages WHERE conversation_id = ? AND id = ?`,
+        conversationId, messageId,
+      );
+      if (!existing) return null;
+      const head = this.getRow<{ id: string }>(
+        `SELECT id FROM queued_messages WHERE conversation_id = ? AND status = 'pending' ORDER BY enqueue_seq ASC LIMIT 1`,
+        conversationId,
+      );
+      if (existing.status === "pending" && head?.id !== messageId) return null;
+      if (existing.status === "staged" && existing.delivery_id === deliveryId) return mapQueuedMessage(existing);
+      if (existing.status !== "pending") return null;
+      const result = this.db.prepare(
+        `UPDATE queued_messages SET status = 'staged', delivery_id = ?, updated_at = ?
+         WHERE conversation_id = ? AND id = ? AND status = 'pending'`,
+      ).run(deliveryId, isoNow(), conversationId, messageId) as { changes: number };
+      return result.changes > 0 ? { ...mapQueuedMessage(existing), status: "staged", deliveryId } : null;
+    });
+  }
+
+  rollbackStagedMessage(conversationId: string, messageId: string, deliveryId: string): boolean {
+    return (this.db.prepare(
+      `UPDATE queued_messages SET status = 'pending', delivery_id = NULL, updated_at = ?
+       WHERE conversation_id = ? AND id = ? AND status = 'staged' AND delivery_id = ?`,
+    ).run(isoNow(), conversationId, messageId, deliveryId) as { changes: number }).changes > 0;
+  }
+
+  acknowledgeMessageDelivery(conversationId: string, messageId: string, deliveryId: string, snapshot: TurnSnapshot): { turnId: string; alreadyAcknowledged: boolean } | null {
+    return this.immediateTransaction(() => {
+      const row = this.getRow<DbQueuedMessageRow>(
+        `SELECT id, conversation_id, content, status, delivery_id, created_at
+         FROM queued_messages WHERE conversation_id = ? AND id = ? AND delivery_id = ?`,
+        conversationId, messageId, deliveryId,
+      );
+      if (!row || (row.status !== "staged" && row.status !== "consumed")) return null;
+      const alreadyAcknowledged = row.status === "consumed";
+      const existingTurn = this.getRow<{ id: string }>("SELECT id FROM turns WHERE message_id = ? LIMIT 1", messageId);
+      const turnId = existingTurn?.id ?? randomUUID();
+      if (!alreadyAcknowledged) {
+        const now = isoNow();
+        const previous = this.getRow<{ id: string }>(
+          "SELECT id FROM turns WHERE conversation_id = ? AND status IN ('starting', 'running') ORDER BY updated_at DESC LIMIT 1", conversationId,
+        );
+        if (previous) {
+          this.db.prepare("UPDATE turns SET status = 'completed', updated_at = ? WHERE id = ?").run(now, previous.id);
+          this.insertEvent(conversationId, { type: "turn_status", payload: { turnId: previous.id, status: "completed" } });
+        }
+        if (!existingTurn) {
+          this.db.prepare("INSERT INTO turns (id, conversation_id, status, message_id, native_turn_id, error_json, created_at, updated_at) VALUES (?, ?, 'running', ?, NULL, NULL, ?, ?)")
+            .run(turnId, conversationId, messageId, now, now);
+          this.db.prepare("INSERT INTO turn_snapshots (turn_id, model_id, permission_mode, plugin_versions_json, auto_queue) VALUES (?, ?, ?, ?, ?)")
+            .run(turnId, snapshot.modelId, snapshot.permissionMode, JSON.stringify(snapshot.pluginVersions), snapshot.autoQueue ? 1 : 0);
+        }
+        this.db.prepare("UPDATE queued_messages SET status = 'consumed', updated_at = ? WHERE id = ? AND status = 'staged'")
+          .run(now, messageId);
+        this.insertUserMessageOnce(conversationId, row);
+        this.insertEvent(conversationId, { type: "turn_status", payload: { turnId, status: "running" } });
+      }
+      return { turnId, alreadyAcknowledged };
+    });
+  }
+
+  completeActiveTurnAtSafePoint(conversationId: string): string | null {
+    return this.immediateTransaction(() => {
+      const active = this.getRow<{ id: string }>(
+        "SELECT id FROM turns WHERE conversation_id = ? AND status IN ('starting', 'running') ORDER BY updated_at DESC LIMIT 1", conversationId,
+      );
+      if (!active) return null;
+      const now = isoNow();
+      this.db.prepare("UPDATE turns SET status = 'completed', updated_at = ? WHERE id = ?").run(now, active.id);
+      this.db.prepare("UPDATE conversations SET queue_paused = 0, updated_at = ? WHERE id = ?").run(now, conversationId);
+      this.insertEvent(conversationId, { type: "turn_status", payload: { turnId: active.id, status: "completed" } });
+      return active.id;
+    });
+  }
+
+  markStagedMessagesUncertain(): number {
+    return (this.db.prepare("UPDATE queued_messages SET status = 'uncertain', updated_at = ? WHERE status = 'staged'")
+      .run(isoNow()) as { changes: number }).changes;
+  }
+
+  markConversationStagedMessageUncertain(conversationId: string): boolean {
+    return this.immediateTransaction(() => {
+      const now = isoNow();
+      const result = this.db.prepare(
+        `UPDATE queued_messages SET status = 'uncertain', updated_at = ?
+         WHERE conversation_id = ? AND status = 'staged'`,
+      ).run(now, conversationId) as { changes: number };
+      if (result.changes > 0) {
+        this.db.prepare("UPDATE conversations SET queue_paused = 1, updated_at = ? WHERE id = ?")
+          .run(now, conversationId);
+      }
+      return result.changes > 0;
+    });
+  }
+
+  resolveUncertainMessage(
+    conversationId: string,
+    messageId: string,
+    action: "retry" | "accept",
+  ): boolean {
+    return this.immediateTransaction(() => {
+      const message = this.getRow<DbQueuedMessageRow>(
+        `SELECT id, conversation_id, content, status, delivery_id, created_at
+         FROM queued_messages WHERE conversation_id = ? AND id = ? AND status = 'uncertain'`,
+        conversationId, messageId,
+      );
+      if (!message) return false;
+      const now = isoNow();
+      if (action === "retry") {
+        this.db.prepare(
+          "UPDATE queued_messages SET status = 'pending', delivery_id = NULL, updated_at = ? WHERE id = ?",
+        ).run(now, messageId);
+      } else {
+        this.db.prepare(
+          "UPDATE queued_messages SET status = 'consumed', updated_at = ? WHERE id = ?",
+        ).run(now, messageId);
+        this.insertUserMessageOnce(conversationId, message);
+      }
+      this.db.prepare("UPDATE conversations SET queue_paused = 0, updated_at = ? WHERE id = ?")
+        .run(now, conversationId);
+      return true;
+    });
+  }
+
+  consumePendingMessage(conversationId: string, messageId: string): boolean {
+    const result = this.db.prepare(
+      `UPDATE queued_messages SET status = 'consumed', updated_at = ?
+       WHERE conversation_id = ? AND id = ? AND status = 'pending'`,
+    ).run(isoNow(), conversationId, messageId) as { changes: number };
+    return result.changes > 0;
   }
 
   enqueueInterruptedTurnRetry(
@@ -457,6 +738,8 @@ class SqliteRepositories implements Repositories {
         id: randomUUID(),
         conversationId,
         content: source.content,
+        status: "pending",
+        deliveryId: null,
         createdAt: now,
       };
       this.db
@@ -481,9 +764,9 @@ class SqliteRepositories implements Repositories {
 
   listQueuedMessages(conversationId: string): QueuedMessage[] {
     const rows = this.getRows<DbQueuedMessageRow>(
-      `SELECT id, conversation_id, content, created_at
+      `SELECT id, conversation_id, content, status, delivery_id, created_at
        FROM queued_messages
-       WHERE conversation_id = ? AND status = 'pending'
+       WHERE conversation_id = ? AND status IN ('pending', 'staged', 'uncertain')
        ORDER BY enqueue_seq ASC`,
       conversationId,
     );
@@ -539,15 +822,20 @@ class SqliteRepositories implements Repositories {
       }
 
       const row = this.getRow<DbQueuedMessageRow>(
-        `SELECT id, conversation_id, content, created_at
+        `SELECT id, conversation_id, content, status, delivery_id, created_at
          FROM queued_messages
-         WHERE conversation_id = ? AND status = 'pending'
+         WHERE conversation_id = ? AND status IN ('pending', 'staged', 'uncertain')
          ORDER BY enqueue_seq ASC
          LIMIT 1`,
         conversationId,
       );
 
       if (!row) {
+        return null;
+      }
+      if (row.status !== "pending") {
+        this.db.prepare("UPDATE conversations SET queue_paused = 1, updated_at = ? WHERE id = ?")
+          .run(isoNow(), conversationId);
         return null;
       }
 
@@ -575,10 +863,10 @@ class SqliteRepositories implements Repositories {
       this.db
         .prepare(
           `INSERT INTO turn_snapshots (
-            turn_id, model_id, permission_mode, plugin_versions_json
-          ) VALUES (?, ?, ?, ?)`,
+            turn_id, model_id, permission_mode, plugin_versions_json, auto_queue
+          ) VALUES (?, ?, ?, ?, ?)`,
         )
-        .run(turn.id, snapshot.modelId, snapshot.permissionMode, JSON.stringify(snapshot.pluginVersions));
+        .run(turn.id, snapshot.modelId, snapshot.permissionMode, JSON.stringify(snapshot.pluginVersions), snapshot.autoQueue ? 1 : 0);
 
       this.db
         .prepare(
@@ -614,18 +902,25 @@ class SqliteRepositories implements Repositories {
            WHERE id = (SELECT message_id FROM turns WHERE id = ?)`,
         )
         .run(now, turnId);
+      const message = this.getRow<DbQueuedMessageRow>(
+        `SELECT id, conversation_id, content, status, delivery_id, created_at
+         FROM queued_messages WHERE id = (SELECT message_id FROM turns WHERE id = ?)`,
+        turnId,
+      );
+      if (message) this.insertUserMessageOnce(message.conversation_id, message);
       return true;
     });
   }
 
-  markTurnCancelling(turnId: string): void {
-    this.db
+  markTurnCancelling(turnId: string): boolean {
+    const result = this.db
       .prepare(
         `UPDATE turns
          SET status = 'cancelling', updated_at = ?
-         WHERE id = ?`,
+         WHERE id = ? AND status IN ('starting', 'running')`,
       )
-      .run(isoNow(), turnId);
+      .run(isoNow(), turnId) as { changes: number };
+    return result.changes > 0;
   }
 
   finishTurn(turnId: string, status: TerminalTurnStatus, error?: NormalizedError): void {
@@ -758,6 +1053,35 @@ class SqliteRepositories implements Repositories {
   interruptActiveTurns(): number {
     return this.immediateTransaction(() => {
       const now = isoNow();
+      this.db.prepare(
+        "UPDATE queued_messages SET status = 'uncertain', updated_at = ? WHERE status = 'staged'",
+      ).run(now);
+      const active = this.db.prepare(
+        `SELECT t.id, t.conversation_id, c.agent_product_id, c.auto_queue,
+                (SELECT e.payload_json FROM events e
+                 WHERE e.conversation_id = t.conversation_id AND e.type = 'queue_status'
+                 ORDER BY e.sequence DESC LIMIT 1) AS queue_payload
+         FROM turns t JOIN conversations c ON c.id = t.conversation_id
+         WHERE t.status IN ('starting', 'running', 'cancelling')`,
+      ).all() as Array<{ id: string; conversation_id: string; agent_product_id: string; auto_queue: number; queue_payload: string | null }>;
+      const waiting = active.filter((turn) => {
+        if (turn.agent_product_id !== "trae" || turn.auto_queue !== 1 || !turn.queue_payload) return false;
+        try {
+          const payload = JSON.parse(turn.queue_payload) as Record<string, unknown>;
+          return payload.status === "waiting" && payload.hasPendingInput === false;
+        } catch {
+          return false;
+        }
+      });
+      for (const turn of waiting) {
+        this.db.prepare("UPDATE turns SET status = 'completed', updated_at = ? WHERE id = ?").run(now, turn.id);
+        this.db.prepare("UPDATE conversations SET queue_paused = 0, updated_at = ? WHERE id = ?").run(now, turn.conversation_id);
+        this.insertEvent(turn.conversation_id, { type: "turn_status", payload: { turnId: turn.id, status: "completed" } });
+      }
+      this.db.prepare(
+        `UPDATE conversations SET queue_paused = 1, updated_at = ?
+         WHERE id IN (SELECT conversation_id FROM queued_messages WHERE status = 'uncertain')`,
+      ).run(now);
       this.db
         .prepare(
           `UPDATE conversations
@@ -776,7 +1100,7 @@ class SqliteRepositories implements Repositories {
            WHERE status IN ('starting', 'running', 'cancelling')`,
         )
         .run(now) as { changes: number };
-      return result.changes;
+      return result.changes + waiting.length;
     });
   }
 
@@ -864,7 +1188,46 @@ class SqliteRepositories implements Repositories {
     }
   }
 
-  private insertEvent(conversationId: string, event: ConnectorEvent): NormalizedEvent {
+  private insertUserMessageOnce(conversationId: string, message: DbQueuedMessageRow): void {
+    const existing = this.getRow<{ id: string }>(
+      `SELECT id FROM events WHERE conversation_id = ? AND type = 'user_message'
+       AND json_extract(payload_json, '$.messageId') = ? LIMIT 1`,
+      conversationId, message.id,
+    );
+    if (!existing) this.insertEvent(conversationId, {
+      type: "user_message", payload: { text: message.content, role: "user", messageId: message.id },
+    });
+  }
+
+  private updateNamedRecord(
+    table: "projects" | "conversations",
+    id: string,
+    column: "name" | "title",
+    value: string,
+  ): "updated" | "not_found" {
+    const result = this.db.prepare(
+      `UPDATE ${table} SET ${column} = ?, updated_at = ? WHERE id = ?`,
+    ).run(value.trim(), isoNow(), id) as { changes: number };
+    return result.changes > 0 ? "updated" : "not_found";
+  }
+
+  private updateArchive(
+    table: "projects" | "conversations",
+    id: string,
+    archived: boolean,
+  ): "updated" | "not_found" {
+    const now = isoNow();
+    const result = this.db.prepare(
+      `UPDATE ${table} SET archived_at = ?, updated_at = ? WHERE id = ?`,
+    ).run(archived ? now : null, now, id) as { changes: number };
+    return result.changes > 0 ? "updated" : "not_found";
+  }
+
+  private insertEvent(
+    conversationId: string,
+    event: ConnectorEvent,
+    createdAt = isoNow(),
+  ): NormalizedEvent {
     const nextSequenceRow = this.getRow<{ sequence: number }>(
       `SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
        FROM events
@@ -881,7 +1244,7 @@ class SqliteRepositories implements Repositories {
       sequence: nextSequenceRow.sequence,
       type: event.type,
       payload: event.payload,
-      createdAt: isoNow(),
+      createdAt,
     };
     this.db
       .prepare(
@@ -914,31 +1277,33 @@ class SqliteRepositories implements Repositories {
     }
   }
 
-  private isPluginScopeConfigured(scope: PluginScope): boolean {
+  private listProjectConversationIds(projectId: string): string[] {
+    return this.getRows<{ id: string }>(
+      "SELECT id FROM conversations WHERE project_id = ?",
+      projectId,
+    ).map((row) => row.id);
+  }
+
+  private deletePluginScopes(scopeType: "project" | "conversation", scopeIds: string[]): void {
+    const deleteEnablements = this.db.prepare(
+      "DELETE FROM plugin_enablements WHERE scope_type = ? AND scope_id = ?",
+    );
+    const deleteScopes = this.db.prepare(
+      "DELETE FROM plugin_enablement_scopes WHERE scope_type = ? AND scope_id = ?",
+    );
+    for (const scopeId of scopeIds) {
+      deleteEnablements.run(scopeType, scopeId);
+      deleteScopes.run(scopeType, scopeId);
+    }
+  }
+
+  isPluginScopeConfigured(scope: PluginScope): boolean {
     return Boolean(this.getRow(
       `SELECT 1
        FROM plugin_enablement_scopes
        WHERE scope_type = ? AND scope_id = ?`,
       scope.type,
       pluginScopeKey(scope),
-    ));
-  }
-
-  private hasActiveTurnForPluginScope(scope: PluginScope): boolean {
-    const where = scope.type === "global"
-      ? "1 = 1"
-      : scope.type === "project"
-        ? "c.project_id = ?"
-        : "c.id = ?";
-    const params = scope.type === "global" ? [] : [scope.id];
-    return Boolean(this.getRow(
-      `SELECT t.id
-       FROM turns t
-       JOIN conversations c ON c.id = t.conversation_id
-       WHERE ${where}
-         AND t.status IN ('starting', 'running', 'cancelling')
-       LIMIT 1`,
-      ...params,
     ));
   }
 
@@ -976,7 +1341,8 @@ const TURN_SELECT = `SELECT
   t.updated_at,
   ts.model_id,
   ts.permission_mode,
-  ts.plugin_versions_json
+  ts.plugin_versions_json,
+  ts.auto_queue
 FROM turns t
 JOIN turn_snapshots ts ON ts.turn_id = t.id`;
 
@@ -992,6 +1358,7 @@ interface DbProjectRow {
   id: string;
   path: string;
   name: string;
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1003,6 +1370,9 @@ interface DbConversationRow {
   model_id: string | null;
   permission_mode: Conversation["permissionMode"];
   queue_paused: number;
+  auto_queue: number;
+  title: string | null;
+  archived_at: string | null;
   created_at: string;
   updated_at: string;
 }
@@ -1011,6 +1381,8 @@ interface DbQueuedMessageRow {
   id: string;
   conversation_id: string;
   content: string;
+  status: string;
+  delivery_id: string | null;
   created_at: string;
 }
 
@@ -1025,6 +1397,7 @@ interface DbTurnRow {
   model_id: string | null;
   permission_mode: TurnSnapshot["permissionMode"];
   plugin_versions_json: string;
+  auto_queue: number;
 }
 
 interface DbNativeSessionRow {
@@ -1049,6 +1422,7 @@ function mapProject(row: DbProjectRow): Project {
     id: row.id,
     path: row.path,
     name: row.name,
+    archivedAt: row.archived_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
@@ -1058,13 +1432,22 @@ function mapConversation(row: DbConversationRow): Conversation {
   return {
     id: row.id,
     projectId: row.project_id,
+    title: row.title,
     agentProductId: row.agent_product_id,
     modelId: row.model_id,
     permissionMode: row.permission_mode,
     queuePaused: row.queue_paused === 1,
+    autoQueue: row.auto_queue === 1,
+    archivedAt: row.archived_at,
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function compactTitle(content: string): string {
+  const title = content.trim().replace(/\s+/g, " ");
+  const characters = Array.from(title);
+  return characters.length > 60 ? `${characters.slice(0, 57).join("")}…` : title;
 }
 
 function mapQueuedMessage(row: DbQueuedMessageRow): QueuedMessage {
@@ -1072,6 +1455,8 @@ function mapQueuedMessage(row: DbQueuedMessageRow): QueuedMessage {
     id: row.id,
     conversationId: row.conversation_id,
     content: row.content,
+    status: row.status === "staged" || row.status === "uncertain" ? row.status : "pending",
+    deliveryId: row.delivery_id,
     createdAt: row.created_at,
   };
 }
@@ -1087,6 +1472,7 @@ function mapTurn(row: DbTurnRow): Turn {
       modelId: row.model_id,
       permissionMode: row.permission_mode,
       pluginVersions: JSON.parse(row.plugin_versions_json) as TurnSnapshot["pluginVersions"],
+      ...(row.auto_queue === 1 ? { autoQueue: true } : {}),
     },
     createdAt: row.created_at,
     updatedAt: row.updated_at,

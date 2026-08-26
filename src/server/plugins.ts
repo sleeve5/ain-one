@@ -1,6 +1,7 @@
 import { createHash, randomUUID } from "node:crypto";
 import {
   closeSync,
+  chmodSync,
   constants,
   existsSync,
   fstatSync,
@@ -99,6 +100,7 @@ export interface PluginHub {
   installLocal(input: InstallLocalInput): Promise<InstalledPluginVersion>;
   scanNative(input: ScanNativeInput[]): Promise<PluginCandidate[]>;
   scanConfiguredRoots(): Promise<PluginCandidate[]>;
+  importConfiguredRoots(): Promise<InstalledPluginSummary[]>;
   acceptCandidate(candidateId: string): Promise<InstalledPluginVersion>;
   repairMaterialization(agentProductId: AgentProductId, plugin: PluginVersion): Promise<void>;
   resolveForTurn(input: ResolveForTurnInput): PluginVersion[];
@@ -112,6 +114,8 @@ export interface PluginHub {
 export interface CreatePluginHubOptions {
   dataDir: string;
   skillRoots: Partial<Record<AgentProductId, string>>;
+  discoverSkillRoots?: () => Promise<Array<{ agentProductId: AgentProductId; path: string }>>;
+  discoverMcpDefinitions?: () => Promise<Array<{ agentProductId: AgentProductId; path: string }>>;
 }
 
 interface StoredVersion {
@@ -214,17 +218,24 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
           continue;
         }
 
-        if (hasStoredVersion(metadata, source.pluginId, source.contentHash)) {
+        const installed = getStoredVersion(metadata, source.pluginId, source.contentHash);
+        if (installed) {
+          installed.compatibility = mergeCompatibility(installed.compatibility, source.compatibility);
+          for (const [candidateId, candidate] of Object.entries(metadata.candidates)) {
+            if (candidate.pluginId === source.pluginId && candidate.versionId === source.contentHash) {
+              delete metadata.candidates[candidateId];
+            }
+          }
           continue;
         }
 
         const existing = Object.values(metadata.candidates).find(
           (candidate) =>
             candidate.pluginId === source.pluginId &&
-            candidate.versionId === source.contentHash &&
-            candidate.agentProductId === item.agentProductId,
+            candidate.versionId === source.contentHash,
         );
         if (existing) {
+          existing.compatibility = mergeCompatibility(existing.compatibility, source.compatibility);
           candidates.push(mapCandidate(existing));
           continue;
         }
@@ -244,8 +255,30 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
       }
 
       saveMetadata(metadataPath, metadata);
-      return candidates;
+      return [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
     });
+  };
+
+  const scanConfiguredRoots = async (): Promise<PluginCandidate[]> => {
+    const candidates: PluginCandidate[] = [];
+    const [discoveredSkillRoots, mcpInputs] = await Promise.all([
+      options.discoverSkillRoots?.() ?? [],
+      options.discoverMcpDefinitions?.() ?? [],
+    ]);
+    const skillInputs = [
+      ...configuredSkillInputs(options.skillRoots),
+      ...discoveredSkillRoots.flatMap(({ agentProductId, path }) =>
+        skillInputsForRoot(agentProductId, path),
+      ),
+    ];
+    for (const input of [...skillInputs, ...mcpInputs]) {
+      try {
+        candidates.push(...await scanNative([input]));
+      } catch {
+        // A malformed native plugin must not prevent other imports or server startup.
+      }
+    }
+    return candidates;
   };
 
   return {
@@ -290,16 +323,17 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
 
     scanNative,
 
-    async scanConfiguredRoots() {
-      const candidates: PluginCandidate[] = [];
-      for (const input of configuredSkillInputs(options.skillRoots)) {
+    scanConfiguredRoots,
+
+    async importConfiguredRoots() {
+      for (const candidate of await scanConfiguredRoots()) {
         try {
-          candidates.push(...await scanNative([input]));
+          await this.acceptCandidate(candidate.id);
         } catch {
-          // A malformed native Skill must not prevent other imports or server startup.
+          // One stale or malformed native plugin must not block the remaining imports.
         }
       }
-      return candidates;
+      return this.listInstalled();
     },
 
     async acceptCandidate(candidateId) {
@@ -354,7 +388,12 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
         .filter((plugin) => {
           const version = getStoredVersion(metadata, plugin.pluginId, plugin.versionId);
           const compatibility = version?.compatibility[input.agentProductId];
-          return isDispatchableCompatibility(compatibility);
+          if (!version || !isDispatchableCompatibility(compatibility)) return false;
+          if (version.type === "skill" && options.skillRoots[input.agentProductId]) {
+            return materializationStatuses(version, metadata, options.skillRoots)
+              .find((item) => item.agentProductId === input.agentProductId)?.status !== "conflicted";
+          }
+          return true;
         })
         .sort((left, right) => left.pluginId.localeCompare(right.pluginId));
     },
@@ -461,7 +500,7 @@ function inspectSourceForNativeScan(
     const inspected = inspectSource(real, compatibilityInput);
     return {
       ...inspected,
-      path: absolutePath,
+      path: real,
       pluginId: normalizePluginId(basename(absolutePath)),
     };
   }
@@ -613,7 +652,17 @@ function copyDirectoryWithoutSymlink(source: string, destination: string): void 
 }
 
 function copyFileWithoutSymlink(source: string, destination: string): void {
-  writeFileSync(destination, readFileWithoutSymlink(source), { flag: "wx" });
+  const descriptor = openSync(source, constants.O_RDONLY | constants.O_NOFOLLOW);
+  try {
+    const stats = fstatSync(descriptor);
+    if (!stats.isFile()) {
+      throw new Error("source file changed during copy");
+    }
+    writeFileSync(destination, readFileSync(descriptor), { flag: "wx", mode: stats.mode & 0o777 });
+    chmodSync(destination, stats.mode & 0o777);
+  } finally {
+    closeSync(descriptor);
+  }
 }
 
 function readFileWithoutSymlink(source: string): Buffer {
@@ -703,29 +752,25 @@ function inferredScanCompatibility(
   return { [sourceAgent]: { kind: "skill" } };
 }
 
+function mergeCompatibility(left: CompatibilityMap, right: CompatibilityMap): CompatibilityMap {
+  return { ...left, ...right };
+}
+
 function configuredSkillInputs(
   skillRoots: Partial<Record<AgentProductId, string>>,
 ): ScanNativeInput[] {
-  const inputs: ScanNativeInput[] = [];
-  for (const [agentProductId, root] of Object.entries(skillRoots)) {
-    if (!isAgentProductId(agentProductId) || !root) {
-      continue;
-    }
-    const stats = safeLstat(root);
-    if (!stats?.isDirectory()) {
-      continue;
-    }
-    for (const entry of readdirSync(root, { withFileTypes: true })) {
-      if (!entry.isDirectory() && !entry.isSymbolicLink()) {
-        continue;
-      }
-      const path = join(root, entry.name);
-      if (existsSync(join(path, "SKILL.md"))) {
-        inputs.push({ agentProductId, path });
-      }
-    }
-  }
-  return inputs;
+  return Object.entries(skillRoots).flatMap(([agentProductId, root]) =>
+    isAgentProductId(agentProductId) && root ? skillInputsForRoot(agentProductId, root) : [],
+  );
+}
+
+function skillInputsForRoot(agentProductId: AgentProductId, root: string): ScanNativeInput[] {
+  if (!safeLstat(root)?.isDirectory()) return [];
+  return readdirSync(root, { withFileTypes: true }).flatMap((entry) => {
+    if (!entry.isDirectory() && !entry.isSymbolicLink()) return [];
+    const path = join(root, entry.name);
+    return existsSync(join(path, "SKILL.md")) ? [{ agentProductId, path }] : [];
+  });
 }
 
 function hasStoredVersion(metadata: PluginMetadata, pluginId: string, hash: string): boolean {
@@ -798,6 +843,9 @@ function materializeTransaction(input: {
     }
 
     const targetPath = join(resolve(root), plugin.pluginId);
+    if (isMatchingNativeSkill(metadata, input.agentProductId, targetPath, version)) {
+      continue;
+    }
     validateManagedTarget(metadata, input.agentProductId, plugin.pluginId, targetPath);
     const materializedPath = join(
       input.materializedDir,
@@ -1202,6 +1250,9 @@ function materializationStatuses(
       if (!target) {
         return { agentProductId, status: "not_materialized", repairable: true };
       }
+      if (isMatchingNativeSkill(metadata, agentProductId, targetPath, version)) {
+        return { agentProductId, status: "materialized", repairable: false };
+      }
       if (!managed || managed.pluginId !== version.pluginId || !target.isSymbolicLink()) {
         return { agentProductId, status: "conflicted", repairable: false };
       }
@@ -1222,6 +1273,22 @@ function materializationStatuses(
         ? { agentProductId, status: "materialized", repairable: false }
         : { agentProductId, status: "not_materialized", repairable: true };
     });
+}
+
+function isMatchingNativeSkill(
+  metadata: PluginMetadata,
+  agentProductId: AgentProductId,
+  targetPath: string,
+  version: StoredVersion,
+): boolean {
+  if (metadata.managedTargets[agentProductId]?.[targetPath]) return false;
+  const source = safeRealpath(targetPath);
+  if (!source) return false;
+  try {
+    return hashSkillDirectory(source) === version.contentHash;
+  } catch {
+    return false;
+  }
 }
 
 function applyScope(
@@ -1616,7 +1683,7 @@ function normalizePluginId(value: string): string {
   if (normalized.length === 0) {
     throw new Error("invalid plugin id");
   }
-  if (normalized === "." || normalized === "..") {
+  if ([".", "..", "__proto__", "constructor", "prototype"].includes(normalized)) {
     throw new Error("invalid plugin id");
   }
   return normalized;
@@ -1675,21 +1742,21 @@ function normalizeVersions(raw: unknown): PluginMetadata["versions"] {
     typeof value === "object" && value !== null && "pluginId" in value && "versionId" in value,
   );
   if (looksLegacyFlat) {
-    const converted: PluginMetadata["versions"] = {};
+    const converted: PluginMetadata["versions"] = Object.create(null) as PluginMetadata["versions"];
     for (const [, value] of entries) {
       const version = value as StoredVersion;
-      const bucket = (converted[version.pluginId] ??= {});
+      const bucket = (converted[normalizePluginId(version.pluginId)] ??= Object.create(null) as Record<string, StoredVersion>);
       bucket[version.versionId] = version;
     }
     return converted;
   }
 
-  const nested: PluginMetadata["versions"] = {};
+  const nested: PluginMetadata["versions"] = Object.create(null) as PluginMetadata["versions"];
   for (const [pluginId, versions] of entries) {
     if (!versions || typeof versions !== "object") {
       continue;
     }
-    const bucket = (nested[pluginId] ??= {});
+    const bucket = (nested[normalizePluginId(pluginId)] ??= Object.create(null) as Record<string, StoredVersion>);
     for (const [versionId, value] of Object.entries(versions as Record<string, unknown>)) {
       if (!value || typeof value !== "object") {
         continue;

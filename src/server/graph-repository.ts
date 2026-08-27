@@ -23,6 +23,7 @@ export interface GraphRepository {
   getRun(runId: string): GraphRun | null;
   getLatestRun(graphId: string): GraphRun | null;
   listRuns(graphId: string): GraphRun[];
+  deleteRun(runId: string): "deleted" | "not_found" | "run_active";
   finishRun(runId: string, status: Exclude<GraphRunStatus, "running">, output?: string | GraphValues | null, error?: NormalizedError): void;
   startNodeRun(runId: string, nodeId: string, iteration: number, input: string | GraphValues): GraphNodeRun;
   finishNodeRun(nodeRunId: string, status: Exclude<GraphNodeRunStatus, "running">, output?: string | GraphValues | null, error?: NormalizedError): void;
@@ -90,6 +91,13 @@ export function createGraphRepository(db: DatabaseSync): GraphRepository {
     },
     listRuns(graphId) {
       return many<RunRow>("SELECT * FROM graph_runs WHERE graph_id = ? ORDER BY created_at DESC, rowid DESC", graphId).map(mapRun);
+    },
+    deleteRun(runId) {
+      const run = this.getRun(runId);
+      if (!run) return "not_found";
+      if (run.status === "running") return "run_active";
+      db.prepare("DELETE FROM graph_runs WHERE id = ?").run(runId);
+      return "deleted";
     },
     finishRun(runId, status, output = null, error) {
       const outputValues = output && typeof output === "object" ? output : null;

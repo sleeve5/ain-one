@@ -168,6 +168,7 @@ export interface AinOneApi {
   listGraphRuns?(graphId: string): Promise<GraphRun[]>;
   getGraphRun(runId: string): Promise<{ run: GraphRun; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[] }>;
   cancelGraphRun(runId: string): Promise<boolean>;
+  deleteGraphRun?(runId: string): Promise<void>;
 }
 
 export type PluginScope =
@@ -693,6 +694,10 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
     },
     async cancelGraphRun(runId): Promise<boolean> {
       return (await postJson<{ cancelled: boolean }>(`/api/graph-runs/${encodeURIComponent(runId)}/cancel`, {})).cancelled;
+    },
+    async deleteGraphRun(runId): Promise<void> {
+      const response = await fetchFn(`${baseUrl}/api/graph-runs/${encodeURIComponent(runId)}`, { method: "DELETE", headers: { authorization: `Bearer ${options.token}` } });
+      if (!response.ok) throw await responseError(response, "delete Graph Run");
     },
   };
 }

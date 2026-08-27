@@ -313,6 +313,12 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       sendJson(response, 200, { run, nodeRuns: options.graphRepository!.listNodeRuns(run.id), events: options.graphRepository!.eventsAfter(run.id, 0) });
       return;
     }
+    if (graphRunMatch && request.method === "DELETE") {
+      const result = options.graphRepository?.deleteRun(graphRunMatch[0]) ?? "not_found";
+      if (result === "run_active") { sendError(response, 409, "graph_run_active", "A running Graph Run cannot be deleted"); return; }
+      if (result === "not_found") { sendError(response, 404, "graph_run_not_found", "Graph Run not found"); return; }
+      response.writeHead(204); response.end(); return;
+    }
     const graphCancelMatch = match(pathname, /^\/api\/graph-runs\/([^/]+)\/cancel$/);
     if (graphCancelMatch && request.method === "POST") {
       const cancelled = await options.graphRuntime?.cancel(graphCancelMatch[0]) ?? false;

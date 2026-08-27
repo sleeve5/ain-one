@@ -55,7 +55,10 @@ export class GraphRuntime {
         const nodeRun = this.options.repository.startNodeRun(run.id, nodeId, iteration, value);
         this.options.repository.appendRunEvent(run.id, "node_started", nodeId, { iteration, input: value });
         try {
-          if (node.type === "agent") value = await this.executeAgent(run.id, node, iteration, value, state);
+          if (node.type === "agent") {
+            const template = node.config.prompt ?? node.config.instruction ?? "";
+            value = await this.executeAgent(run.id, node, iteration, template.includes("{{input}}") ? template.replaceAll("{{input}}", value) : value, state);
+          }
           if (node.type === "literal") value = node.config.value;
           if (node.type === "template") value = node.config.template.replaceAll("{{input}}", value);
           if (state.cancelled) {
@@ -219,9 +222,8 @@ export class GraphRuntime {
       sessionState.eventHandler.current = onEvent;
     }
     state.active = { ...sessionState, nativeTurnId: null, cancel: () => terminalResolve("cancelled") };
-    const template = node.config.prompt ?? node.config.instruction ?? "";
     const starting = connector.startTurn(sessionState.session, {
-      content: template.includes("{{input}}") ? template.replaceAll("{{input}}", input) : input,
+      content: input,
       snapshot: { modelId: node.config.modelId, permissionMode: node.config.permissionMode, pluginVersions: [] },
       turnId: `graph:${runId}:${node.id}:${iteration}`,
     });
@@ -237,11 +239,22 @@ export class GraphRuntime {
   }
 
   private async executeDataflowAgent(runId: string, node: Extract<GraphNode, { type: "agent" }>, iteration: number, input: GraphValues, state: ActiveRun): Promise<GraphValues> {
-    const labels = new Map((node.config.inputs ?? [{ id: "input", name: "Input" }]).map((port) => [port.id, port.name]));
-    const parameters = Object.entries(input).map(([id, value]) => `${labels.get(id) ?? id}:\n${value}`).join("\n\n");
+    const ports = node.config.inputs ?? [{ id: "input", name: "Input" }];
+    const labels = new Map(ports.map((port) => [port.id, port.name]));
+    const instruction = node.config.instruction ?? node.config.prompt ?? "";
+    const referenced = new Set<string>();
+    let prompt = instruction;
+    for (const port of ports) {
+      const token = `{{${port.id}}}`;
+      if (!prompt.includes(token)) continue;
+      referenced.add(port.id);
+      prompt = prompt.replaceAll(token, input[port.id] ?? "");
+    }
+    const parameters = Object.entries(input).filter(([id]) => !referenced.has(id)).map(([id, value]) => `${labels.get(id) ?? id}:\n${value}`).join("\n\n");
     const outputs = node.config.outputs ?? [{ id: "output", name: "Output" }];
     const format = outputs.length > 1 ? `\n\nReturn a JSON object with these keys only: ${outputs.map((port) => port.id).join(", ")}.` : "";
-    const text = await this.executeAgent(runId, node, iteration, `${node.config.instruction ?? node.config.prompt ?? ""}\n\nInput parameters:\n${parameters}${format}`, state);
+    if (parameters) prompt += `${prompt ? "\n\n" : ""}Input parameters:\n${parameters}`;
+    const text = await this.executeAgent(runId, node, iteration, `${prompt}${format}`, state);
     if (outputs.length === 1) return { [outputs[0]!.id]: text };
     const parsed = JSON.parse(text) as Record<string, unknown>;
     const result: GraphValues = {};

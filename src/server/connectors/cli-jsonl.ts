@@ -152,6 +152,12 @@ export abstract class CliJsonlConnector extends BaseConnector {
         status: effectiveStatus,
         error: effectiveError,
       };
+      const finishingTurn = input.session.activeTurn?.settled === settled
+        ? input.session.activeTurn
+        : undefined;
+      if (finishingTurn) {
+        delete input.session.activeTurn;
+      }
       try {
         await this.emitEvent(input.session, {
           type: "turn_status",
@@ -169,15 +175,15 @@ export abstract class CliJsonlConnector extends BaseConnector {
         }
         terminalSent = true;
       } catch (error) {
+        if (!input.session.activeTurn && finishingTurn) {
+          input.session.activeTurn = finishingTurn;
+        }
         settledReject(error);
         return;
       } finally {
         input.session.settled = settled;
       }
       if (terminalSent) {
-        if (input.session.activeTurn?.settled === settled) {
-          delete input.session.activeTurn;
-        }
         settledResolve();
       }
     };

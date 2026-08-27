@@ -239,6 +239,8 @@ export interface QueueMessageRequest {
 export type GraphNode =
   | { id: string; type: "agent"; name: string; config: { agentProductId: AgentProductId; modelId: string | null; permissionMode: PermissionMode; prompt: string } }
   | { id: string; type: "loop_counter"; name: string; config: { maxIterations: number } }
+  | { id: string; type: "literal"; name: string; config: { value: string } }
+  | { id: string; type: "template"; name: string; config: { template: string } }
   | { id: string; type: "passthrough"; name: string; config: Record<string, never> };
 
 export interface GraphEdge {
@@ -266,6 +268,7 @@ export interface GraphProject {
   definition: GraphDefinition;
   viewport: GraphViewport;
   positions: Record<string, GraphNodePosition>;
+  archivedAt?: string | null;
   createdAt: string;
   updatedAt: string;
 }

@@ -18,6 +18,7 @@ import {
   parseUncertainMessageResolution,
   ValidationError,
   validateGraphDefinition,
+  validateGraphDraft,
 } from "../shared/validation.js";
 import type { ProjectFilesService } from "./files.js";
 import { FilesServiceError } from "./files.js";
@@ -234,7 +235,7 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     if (projectGraphsMatch && request.method === "GET") {
       if (!options.graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
       if (!options.repositories.getProject(projectGraphsMatch[0])) { sendError(response, 404, "project_not_found", "Project not found"); return; }
-      sendJson(response, 200, { graphs: options.graphRepository.listGraphs(projectGraphsMatch[0]) });
+      sendJson(response, 200, { graphs: options.graphRepository.listGraphs(projectGraphsMatch[0], requestUrl.searchParams.get("archived") === "true") });
       return;
     }
     if (projectGraphsMatch && request.method === "POST") {
@@ -246,6 +247,13 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     }
 
     const graphMatch = match(pathname, /^\/api\/graphs\/([^/]+)$/);
+    const graphForkMatch = match(pathname, /^\/api\/graphs\/([^/]+)\/fork$/);
+    if (graphForkMatch && request.method === "POST") {
+      const graph = options.graphRepository?.forkGraph(graphForkMatch[0]);
+      if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      sendJson(response, 201, { graph });
+      return;
+    }
     if (graphMatch && request.method === "GET") {
       const graph = options.graphRepository?.getGraph(graphMatch[0]);
       if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
@@ -255,12 +263,20 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     if (graphMatch && request.method === "PUT") {
       const current = options.graphRepository?.getGraph(graphMatch[0]);
       if (!current) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
-      const patch = parseGraphWrite(await readJsonBody(request, bodyLimitBytes), false);
+      const body = await readJsonBody(request, bodyLimitBytes);
+      const record = readRecord(body, "Invalid graph payload");
+      const patch = parseGraphWrite(body, false);
+      if (record.archived !== undefined) {
+        if (typeof record.archived !== "boolean") throw new ValidationError("archived must be a boolean");
+        const result = options.graphRepository!.archiveGraph(current.id, record.archived);
+        if (result === "run_active") { sendError(response, 409, "graph_run_active", "A running Graph cannot be archived"); return; }
+      }
       sendJson(response, 200, { graph: options.graphRepository!.updateGraph(current.id, patch) });
       return;
     }
     if (graphMatch && request.method === "DELETE") {
       if (options.graphRepository?.getLatestRun(graphMatch[0])?.status === "running") { sendError(response, 409, "graph_run_active", "A running Graph cannot be deleted"); return; }
+      if (!options.graphRepository?.getGraph(graphMatch[0])?.archivedAt) { sendError(response, 409, "graph_not_archived", "Only archived Graphs can be deleted"); return; }
       if (!options.graphRepository?.deleteGraph(graphMatch[0])) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
       response.writeHead(204); response.end(); return;
     }
@@ -269,6 +285,9 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     if (graphRunsMatch && request.method === "POST") {
       const graph = options.graphRepository?.getGraph(graphRunsMatch[0]);
       if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      if (graph.archivedAt) { sendError(response, 409, "graph_archived", "An archived Graph cannot run"); return; }
+      const graphErrors = validateGraphDefinition(graph.definition);
+      if (graphErrors.length) { sendError(response, 400, "graph_not_runnable", graphErrors.join("; ")); return; }
       if (!options.graphRuntime) { sendError(response, 501, "graph_runtime_unsupported", "Graph runtime is unavailable"); return; }
       const graphRepository = options.graphRepository;
       if (!graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
@@ -1507,7 +1526,7 @@ function parseGraphWrite(value: unknown, complete: boolean): Partial<Omit<Create
     patch.description = body.description;
   }
   if (body.definition !== undefined) {
-    const errors = validateGraphDefinition(body.definition);
+    const errors = validateGraphDraft(body.definition);
     if (errors.length) throw new ValidationError(errors.join("; "));
     patch.definition = body.definition as GraphDefinition;
   }

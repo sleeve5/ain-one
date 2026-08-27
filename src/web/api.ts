@@ -96,6 +96,7 @@ export interface ConversationView {
 export interface ArchivedWorkspaceState {
   projects: Project[];
   conversations: Conversation[];
+  graphs?: GraphProject[];
 }
 
 export interface WorkspaceState {
@@ -159,6 +160,9 @@ export interface AinOneApi {
   createGraph(projectId: string, input: Omit<GraphProject, "id" | "projectId" | "createdAt" | "updatedAt">): Promise<GraphProject>;
   getGraph(graphId: string): Promise<{ graph: GraphProject; latestRun: GraphRun | null }>;
   saveGraph(graph: GraphProject): Promise<GraphProject>;
+  renameGraph?(graphId: string, name: string): Promise<GraphProject>;
+  archiveGraph?(graphId: string, archived: boolean): Promise<GraphProject>;
+  forkGraph?(graphId: string): Promise<GraphProject>;
   deleteGraph(graphId: string): Promise<void>;
   runGraph(graphId: string, input: string): Promise<GraphRun>;
   getGraphRun(runId: string): Promise<{ run: GraphRun; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[] }>;
@@ -483,7 +487,10 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       const conversations = uniqueById((await Promise.all(allProjects.map(async (project) =>
         (await getJson<{ conversations: Conversation[] }>(`/api/projects/${encodeURIComponent(project.id)}/conversations?archived=true`)).conversations
       ))).flat());
-      return { projects, conversations };
+      const graphs = uniqueById((await Promise.all(allProjects.map(async (project) =>
+        (await getJson<{ graphs?: GraphProject[] }>(`/api/projects/${encodeURIComponent(project.id)}/graphs?archived=true`)).graphs ?? []
+      ))).flat());
+      return { projects, conversations, graphs };
     },
 
     async queueMessage(conversationId, content): Promise<void> {
@@ -660,6 +667,15 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
     async saveGraph(graph): Promise<GraphProject> {
       const { name, description, definition, viewport, positions } = graph;
       return (await putJson<{ graph: GraphProject }>(`/api/graphs/${encodeURIComponent(graph.id)}`, { name, description, definition, viewport, positions })).graph;
+    },
+    async renameGraph(graphId, name): Promise<GraphProject> {
+      return (await putJson<{ graph: GraphProject }>(`/api/graphs/${encodeURIComponent(graphId)}`, { name })).graph;
+    },
+    async archiveGraph(graphId, archived): Promise<GraphProject> {
+      return (await putJson<{ graph: GraphProject }>(`/api/graphs/${encodeURIComponent(graphId)}`, { archived })).graph;
+    },
+    async forkGraph(graphId): Promise<GraphProject> {
+      return (await postJson<{ graph: GraphProject }>(`/api/graphs/${encodeURIComponent(graphId)}/fork`, {})).graph;
     },
     async deleteGraph(graphId): Promise<void> {
       const response = await fetchFn(`${baseUrl}/api/graphs/${encodeURIComponent(graphId)}`, { method: "DELETE", headers: { authorization: `Bearer ${options.token}` } });

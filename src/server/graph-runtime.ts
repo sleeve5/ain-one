@@ -49,6 +49,8 @@ export class GraphRuntime {
         this.options.repository.appendRunEvent(run.id, "node_started", nodeId, { iteration, input: value });
         try {
           if (node.type === "agent") value = await this.executeAgent(run.id, node, iteration, value, state);
+          if (node.type === "literal") value = node.config.value;
+          if (node.type === "template") value = node.config.template.replaceAll("{{input}}", value);
           if (state.cancelled) {
             this.options.repository.finishNodeRun(nodeRun.id, "cancelled", value);
             return this.cancelled(run.id);

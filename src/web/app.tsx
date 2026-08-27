@@ -1,5 +1,6 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 import type { AgentProductId, CreateConversationInput, PluginVersion } from "../shared/contracts.js";
+import { validateGraphDefinition } from "../shared/validation.js";
 import type {
   AinOneApi,
   AgentSettingsView,
@@ -49,15 +50,18 @@ export function App(props: AppProps) {
   const [pluginScope, setPluginScope] = useState<PluginScopeKind>("global");
   const [enabledPluginVersions, setEnabledPluginVersions] = useState<PluginVersion[]>([]);
   const [pluginEnablementsLoading, setPluginEnablementsLoading] = useState(false);
-  const [archived, setArchived] = useState<ArchivedWorkspaceState>({ projects: [], conversations: [] });
+  const [archived, setArchived] = useState<ArchivedWorkspaceState>({ projects: [], conversations: [], graphs: [] });
   const [newConversation, setNewConversation] = useState<NewConversationDraft | null>(null);
   const [graphMode, setGraphMode] = useState<"editor" | "runs">("editor");
+  const [clearGraphRequest, setClearGraphRequest] = useState(0);
+  const [graphValidation, setGraphValidation] = useState<string[] | null>(null);
   const [unreadConversationIds, setUnreadConversationIds] = useState<Set<string>>(() => new Set());
   const selectedConversationIdRef = useRef<string | null>(null);
   const workspaceRequest = useRef(0);
   const workspaceGeneration = useRef(0);
   const locallyArchivedProjects = useRef(new Set<string>());
   const locallyArchivedConversations = useRef(new Set<string>());
+  const locallyArchivedGraphs = useRef(new Set<string>());
   const pendingWorkspaceSelection = useRef<WorkspaceSelection | null>(null);
   const pluginRequest = useRef(0);
   const pluginScopeRef = useRef<PluginScopeKind>("global");
@@ -86,7 +90,7 @@ export function App(props: AppProps) {
       setState((current) => {
         const workspace = {
           ...loadedWorkspace,
-          graphs: (loadedWorkspace.graphError ? current.workspace.graphs ?? [] : loadedWorkspace.graphs ?? []).filter((graph) => !locallyArchivedProjects.current.has(graph.projectId)),
+          graphs: (loadedWorkspace.graphError ? current.workspace.graphs ?? [] : loadedWorkspace.graphs ?? []).filter((graph) => !locallyArchivedProjects.current.has(graph.projectId) && !locallyArchivedGraphs.current.has(graph.id)),
           projects: loadedWorkspace.projects.filter((project) => !locallyArchivedProjects.current.has(project.id)),
           agents: loadedWorkspace.agents.filter((agent) => isPhaseOneAgentProductId(agent.id)),
           conversations: loadedWorkspace.conversations.filter((conversation) =>
@@ -327,7 +331,7 @@ export function App(props: AppProps) {
     resourceSelection.current += 1;
     setUnreadConversationIds((current) => { const next = new Set(current); next.delete(conversationId); return next; });
     setNewConversation(null);
-    setGraphMode("editor");
+    setGraphMode("editor"); setGraphValidation(null);
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
@@ -348,7 +352,7 @@ export function App(props: AppProps) {
     if (!graph) return;
     resourceSelection.current += 1;
     setNewConversation(null);
-    setGraphMode("editor");
+    setGraphMode("editor"); setGraphValidation(validateGraphDefinition(graph.definition));
     setState((current) => ({ ...current, actionError: null, activeCanvas: "conversation", selectedGraphId: graphId, workspace: { ...current.workspace, selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } }));
   };
 
@@ -551,7 +555,7 @@ export function App(props: AppProps) {
     const selection = ++resourceSelection.current;
     workspaceGeneration.current += 1;
     try {
-      const graph = await props.api.createGraph(selectedProjectId, defaultGraph(state.workspace.agents));
+      const graph = await props.api.createGraph(selectedProjectId, defaultGraph(agentsForProject(state.workspace.agents, selectedProjectId)));
       const selectCreated = resourceSelection.current === selection;
       if (selectCreated) { setNewConversation(null); setGraphMode("editor"); }
       setState((current) => ({ ...current, actionError: null, ...(selectCreated ? { activeCanvas: "conversation" as const, selectedGraphId: graph.id } : {}), workspace: { ...current.workspace, graphs: [graph, ...(current.workspace.graphs ?? []).filter((item) => item.id !== graph.id)], ...(selectCreated ? { selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } : {}) } }));
@@ -740,6 +744,34 @@ export function App(props: AppProps) {
                 if (created) addCreatedConversation(created, null, cloneEvents(source?.events ?? [], created.id));
               }, "Could not branch Conversation");
             }}
+            onRenameGraph={async (graphId, name) => {
+              await runSidebarAction(async () => {
+                const renamed = await props.api.renameGraph?.(graphId, name);
+                if (renamed) setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: (current.workspace.graphs ?? []).map((item) => item.id === graphId ? renamed : item) } }));
+              }, "Could not rename Graph");
+            }}
+            onForkGraph={async (graphId) => {
+              await runSidebarAction(async () => {
+                const forked = await props.api.forkGraph?.(graphId);
+                if (!forked) return;
+                setNewConversation(null); setGraphMode("editor");
+                setState((current) => ({ ...current, selectedGraphId: forked.id, workspace: { ...current.workspace, graphs: [forked, ...(current.workspace.graphs ?? [])], selectedProjectId: forked.projectId, selectedConversationId: null, conversation: null } }));
+              }, "Could not branch Graph");
+            }}
+            onArchiveGraph={async (graphId) => {
+              await runSidebarAction(async () => {
+                await props.api.archiveGraph?.(graphId, true);
+                locallyArchivedGraphs.current.add(graphId);
+                setState((current) => {
+                  const graphs = (current.workspace.graphs ?? []).filter((item) => item.id !== graphId);
+                  if (current.selectedGraphId !== graphId) return { ...current, workspace: { ...current.workspace, graphs } };
+                  const nextGraph = graphs.find((item) => item.projectId === current.workspace.selectedProjectId) ?? null;
+                  const fallback = nextGraph ? null : current.workspace.conversations.find((item) => item.projectId === current.workspace.selectedProjectId) ?? null;
+                  return { ...current, selectedGraphId: nextGraph?.id ?? null, workspace: { ...current.workspace, graphs, selectedConversationId: fallback?.id ?? null, conversation: fallback } };
+                });
+                await loadWorkspace();
+              }, "Could not archive Graph");
+            }}
             onOpenSettings={() => {
               setSettingsSection("general");
               setSettingsOpen(true);
@@ -755,6 +787,7 @@ export function App(props: AppProps) {
             <div className="workspace__conversation-title">
               <h2>{selectedGraph?.name ?? conversation?.title ?? (newConversation ? (preferences.language === "zh" ? "新对话" : "New conversation") : (preferences.language === "zh" ? "选择资源" : "Select a resource"))}</h2>
               {!selectedGraph && (conversation ?? newConversation) ? <AgentBadge agent={(conversation ?? newConversation)!.agentProductId}/> : null}
+              {selectedGraph ? <div className="workspace__graph-actions">{graphValidation ? <span className="workspace__graph-status" data-valid={graphValidation.length === 0}>{graphValidation.length === 0 ? (preferences.language === "zh" ? "可运行" : "Runnable") : (preferences.language === "zh" ? "待完善" : "Incomplete")}</span> : null}<button type="button" onClick={() => setClearGraphRequest((value) => value + 1)}>{preferences.language === "zh" ? "清空图" : "Clear graph"}</button></div> : null}
             </div>
             {selectedGraph ? <div className="canvas-switch" role="group" aria-label="Graph view"><button type="button" className="canvas-switch__button" data-active={graphMode === "editor"} aria-pressed={graphMode === "editor"} onClick={() => setGraphMode("editor")}>{preferences.language === "zh" ? "编排" : "Editor"}</button><button type="button" className="canvas-switch__button" data-active={graphMode === "runs"} aria-pressed={graphMode === "runs"} onClick={() => setGraphMode("runs")}>{preferences.language === "zh" ? "最近运行" : "Latest run"}</button></div> : <CanvasSwitch value={state.activeCanvas} language={preferences.language} onChange={changeCanvas} />}
           </div>
@@ -920,7 +953,7 @@ export function App(props: AppProps) {
             aria-hidden={!selectedGraph}
             inert={!selectedGraph}
           >
-            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={state.workspace.agents} view={graphMode} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} onGraphDeleted={(graphId) => setState((current) => { const graphs = (current.workspace.graphs ?? []).filter((item) => item.id !== graphId); const nextGraph = graphs.find((item) => item.projectId === selectedGraph.projectId) ?? null; const fallback = nextGraph ? null : current.workspace.conversations.find((item) => item.projectId === selectedGraph.projectId) ?? null; return { ...current, selectedGraphId: nextGraph?.id ?? null, workspace: { ...current.workspace, graphs, selectedConversationId: fallback?.id ?? null, conversation: fallback } }; })} /> : null}
+            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={agentsForProject(state.workspace.agents, selectedGraph.projectId)} view={graphMode} clearRequest={clearGraphRequest} onValidationChange={setGraphValidation} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} /> : null}
           </section>
 
           <AppSettings
@@ -928,7 +961,7 @@ export function App(props: AppProps) {
             section={settingsSection}
             language={preferences.language}
             onSectionChange={setSettingsSection}
-            archived={<ArchivedSettings state={archived} language={preferences.language} onRestoreProject={async (id) => { await runSidebarAction(async () => { await props.api.archiveProject?.(id, false); locallyArchivedProjects.current.delete(id); setArchived(await props.api.loadArchived?.() ?? { projects: [], conversations: [] }); await loadWorkspace(); }, "Could not restore Project"); }} onRestoreConversation={async (id) => { await runSidebarAction(async () => { await props.api.archiveConversation?.(id, false); locallyArchivedConversations.current.delete(id); setArchived(await props.api.loadArchived?.() ?? { projects: [], conversations: [] }); await loadWorkspace(); }, "Could not restore Conversation"); }} onDeleteConversation={async (id) => { await runSidebarAction(async () => { await props.api.deleteArchivedConversation?.(id); setArchived((current) => ({ ...current, conversations: current.conversations.filter((item) => item.id !== id) })); }, "Could not delete Conversation"); }} onDeleteProject={async (id) => { await runSidebarAction(async () => { await props.api.deleteArchivedProject?.(id); locallyArchivedProjects.current.delete(id); setArchived((current) => ({ projects: current.projects.filter((item) => item.id !== id), conversations: current.conversations.filter((item) => item.projectId !== id) })); await loadWorkspace(); }, "Could not delete Project"); }}/>}
+            archived={<ArchivedSettings state={archived} language={preferences.language} onRestoreProject={async (id) => { await runSidebarAction(async () => { await props.api.archiveProject?.(id, false); locallyArchivedProjects.current.delete(id); setArchived(await props.api.loadArchived?.() ?? { projects: [], conversations: [], graphs: [] }); await loadWorkspace(); }, "Could not restore Project"); }} onRestoreConversation={async (id) => { await runSidebarAction(async () => { await props.api.archiveConversation?.(id, false); locallyArchivedConversations.current.delete(id); setArchived(await props.api.loadArchived?.() ?? { projects: [], conversations: [], graphs: [] }); await loadWorkspace(); }, "Could not restore Conversation"); }} onRestoreGraph={async (id) => { await runSidebarAction(async () => { await props.api.archiveGraph?.(id, false); locallyArchivedGraphs.current.delete(id); setArchived(await props.api.loadArchived?.() ?? { projects: [], conversations: [], graphs: [] }); await loadWorkspace(); }, "Could not restore Graph"); }} onDeleteGraph={async (id) => { await runSidebarAction(async () => { await props.api.deleteGraph(id); setArchived((current) => ({ ...current, graphs: (current.graphs ?? []).filter((item) => item.id !== id) })); }, "Could not delete Graph"); }} onDeleteConversation={async (id) => { await runSidebarAction(async () => { await props.api.deleteArchivedConversation?.(id); setArchived((current) => ({ ...current, conversations: current.conversations.filter((item) => item.id !== id) })); }, "Could not delete Conversation"); }} onDeleteProject={async (id) => { await runSidebarAction(async () => { await props.api.deleteArchivedProject?.(id); locallyArchivedProjects.current.delete(id); setArchived((current) => ({ projects: current.projects.filter((item) => item.id !== id), conversations: current.conversations.filter((item) => item.projectId !== id), graphs: (current.graphs ?? []).filter((item) => item.projectId !== id) })); await loadWorkspace(); }, "Could not delete Project"); }}/>}
             onClose={() => setSettingsOpen(false)}
             general={<GeneralSettings value={preferences} onChange={setPreferences} />}
             agents={
@@ -1072,6 +1105,10 @@ function isRunnableAgent(agent: AgentSettingsView): boolean {
 
 function preferredAgent(agents: AgentSettingsView[]): AgentSettingsView | undefined {
   return agents.find(isRunnableAgent) ?? agents[0];
+}
+
+function agentsForProject(agents: AgentSettingsView[], projectId: string): AgentSettingsView[] {
+  return agents.map((agent) => ({ ...agent, catalog: agent.projectCatalogs?.[projectId] ?? agent.catalog }));
 }
 
 function createNewConversationDraft(

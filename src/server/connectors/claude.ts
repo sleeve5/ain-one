@@ -48,7 +48,7 @@ export class ClaudeConnector extends CliJsonlConnector {
   async fetchCatalog(projectPath: string): Promise<AgentCatalog> {
     const configuredModel = await this.readConfiguredModel(projectPath);
     return {
-      models: configuredModel ? [configuredModel] : [],
+      models: configuredModel && !isKnownForeignModel(configuredModel) ? [configuredModel] : [],
       permissionModes: ["request_approval", "help_me_approve", "full_access"],
     };
   }
@@ -193,6 +193,10 @@ export class ClaudeConnector extends CliJsonlConnector {
     }
     return null;
   }
+}
+
+function isKnownForeignModel(model: string): boolean {
+  return /^(?:gpt|glm|deepseek|seed|kimi|openrouter|gemini)[-_.]/i.test(model);
 }
 
 function claudeStreamId(context: JsonlEventContext, sessionId: string | null): string {

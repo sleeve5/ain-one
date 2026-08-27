@@ -13,9 +13,11 @@ export interface CreateGraphInput {
 
 export interface GraphRepository {
   createGraph(input: CreateGraphInput): GraphProject;
-  listGraphs(projectId: string): GraphProject[];
+  listGraphs(projectId: string, archived?: boolean): GraphProject[];
   getGraph(graphId: string): GraphProject | null;
   updateGraph(graphId: string, patch: Partial<Omit<CreateGraphInput, "projectId">>): GraphProject | null;
+  archiveGraph(graphId: string, archived: boolean): "updated" | "not_found" | "run_active";
+  forkGraph(graphId: string): GraphProject | null;
   deleteGraph(graphId: string): boolean;
   createRun(graphId: string, input: string): GraphRun;
   getRun(runId: string): GraphRun | null;
@@ -35,12 +37,12 @@ export function createGraphRepository(db: DatabaseSync): GraphRepository {
   return {
     createGraph(input) {
       const now = new Date().toISOString();
-      const graph: GraphProject = { id: randomUUID(), ...input, createdAt: now, updatedAt: now };
-      db.prepare("INSERT INTO graphs VALUES (?, ?, ?, ?, ?, ?, ?, ?, ?)").run(graph.id, graph.projectId, graph.name, graph.description, JSON.stringify(graph.definition), JSON.stringify(graph.viewport), JSON.stringify(graph.positions), now, now);
+      const graph: GraphProject = { id: randomUUID(), ...input, archivedAt: null, createdAt: now, updatedAt: now };
+      db.prepare("INSERT INTO graphs (id, project_id, name, description, definition_json, viewport_json, positions_json, archived_at, created_at, updated_at) VALUES (?, ?, ?, ?, ?, ?, ?, NULL, ?, ?)").run(graph.id, graph.projectId, graph.name, graph.description, JSON.stringify(graph.definition), JSON.stringify(graph.viewport), JSON.stringify(graph.positions), now, now);
       return graph;
     },
-    listGraphs(projectId) {
-      return many<GraphRow>(`SELECT * FROM graphs WHERE project_id = ? ORDER BY updated_at DESC, rowid DESC`, projectId).map(mapGraph);
+    listGraphs(projectId, archived = false) {
+      return many<GraphRow>(`SELECT * FROM graphs WHERE project_id = ? AND archived_at IS ${archived ? "NOT " : ""}NULL ORDER BY updated_at DESC, rowid DESC`, projectId).map(mapGraph);
     },
     getGraph(graphId) {
       const row = one<GraphRow>("SELECT * FROM graphs WHERE id = ?", graphId);
@@ -53,6 +55,17 @@ export function createGraphRepository(db: DatabaseSync): GraphRepository {
       db.prepare("UPDATE graphs SET name = ?, description = ?, definition_json = ?, viewport_json = ?, positions_json = ?, updated_at = ? WHERE id = ?")
         .run(next.name, next.description, JSON.stringify(next.definition), JSON.stringify(next.viewport), JSON.stringify(next.positions), next.updatedAt, graphId);
       return next;
+    },
+    archiveGraph(graphId, archived) {
+      if (!this.getGraph(graphId)) return "not_found";
+      if (archived && this.getLatestRun(graphId)?.status === "running") return "run_active";
+      db.prepare("UPDATE graphs SET archived_at = ?, updated_at = ? WHERE id = ?").run(archived ? new Date().toISOString() : null, new Date().toISOString(), graphId);
+      return "updated";
+    },
+    forkGraph(graphId) {
+      const source = this.getGraph(graphId);
+      if (!source) return null;
+      return this.createGraph({ projectId: source.projectId, name: `${source.name} (branch)`, description: source.description, definition: structuredClone(source.definition), viewport: { ...source.viewport }, positions: structuredClone(source.positions) });
     },
     deleteGraph(graphId) {
       return (db.prepare("DELETE FROM graphs WHERE id = ?").run(graphId) as { changes: number }).changes > 0;
@@ -110,11 +123,11 @@ export function createGraphRepository(db: DatabaseSync): GraphRepository {
   };
 }
 
-interface GraphRow { id: string; project_id: string; name: string; description: string; definition_json: string; viewport_json: string; positions_json: string; created_at: string; updated_at: string; }
+interface GraphRow { id: string; project_id: string; name: string; description: string; definition_json: string; viewport_json: string; positions_json: string; archived_at: string | null; created_at: string; updated_at: string; }
 interface RunRow { id: string; graph_id: string; status: GraphRunStatus; input: string; output: string | null; error_json: string | null; created_at: string; updated_at: string; }
 interface NodeRunRow { id: string; run_id: string; node_id: string; iteration: number; status: GraphNodeRunStatus; input: string; output: string | null; error_json: string | null; created_at: string; updated_at: string; }
 interface EventRow { id: string; run_id: string; sequence: number; type: string; node_id: string | null; payload_json: string; created_at: string; }
-function mapGraph(row: GraphRow): GraphProject { return { id: row.id, projectId: row.project_id, name: row.name, description: row.description, definition: JSON.parse(row.definition_json) as GraphDefinition, viewport: JSON.parse(row.viewport_json) as GraphViewport, positions: JSON.parse(row.positions_json) as Record<string, GraphNodePosition>, createdAt: row.created_at, updatedAt: row.updated_at }; }
+function mapGraph(row: GraphRow): GraphProject { return { id: row.id, projectId: row.project_id, name: row.name, description: row.description, definition: JSON.parse(row.definition_json) as GraphDefinition, viewport: JSON.parse(row.viewport_json) as GraphViewport, positions: JSON.parse(row.positions_json) as Record<string, GraphNodePosition>, archivedAt: row.archived_at, createdAt: row.created_at, updatedAt: row.updated_at }; }
 function mapRun(row: RunRow): GraphRun { return { id: row.id, graphId: row.graph_id, status: row.status, input: row.input, output: row.output, error: row.error_json ? JSON.parse(row.error_json) as NormalizedError : null, createdAt: row.created_at, updatedAt: row.updated_at }; }
 function mapNodeRun(row: NodeRunRow): GraphNodeRun { return { id: row.id, runId: row.run_id, nodeId: row.node_id, iteration: row.iteration, status: row.status, input: row.input, output: row.output, error: row.error_json ? JSON.parse(row.error_json) as NormalizedError : null, createdAt: row.created_at, updatedAt: row.updated_at }; }
 function mapEvent(row: EventRow): GraphRunEvent { return { id: row.id, runId: row.run_id, sequence: row.sequence, type: row.type, nodeId: row.node_id, payload: JSON.parse(row.payload_json) as Record<string, unknown>, createdAt: row.created_at }; }

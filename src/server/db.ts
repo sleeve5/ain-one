@@ -118,6 +118,7 @@ function migrate(db: DatabaseSync): void {
       definition_json TEXT NOT NULL,
       viewport_json TEXT NOT NULL,
       positions_json TEXT NOT NULL,
+      archived_at TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -167,8 +168,14 @@ function migrate(db: DatabaseSync): void {
 
   migrateQueuedMessageSequence(db);
   migrateWorkspaceManagement(db);
+  migrateGraphManagement(db);
   migrateTraeQueue(db);
   migrateQueueDeliveries(db);
+}
+
+function migrateGraphManagement(db: DatabaseSync): void {
+  const columns = new Set((db.prepare("PRAGMA table_info(graphs)").all() as Array<{ name: string }>).map((item) => item.name));
+  if (!columns.has("archived_at")) db.exec("ALTER TABLE graphs ADD COLUMN archived_at TEXT");
 }
 
 function migrateQueueDeliveries(db: DatabaseSync): void {

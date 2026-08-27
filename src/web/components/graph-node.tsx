@@ -2,7 +2,7 @@ import { Handle, Position, type NodeProps } from "@xyflow/react";
 
 export interface GraphNodeData extends Record<string, unknown> {
   label: string;
-  kind: "start" | "end" | "agent" | "loop_counter" | "passthrough";
+  kind: "start" | "end" | "agent" | "literal" | "template" | "loop_counter" | "passthrough";
   subtitle?: string;
   status?: string;
 }
@@ -24,6 +24,8 @@ function icon(kind: GraphNodeData["kind"]): string {
   if (kind === "start") return "▶";
   if (kind === "end") return "■";
   if (kind === "agent") return "✦";
+  if (kind === "literal") return "T";
+  if (kind === "template") return "{ }";
   if (kind === "loop_counter") return "↻";
   return "→";
 }

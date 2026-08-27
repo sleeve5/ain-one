@@ -243,7 +243,7 @@ export function parsePermissionDecision(input: unknown): PermissionDecision {
   return decision;
 }
 
-export function validateGraphDefinition(value: unknown): string[] {
+export function validateGraphDraft(value: unknown): string[] {
   const errors: string[] = [];
   if (!value || typeof value !== "object" || Array.isArray(value)) return ["Graph definition must be an object"];
   const graph = value as { nodes?: unknown; edges?: unknown; start?: unknown; end?: unknown };
@@ -263,16 +263,16 @@ export function validateGraphDefinition(value: unknown): string[] {
     if (typeof node.id !== "string" || !node.id || typeof node.name !== "string") { errors.push("Every node requires a string id and name"); continue; }
     if (ids.has(node.id)) errors.push(`Node IDs must be unique: ${node.id}`);
     ids.add(node.id);
-    if (node.type !== "agent" && node.type !== "loop_counter" && node.type !== "passthrough") errors.push(`Unsupported node type: ${String(node.type)}`);
+    if (node.type !== "agent" && node.type !== "loop_counter" && node.type !== "literal" && node.type !== "template" && node.type !== "passthrough") errors.push(`Unsupported node type: ${String(node.type)}`);
     if (!node.config || typeof node.config !== "object" || Array.isArray(node.config)) { errors.push(`Node ${node.id} config must be an object`); continue; }
     const config = node.config as Record<string, unknown>;
     if (node.type === "agent" && (!SUPPORTED_AGENT_PRODUCTS.includes(config.agentProductId as AgentProductId) || (config.modelId !== null && typeof config.modelId !== "string") || !["request_approval", "help_me_approve", "full_access"].includes(String(config.permissionMode)) || typeof config.prompt !== "string")) errors.push(`Agent node ${node.id} has invalid config`);
     if (node.type === "loop_counter" && (!Number.isInteger(config.maxIterations) || (config.maxIterations as number) < 1)) {
       errors.push(`Loop Counter ${node.id} maxIterations must be >= 1`);
     }
+    if (node.type === "literal" && typeof config.value !== "string") errors.push(`Literal node ${node.id} requires a string value`);
+    if (node.type === "template" && typeof config.template !== "string") errors.push(`Template node ${node.id} requires a string template`);
   }
-  if (start.length === 0) errors.push("Graph requires at least one start node");
-  if (end.length === 0) errors.push("Graph requires at least one end node");
   for (const id of start) if (typeof id !== "string" || !ids.has(id)) errors.push(`Start references unknown node: ${String(id)}`);
   for (const id of end) if (typeof id !== "string" || !ids.has(id)) errors.push(`End references unknown node: ${String(id)}`);
   const edgeIds = new Set<string>();
@@ -289,6 +289,21 @@ export function validateGraphDefinition(value: unknown): string[] {
     if (!ids.has(edge.target)) errors.push(`Edge ${edge.id} has unknown target: ${edge.target}`);
     if (edge.condition !== undefined && (!condition || (condition.branch !== "loop" && condition.branch !== "done"))) errors.push(`Edge ${edge.id} has invalid branch`);
   }
+  return errors;
+}
+
+export function validateGraphDefinition(value: unknown): string[] {
+  const errors = validateGraphDraft(value);
+  if (!value || typeof value !== "object" || Array.isArray(value)) return errors;
+  const graph = value as { nodes?: unknown; edges?: unknown; start?: unknown; end?: unknown };
+  if (!Array.isArray(graph.nodes) || !Array.isArray(graph.edges) || !Array.isArray(graph.start) || !Array.isArray(graph.end)) return errors;
+  const nodes = graph.nodes as Array<Record<string, unknown>>;
+  const parsedEdges = graph.edges as Array<{ id: string; source: string; target: string; condition?: { branch?: unknown } }>;
+  const start = graph.start as unknown[];
+  const end = graph.end as unknown[];
+  if (start.length !== 1) errors.push("Graph requires exactly one start node");
+  if (end.length !== 1) errors.push("Graph requires exactly one end node");
+  if (errors.length) return errors;
   for (const rawNode of nodes) {
     if (!rawNode || typeof rawNode !== "object" || Array.isArray(rawNode)) continue;
     const node = rawNode as Record<string, unknown>;
@@ -308,5 +323,32 @@ export function validateGraphDefinition(value: unknown): string[] {
       if (branches.some((branch) => branch !== undefined)) errors.push(`Node ${node.id} cannot use loop branches`);
     }
   }
+  if (start.length === 1 && end.length === 1) {
+    const outgoing = new Map<string, string[]>();
+    const incoming = new Map<string, string[]>();
+    for (const edge of parsedEdges) {
+      outgoing.set(edge.source, [...(outgoing.get(edge.source) ?? []), edge.target]);
+      incoming.set(edge.target, [...(incoming.get(edge.target) ?? []), edge.source]);
+    }
+    const fromStart = reachable(String(start[0]), outgoing);
+    const toEnd = reachable(String(end[0]), incoming);
+    for (const node of nodes) {
+      if (typeof node.id !== "string" || typeof node.name !== "string") continue;
+      if (!fromStart.has(node.id)) errors.push(`Node ${node.name} is not reachable from Start`);
+      else if (!toEnd.has(node.id)) errors.push(`Node ${node.name} cannot reach End`);
+    }
+  }
   return errors;
+}
+
+function reachable(start: string, adjacency: Map<string, string[]>): Set<string> {
+  const visited = new Set<string>();
+  const pending = [start];
+  while (pending.length) {
+    const id = pending.pop()!;
+    if (visited.has(id)) continue;
+    visited.add(id);
+    pending.push(...(adjacency.get(id) ?? []));
+  }
+  return visited;
 }

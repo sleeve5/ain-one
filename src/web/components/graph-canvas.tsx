@@ -1,89 +1,86 @@
 import { useEffect, useMemo, useRef, useState } from "react";
-import { addEdge, applyNodeChanges, Background, Controls, MarkerType, ReactFlow, type Connection, type Edge, type Node, type NodeChange, type ReactFlowInstance } from "@xyflow/react";
+import Markdown from "markdown-to-jsx";
+import { addEdge, applyNodeChanges, Background, Controls, MarkerType, ReactFlow, SelectionMode, type Connection, type Edge, type EdgeChange, type Node, type NodeChange, type ReactFlowInstance } from "@xyflow/react";
 import "@xyflow/react/dist/style.css";
-import type { GraphDefinition, GraphNode, GraphNodeRun, GraphProject, GraphRun, GraphRunEvent } from "../../shared/contracts.js";
+import type { GraphDefinition, GraphInputField, GraphNode, GraphNodeRun, GraphPort, GraphProject, GraphRun, GraphRunEvent, GraphValues, PermissionMode } from "../../shared/contracts.js";
 import { validateGraphDefinition, validateGraphDraft } from "../../shared/validation.js";
 import type { AinOneApi, AgentSettingsView } from "../api.js";
-import { GraphNodeView, type GraphNodeData } from "./graph-node.js";
 import { agentLabel, sortAgents } from "../agent-meta.js";
+import { GraphNodeView, type GraphNodeData } from "./graph-node.js";
 
-interface GraphCanvasProps {
-  language?: "zh" | "en";
-  api?: AinOneApi;
-  graphId: string;
-  agents?: AgentSettingsView[];
-  view?: "editor" | "runs";
-  clearRequest?: number;
-  onGraphSaved?(graph: GraphProject): void;
-  onValidationChange?(errors: string[]): void;
-}
+interface GraphCanvasProps { language?: "zh" | "en"; api?: AinOneApi; graphId: string; agents?: AgentSettingsView[]; view?: "editor" | "runs"; clearRequest?: number; onGraphSaved?(graph: GraphProject): void; onValidationChange?(errors: string[]): void; }
+interface ClipboardGraph { nodes: GraphNode[]; edges: GraphDefinition["edges"]; positions: GraphProject["positions"]; }
 const nodeTypes = { workflow: GraphNodeView };
+const permissionLabels: Record<PermissionMode, { zh: string; en: string }> = { request_approval: { zh: "需要审批", en: "Ask for approval" }, help_me_approve: { zh: "自动审批", en: "Auto approve" }, full_access: { zh: "完全访问", en: "Full access" } };
 
 export function GraphCanvas({ language = "en", api, graphId, agents = [], view = "editor", clearRequest = 0, onGraphSaved, onValidationChange }: GraphCanvasProps) {
   const zh = language === "zh";
   const [graph, setGraph] = useState<GraphProject | null>(null);
-  const [selectedNodeId, setSelectedNodeId] = useState<string | null>(null);
+  const [selectedNodeIds, setSelectedNodeIds] = useState<Set<string>>(new Set());
+  const [selectedEdgeIds, setSelectedEdgeIds] = useState<Set<string>>(new Set());
   const [run, setRun] = useState<GraphRun | null>(null);
+  const [runs, setRuns] = useState<GraphRun[]>([]);
   const [nodeRuns, setNodeRuns] = useState<GraphNodeRun[]>([]);
   const [runEvents, setRunEvents] = useState<GraphRunEvent[]>([]);
-  const [runInput, setRunInput] = useState("");
-  const [result, setResult] = useState<string | null>(null);
+  const [runInput, setRunInput] = useState<GraphValues>({});
   const [error, setError] = useState<string | null>(null);
   const [confirmClear, setConfirmClear] = useState(false);
   const [interactionMode, setInteractionMode] = useState<"select" | "pan">("select");
+  const [libraryOpen, setLibraryOpen] = useState(true);
+  const [inspectorOpen, setInspectorOpen] = useState(true);
+  const [inspectorWidth, setInspectorWidth] = useState(() => Number(globalThis.localStorage?.getItem("ain-one.graph.inspector-width")) || 300);
   const flow = useRef<ReactFlowInstance<Node<GraphNodeData>, Edge> | null>(null);
-  const flowElement = useRef<HTMLDivElement | null>(null);
   const lastClearRequest = useRef(clearRequest);
   const lastSaved = useRef("");
   const savingFingerprint = useRef("");
   const saveChain = useRef(Promise.resolve());
   const measurements = useRef(new Map<string, { width: number; height: number }>());
-  const fitAfterMeasurement = useRef(false);
+  const clipboard = useRef<ClipboardGraph | null>(null);
+  const pasteCount = useRef(0);
+  const selectedNodeIdsRef = useRef(selectedNodeIds);
+  const selectedEdgeIdsRef = useRef(selectedEdgeIds);
   const graphIdRef = useRef(graphId);
   const onGraphSavedRef = useRef(onGraphSaved);
-  graphIdRef.current = graphId;
-  onGraphSavedRef.current = onGraphSaved;
+  graphIdRef.current = graphId; onGraphSavedRef.current = onGraphSaved; selectedNodeIdsRef.current = selectedNodeIds; selectedEdgeIdsRef.current = selectedEdgeIds;
+
+  const loadRun = async (target: GraphRun) => {
+    setRun(target); setNodeRuns([]); setRunEvents([]);
+    if (!api?.getGraphRun) return;
+    const detail = await api.getGraphRun(target.id);
+    if (graphIdRef.current === graphId) { setRun(detail.run); setNodeRuns(detail.nodeRuns); setRunEvents(detail.events); }
+  };
 
   useEffect(() => {
     let mounted = true;
-    setGraph(null); setRun(null); setNodeRuns([]); setRunEvents([]); setResult(null); setRunInput(""); setSelectedNodeId(null); setError(null);
-    if (!api?.getGraph) { setGraph(null); return; }
+    setGraph(null); setRun(null); setRuns([]); setNodeRuns([]); setRunEvents([]); setRunInput({}); setSelectedNodeIds(new Set()); setSelectedEdgeIds(new Set()); setError(null);
+    if (!api?.getGraph) return;
     void api.getGraph(graphId).then(async (detail) => {
       if (!mounted) return;
-      lastSaved.current = editableFingerprint(detail.graph);
-      setGraph(detail.graph);
-      setRun(detail.latestRun);
-      if (detail.latestRun && api.getGraphRun) {
-        const runDetail = await api.getGraphRun(detail.latestRun.id);
-        if (mounted) { setRun(runDetail.run); setNodeRuns(runDetail.nodeRuns); setRunEvents(runDetail.events); setResult(runDetail.run.output); }
-      }
+      lastSaved.current = editableFingerprint(detail.graph); setGraph(detail.graph);
+      const inputNode = detail.graph.definition.nodes.find((node) => node.type === "input");
+      if (inputNode?.type === "input") setRunInput(Object.fromEntries(inputNode.config.fields.map((field) => [field.id, ""])));
+      const history = api.listGraphRuns ? await api.listGraphRuns(graphId) : detail.latestRun ? [detail.latestRun] : [];
+      if (!mounted) return;
+      setRuns(history);
+      if (detail.latestRun) await loadRun(detail.latestRun);
     }).catch((cause) => { if (mounted) setError(message(cause)); });
     return () => { mounted = false; };
   }, [api, graphId]);
 
-  useEffect(() => {
-    if (clearRequest === lastClearRequest.current) return;
-    lastClearRequest.current = clearRequest;
-    if (graph) setConfirmClear(true);
-  }, [clearRequest, graph]);
-
+  useEffect(() => { if (clearRequest !== lastClearRequest.current) { lastClearRequest.current = clearRequest; if (graph) setConfirmClear(true); } }, [clearRequest, graph]);
   useEffect(() => {
     if (!graph || !api?.saveGraph || graph.id !== graphId) return;
     const fingerprint = editableFingerprint(graph);
     if (fingerprint === lastSaved.current || fingerprint === savingFingerprint.current) return;
     const draftErrors = validateGraphDraft(graph.definition);
     if (draftErrors.length) { setError(draftErrors.join(" · ")); return; }
-    const snapshot = structuredClone(graph);
-    const requestedGraphId = graph.id;
+    const snapshot = structuredClone(graph); const requestedGraphId = graph.id;
     const timer = setTimeout(() => {
       savingFingerprint.current = fingerprint;
       saveChain.current = saveChain.current.catch(() => undefined).then(async () => {
-        const saved = await api.saveGraph(snapshot);
+        const saved = await api.saveGraph!(snapshot);
         if (graphIdRef.current !== requestedGraphId) return;
-        lastSaved.current = fingerprint;
-        savingFingerprint.current = "";
-        onGraphSavedRef.current?.(saved);
-        setError(null);
+        lastSaved.current = fingerprint; savingFingerprint.current = ""; onGraphSavedRef.current?.(saved); setError(null);
       }).catch((cause) => { savingFingerprint.current = ""; if (graphIdRef.current === requestedGraphId) setError(message(cause)); });
     }, 350);
     return () => clearTimeout(timer);
@@ -91,135 +88,124 @@ export function GraphCanvas({ language = "en", api, graphId, agents = [], view =
 
   useEffect(() => {
     if (!api?.getGraphRun || run?.status !== "running") return;
-    const requestedGraphId = graphId;
-    const refresh = () => { void api.getGraphRun!(run.id).then((detail) => { if (graphIdRef.current !== requestedGraphId) return; setRun(detail.run); setNodeRuns(detail.nodeRuns); setRunEvents(detail.events); if (detail.run.output !== null) setResult(detail.run.output); }); };
-    refresh();
-    const timer = setInterval(refresh, 400);
+    const timer = setInterval(() => { void api.getGraphRun!(run.id).then((detail) => { if (graphIdRef.current !== graphId) return; setRun(detail.run); setNodeRuns(detail.nodeRuns); setRunEvents(detail.events); setRuns((current) => [detail.run, ...current.filter((item) => item.id !== detail.run.id)]); }); }, 400);
     return () => clearInterval(timer);
   }, [api, graphId, run?.id, run?.status]);
 
-  const flowNodes = useMemo(() => graph ? toFlowNodes(graph, nodeRuns, measurements.current) : [], [graph, nodeRuns]);
-  const flowEdges = useMemo(() => graph ? toFlowEdges(graph) : [], [graph]);
-  useEffect(() => {
-    if (flowNodes.length === 0) return;
-    const frame = requestAnimationFrame(() => { void flow.current?.fitView({ padding: 0.12, duration: 250 }); });
-    return () => cancelAnimationFrame(frame);
-  }, [flowNodes.length]);
-  const selectedNode = graph?.definition.nodes.find((node) => node.id === selectedNodeId) ?? null;
+  const selectedNode = graph?.definition.nodes.find((node) => selectedNodeIds.size === 1 && selectedNodeIds.has(node.id)) ?? null;
+  const flowNodes = useMemo(() => graph ? toFlowNodes(graph, nodeRuns, measurements.current, selectedNodeIds) : [], [graph, nodeRuns, selectedNodeIds]);
+  const flowEdges = useMemo(() => graph ? toFlowEdges(graph, selectedEdgeIds) : [], [graph, selectedEdgeIds]);
   const validation = graph ? validateGraphDefinition(graph.definition) : [];
   const validationKey = validation.join("\n");
   useEffect(() => { onValidationChange?.(validation); }, [onValidationChange, validationKey]);
-  const clearRunState = () => { setRun(null); setNodeRuns([]); setRunEvents([]); setResult(null); setSelectedNodeId(null); };
   const updateGraph = (change: (current: GraphProject) => GraphProject) => setGraph((current) => current ? change(current) : current);
-  const addNode = (type: GraphNode["type"]) => { fitAfterMeasurement.current = true; updateGraph((current) => appendNode(current, type, agents)); };
+  const replaceSelection = (nodes: Set<string>, edges: Set<string>) => { selectedNodeIdsRef.current = nodes; selectedEdgeIdsRef.current = edges; setSelectedNodeIds(nodes); setSelectedEdgeIds(edges); };
+
+  useEffect(() => {
+    const onKeyDown = (event: KeyboardEvent) => {
+      if (!graph || view !== "editor" || isEditableTarget(event.target)) return;
+      const command = event.metaKey || event.ctrlKey;
+      if (command && event.key.toLowerCase() === "a") { event.preventDefault(); replaceSelection(new Set(graph.definition.nodes.map((node) => node.id)), new Set(graph.definition.edges.map((edge) => edge.id))); return; }
+      if (command && event.key.toLowerCase() === "c") { event.preventDefault(); clipboard.current = copySelection(graph, selectedNodeIdsRef.current, selectedEdgeIdsRef.current); pasteCount.current = 0; return; }
+      if (command && event.key.toLowerCase() === "x") { event.preventDefault(); clipboard.current = copySelection(graph, selectedNodeIdsRef.current, selectedEdgeIdsRef.current); updateGraph((current) => removeSelection(current, selectedNodeIdsRef.current, selectedEdgeIdsRef.current)); replaceSelection(new Set(), new Set()); return; }
+      if (command && event.key.toLowerCase() === "v" && clipboard.current) { event.preventDefault(); pasteCount.current += 1; const pasted = pasteSelection(graph, clipboard.current, pasteCount.current); updateGraph(() => pasted.graph); replaceSelection(new Set(pasted.nodeIds), new Set(pasted.edgeIds)); return; }
+      if (event.key === "Delete" || event.key === "Backspace") { event.preventDefault(); updateGraph((current) => removeSelection(current, selectedNodeIdsRef.current, selectedEdgeIdsRef.current)); replaceSelection(new Set(), new Set()); }
+    };
+    window.addEventListener("keydown", onKeyDown); return () => window.removeEventListener("keydown", onKeyDown);
+  }, [graph, selectedEdgeIds, selectedNodeIds, view]);
+
   const changeNodes = (changes: NodeChange[]) => {
     for (const change of changes) if (change.type === "dimensions" && change.dimensions) measurements.current.set(change.id, change.dimensions);
-    const positionChanges = changes.filter((change) => change.type === "position");
-    if (positionChanges.length) updateGraph((current) => applyPositionChanges(current, positionChanges));
-    if (fitAfterMeasurement.current && changes.some((change) => change.type === "dimensions")) {
-      fitAfterMeasurement.current = false;
-      requestAnimationFrame(() => { void flow.current?.fitView({ padding: 0.12, duration: 250 }); });
-    }
+    const selection = changes.filter((change): change is Extract<NodeChange, { type: "select" }> => change.type === "select");
+    if (selection.length) { const next = new Set(selectedNodeIdsRef.current); for (const change of selection) change.selected ? next.add(change.id) : next.delete(change.id); selectedNodeIdsRef.current = next; setSelectedNodeIds(next); }
+    const positions = changes.filter((change) => change.type === "position");
+    if (positions.length) updateGraph((current) => applyPositionChanges(current, positions));
   };
   const startRun = async () => {
     if (!graph || !api?.runGraph || !api.saveGraph || validation.length) { setError(validation.join(" · ")); return; }
     try {
-      const requestedGraphId = graph.id;
       await saveChain.current.catch(() => undefined);
-      const saved = await api.saveGraph(graph);
-      lastSaved.current = editableFingerprint(saved);
-      onGraphSaved?.(saved);
-      if (graphIdRef.current !== requestedGraphId) return;
-      setGraph(saved);
+      const saved = await api.saveGraph(graph); lastSaved.current = editableFingerprint(saved); onGraphSaved?.(saved); setGraph(saved);
       const next = await api.runGraph(saved.id, runInput);
-      if (graphIdRef.current !== requestedGraphId) return;
-      setRun(next); setNodeRuns([]); setRunEvents([]); setResult(next.output); setError(null);
-      const detail = await api.getGraphRun?.(next.id); if (detail && graphIdRef.current === requestedGraphId) { setRun(detail.run); setNodeRuns(detail.nodeRuns); setRunEvents(detail.events); setResult(detail.run.output); }
+      if (graphIdRef.current !== saved.id) return;
+      setRun(next); setRuns((current) => [next, ...current.filter((item) => item.id !== next.id)]); setNodeRuns([]); setRunEvents([]); setError(null);
+      await loadRun(next);
     } catch (cause) { if (graphIdRef.current === graph.id) setError(message(cause)); }
   };
 
-  if (view === "runs") return <section className="graph-run-view" data-testid="graph-canvas" aria-label={zh ? "最近运行" : "Latest run"}>{run ? <div className="graph-run-view__panel"><div><span data-status={run.status}>{run.status}</span><time dateTime={run.updatedAt}>{new Date(run.updatedAt).toLocaleString()}</time></div><h3>{zh ? "输入" : "Input"}</h3><pre>{run.input}</pre>{result !== null ? <><h3>{zh ? "最终结果" : "Final result"}</h3><pre>{result}</pre></> : null}{run.error ? <><h3>{zh ? "错误" : "Error"}</h3><pre>{run.error.message}</pre></> : null}{runEvents.length ? <><h3>{zh ? "运行事件" : "Run events"}</h3><ol className="graph-event-log" role="log" aria-label={zh ? "运行事件" : "Run events"}>{runEvents.map((event) => <li key={event.id}><code>{event.type}</code>{event.nodeId ? <span>{graph?.definition.nodes.find((node) => node.id === event.nodeId)?.name ?? event.nodeId}</span> : null}</li>)}</ol></> : null}</div> : <div className="graph-run-view__empty"><h2>{zh ? "暂无运行" : "No runs yet"}</h2><p>{zh ? "运行图后，最近一次结果会显示在这里。" : "Run this graph to see its latest result here."}</p></div>}</section>;
+  if (view === "runs") return <RunHistory zh={zh} graph={graph} runs={runs} run={run} nodeRuns={nodeRuns} events={runEvents} onOpen={(item) => void loadRun(item)} />;
 
-  return <section className="graph-canvas" data-testid="graph-canvas" aria-label="Graph Canvas">
-    <aside className="graph-sidebar">
-      <div className="graph-library"><h3>{zh ? "节点" : "Nodes"}</h3><button type="button" aria-label={zh ? "添加 Agent" : "Add Agent"} disabled={!graph} onClick={() => addNode("agent")}>✦ Agent</button><button type="button" aria-label={zh ? "添加固定文本" : "Add Literal"} disabled={!graph} onClick={() => addNode("literal")}>T Literal</button><button type="button" aria-label={zh ? "添加文本模板" : "Add Template"} disabled={!graph} onClick={() => addNode("template")}>{`{ } Template`}</button><button type="button" aria-label={zh ? "添加循环计数器" : "Add Loop Counter"} disabled={!graph} onClick={() => addNode("loop_counter")}>↻ Loop Counter</button><button type="button" aria-label={zh ? "添加直通节点" : "Add Pass-through"} disabled={!graph} onClick={() => addNode("passthrough")}>→ Pass-through</button></div>
-    </aside>
+  const inputNode = graph?.definition.nodes.find((node) => node.type === "input");
+  return <section className="graph-canvas" data-library-open={libraryOpen} data-inspector-open={inspectorOpen} style={{ "--graph-inspector-width": `${inspectorWidth}px` } as React.CSSProperties} data-testid="graph-canvas" aria-label="Graph Canvas">
+    <aside className="graph-sidebar"><header><strong>{zh ? "节点" : "Nodes"}</strong><button type="button" title={zh ? "收起节点栏" : "Collapse node library"} aria-label={zh ? "收起节点栏" : "Collapse node library"} onClick={() => setLibraryOpen(false)}>‹</button></header><div className="graph-library">{(["input", "agent", "loop_counter", "output"] as const).map((type) => <button type="button" key={type} aria-label={nodeAction(type, zh)} disabled={!graph || ((type === "input" || type === "output") && graph.definition.nodes.some((node) => node.type === type))} onClick={() => updateGraph((current) => appendNode(current, type, agents))}>{nodeIcon(type)} {nodeName(type, zh)}</button>)}</div></aside>
+    {!libraryOpen && <button type="button" className="graph-panel-toggle graph-panel-toggle--left" aria-label={zh ? "展开节点栏" : "Expand node library"} onClick={() => setLibraryOpen(true)}>›</button>}
     <div className="graph-workspace">
-      <div className="graph-flow" data-testid="graph-flow" ref={flowElement}><ReactFlow nodes={flowNodes} edges={flowEdges} nodeTypes={nodeTypes} fitView minZoom={0.25} maxZoom={1.8} deleteKeyCode={interactionMode === "select" ? ["Backspace", "Delete"] : null} nodesDraggable={interactionMode === "select"} nodesConnectable={interactionMode === "select"} elementsSelectable={interactionMode === "select"} selectionOnDrag={interactionMode === "select"} panOnDrag={interactionMode === "pan"} onInit={(instance) => { flow.current = instance; }} onNodeClick={(_event, node) => { if (interactionMode === "select" && !String(node.id).startsWith("virtual-")) setSelectedNodeId(node.id); }} onNodesChange={changeNodes} onNodesDelete={(nodes) => updateGraph((current) => removeNodes(current, nodes.map((node) => node.id)))} onEdgesDelete={(edges) => updateGraph((current) => ({ ...current, definition: { ...current.definition, edges: current.definition.edges.filter((edge) => !edges.some((deleted) => deleted.id === edge.id)) } }))} onConnect={(connection: Connection) => updateGraph((current) => connect(current, connection))} onMoveEnd={(_event, viewport) => updateGraph((current) => ({ ...current, viewport }))}><Background gap={18} size={1} color="#c9d8e8" /><Controls showInteractive={false} /><div className="graph-canvas-controls"><button type="button" aria-label={zh ? "全屏" : "Fullscreen"} onClick={() => void (document.fullscreenElement ? document.exitFullscreen?.() : flowElement.current?.requestFullscreen?.())}><FullscreenIcon /></button><button type="button" aria-label={interactionMode === "select" ? (zh ? "切换到拖动画布" : "Switch to pan mode") : (zh ? "切换到选择模式" : "Switch to select mode")} data-active={interactionMode === "pan"} onClick={() => setInteractionMode((current) => current === "select" ? "pan" : "select")}>{interactionMode === "select" ? <HandIcon /> : <PointerIcon />}</button></div></ReactFlow></div>
-      <div className="graph-runbar"><textarea aria-label={zh ? "图输入" : "Graph input"} placeholder={zh ? "输入任务…" : "Describe the task…"} value={runInput} onChange={(event) => setRunInput(event.currentTarget.value)} /><div>{run?.status === "running" && <button type="button" className="graph-stop" aria-label={zh ? "停止图" : "Stop graph"} onClick={() => { if (run && api?.cancelGraphRun) void api.cancelGraphRun(run.id).then(() => setRun((current) => current ? { ...current, status: "cancelled" } : current)); }}>■</button>}<button type="button" aria-label={zh ? "运行图" : "Run graph"} disabled={!runInput.trim() || run?.status === "running" || validation.length > 0} onClick={() => void startRun()}>▶ {zh ? "运行" : "Run"}</button></div></div>
+      <div className="graph-flow" data-testid="graph-flow"><ReactFlow nodes={flowNodes} edges={flowEdges} nodeTypes={nodeTypes} fitView minZoom={0.25} maxZoom={1.8} deleteKeyCode={null} nodesDraggable={interactionMode === "select"} nodesConnectable={interactionMode === "select"} elementsSelectable={interactionMode === "select"} selectionOnDrag={interactionMode === "select"} selectionMode={SelectionMode.Partial} panOnDrag={interactionMode === "pan"} onInit={(instance) => { flow.current = instance; }} onNodesChange={changeNodes} onNodesDelete={(nodes) => updateGraph((current) => removeSelection(current, new Set(nodes.map((node) => node.id)), new Set()))} onEdgesChange={(changes: EdgeChange[]) => { const selection = changes.filter((change): change is Extract<EdgeChange, { type: "select" }> => change.type === "select"); if (selection.length) { const next = new Set(selectedEdgeIdsRef.current); for (const change of selection) change.selected ? next.add(change.id) : next.delete(change.id); selectedEdgeIdsRef.current = next; setSelectedEdgeIds(next); } const removed = new Set(changes.filter((change) => change.type === "remove").map((change) => change.id)); if (removed.size) updateGraph((current) => removeSelection(current, new Set(), removed)); }} onConnect={(connection) => updateGraph((current) => connect(current, connection))} onReconnect={(_oldEdge, connection) => updateGraph((current) => reconnect(current, _oldEdge.id, connection))} edgesReconnectable onMoveEnd={(_event, viewport) => updateGraph((current) => ({ ...current, viewport }))}><Background gap={18} size={1} color="#c9d8e8" /><Controls showInteractive={false} /><div className="graph-canvas-controls"><button type="button" title={interactionMode === "select" ? (zh ? "切换到拖动画布" : "Switch to pan mode") : (zh ? "切换到选择模式" : "Switch to select mode")} aria-label={interactionMode === "select" ? (zh ? "切换到拖动画布" : "Switch to pan mode") : (zh ? "切换到选择模式" : "Switch to select mode")} data-active={interactionMode === "pan"} onClick={() => setInteractionMode((current) => current === "select" ? "pan" : "select")}>{interactionMode === "select" ? <HandIcon /> : <PointerIcon />}</button></div></ReactFlow></div>
+      <div className="graph-runbar"><div className="graph-runbar__fields">{inputNode?.type === "input" ? inputNode.config.fields.map((field) => <label key={field.id}><span>{field.name}{field.required !== false ? " *" : ""}</span>{field.multiline ? <textarea aria-label={field.name} placeholder={field.description || (zh ? "输入本次运行内容…" : "Enter input for this run…")} value={runInput[field.id] ?? ""} onChange={(event) => { const value = event.currentTarget.value; setRunInput((current) => ({ ...current, [field.id]: value })); }} /> : <input aria-label={field.name} value={runInput[field.id] ?? ""} onChange={(event) => { const value = event.currentTarget.value; setRunInput((current) => ({ ...current, [field.id]: value })); }} />}</label>) : <textarea aria-label={zh ? "图输入" : "Graph input"} value={runInput.input ?? ""} onChange={(event) => setRunInput({ input: event.currentTarget.value })} />}</div><div>{run?.status === "running" && <button type="button" className="graph-stop" aria-label={zh ? "停止图" : "Stop graph"} onClick={() => { if (run && api?.cancelGraphRun) void api.cancelGraphRun(run.id).then(() => setRun((current) => current ? { ...current, status: "cancelled" } : current)); }}>■</button>}<button type="button" aria-label={zh ? "运行图" : "Run graph"} disabled={run?.status === "running" || validation.length > 0 || !hasRequiredInput(inputNode, runInput)} onClick={() => void startRun()}>▶ {zh ? "运行" : "Run"}</button></div></div>
     </div>
-    <aside className="graph-inspector" aria-label={zh ? "图检查器" : "Graph inspector"}>{selectedNode ? <NodeInspector node={selectedNode} agents={agents} zh={zh} isStart={graph?.definition.start.includes(selectedNode.id) ?? false} isEnd={graph?.definition.end.includes(selectedNode.id) ?? false} onSetBoundary={(boundary) => updateGraph((current) => ({ ...current, definition: { ...current.definition, [boundary]: [selectedNode.id] } }))} onChange={(next) => updateGraph((current) => ({ ...current, definition: { ...current.definition, nodes: current.definition.nodes.map((node) => node.id === next.id ? next : node) } }))} onDelete={() => { updateGraph((current) => removeNodes(current, [selectedNode.id])); setSelectedNodeId(null); }} /> : <><h3>{zh ? "图设置" : "Graph settings"}</h3><label>{zh ? "描述" : "Description"}<textarea value={graph?.description ?? ""} onChange={(event) => updateGraph((current) => ({ ...current, description: event.currentTarget.value }))} /></label>{validation.length > 0 && <div className="graph-errors" role="alert">{validation.map((item) => <p key={item}>{item}</p>)}</div>}</>}{run && <section className="graph-run-state"><h3>{zh ? "最近运行" : "Latest run"}</h3><span data-status={run.status}>{run.status}</span>{result !== null && <><h4>{zh ? "最终结果" : "Final result"}</h4><pre>{result}</pre></>}{runEvents.length > 0 && <><h4>{zh ? "运行事件" : "Run events"}</h4><ol className="graph-event-log" role="log" aria-label={zh ? "运行事件" : "Run events"}>{runEvents.map((event) => <li key={event.id}><code>{event.type}</code>{event.nodeId ? <span>{graph?.definition.nodes.find((node) => node.id === event.nodeId)?.name ?? event.nodeId}</span> : null}</li>)}</ol></>}</section>}</aside>
+    {!inspectorOpen && <button type="button" className="graph-panel-toggle graph-panel-toggle--right" aria-label={zh ? "展开检查器" : "Expand inspector"} onClick={() => setInspectorOpen(true)}>‹</button>}
+    <aside className="graph-inspector" aria-label={zh ? "图检查器" : "Graph inspector"}><button type="button" className="graph-inspector__resize" aria-label={zh ? "调整检查器宽度" : "Resize inspector"} onPointerDown={(event) => beginResize(event, inspectorWidth, setInspectorWidth)} />{selectedNode ? <NodeInspector node={selectedNode} agents={agents} zh={zh} latest={nodeRuns.filter((item) => item.nodeId === selectedNode.id).at(-1)} events={runEvents.filter((event) => event.nodeId === selectedNode.id)} onClose={() => replaceSelection(new Set(), new Set())} onChange={(next) => updateGraph((current) => ({ ...current, definition: { ...current.definition, nodes: current.definition.nodes.map((node) => node.id === next.id ? next : node) } }))} onDelete={() => { updateGraph((current) => removeSelection(current, new Set([selectedNode.id]), new Set())); replaceSelection(new Set(), new Set()); }} /> : <GraphInspector zh={zh} graph={graph} validation={validation} run={run} nodeRuns={nodeRuns} events={runEvents} onCollapse={() => setInspectorOpen(false)} onDescription={(description) => updateGraph((current) => ({ ...current, description }))} />}</aside>
     {error && <div className="graph-toast" role="alert"><span>{error}</span><button onClick={() => setError(null)}>×</button></div>}
-    {confirmClear && <div className="client-dialog"><button type="button" className="client-dialog__backdrop" aria-label={zh ? "取消清空" : "Cancel clearing"} onPointerDown={() => setConfirmClear(false)}/><div className="client-dialog__panel" role="dialog" aria-modal="true" aria-label={zh ? "清空图" : "Clear graph"}><h2>{zh ? "清空此图？" : "Clear this graph?"}</h2><p>{zh ? "将移除全部节点和连线，但保留图及其运行记录。" : "All nodes and edges will be removed. The Graph and its run history remain."}</p><div><button onClick={() => setConfirmClear(false)}>{zh ? "取消" : "Cancel"}</button><button className="danger" onClick={() => { clearRunState(); updateGraph((current) => ({ ...current, definition: { nodes: [], edges: [], start: [], end: [] }, positions: {} })); setConfirmClear(false); }}>{zh ? "清空" : "Clear"}</button></div></div></div>}
+    {confirmClear && <div className="client-dialog"><button type="button" className="client-dialog__backdrop" aria-label={zh ? "取消清空" : "Cancel clearing"} onPointerDown={() => setConfirmClear(false)}/><div className="client-dialog__panel" role="dialog" aria-modal="true" aria-label={zh ? "清空图" : "Clear graph"}><h2>{zh ? "清空此图？" : "Clear this graph?"}</h2><p>{zh ? "将移除全部节点和连线，但保留图及其运行记录。" : "All nodes and edges will be removed. The Graph and its run history remain."}</p><div><button onClick={() => setConfirmClear(false)}>{zh ? "取消" : "Cancel"}</button><button className="danger" onClick={() => { setRun(null); setNodeRuns([]); setRunEvents([]); updateGraph((current) => ({ ...current, definition: { nodes: [], edges: [], start: [], end: [] }, positions: {} })); setConfirmClear(false); }}>{zh ? "清空" : "Clear"}</button></div></div></div>}
   </section>;
 }
 
-function NodeInspector({ node, agents, zh, isStart, isEnd, onSetBoundary, onChange, onDelete }: { node: GraphNode; agents: AgentSettingsView[]; zh: boolean; isStart: boolean; isEnd: boolean; onSetBoundary(boundary: "start" | "end"): void; onChange(node: GraphNode): void; onDelete(): void }) {
+function GraphInspector({ zh, graph, validation, run, nodeRuns, events, onCollapse, onDescription }: { zh: boolean; graph: GraphProject | null; validation: string[]; run: GraphRun | null; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[]; onCollapse(): void; onDescription(value: string): void }) {
+  return <><InspectorHeader title={zh ? "图信息" : "Graph information"} label={zh ? "收起检查器" : "Collapse inspector"} onClose={onCollapse} /><label>{zh ? "描述" : "Description"}<textarea value={graph?.description ?? ""} onChange={(event) => onDescription(event.currentTarget.value)} /></label>{validation.length ? <div className="graph-errors" role="alert">{validation.map((item) => <p key={item}>{item}</p>)}</div> : <p className="graph-valid">{zh ? "图结构完整，可以运行" : "Graph is ready to run"}</p>}{run && <section className="graph-run-state"><h3>{zh ? "最近一次执行" : "Latest execution"}</h3><RunStatus run={run} zh={zh} /><div className="graph-run-summary"><span>{zh ? "节点" : "Nodes"} {new Set(nodeRuns.map((item) => item.nodeId)).size}</span><span>{zh ? "步骤" : "Steps"} {nodeRuns.length}</span><span>{zh ? "事件" : "Events"} {events.length}</span></div><EventLog events={events.filter((event) => event.type.startsWith("node_") || event.type.startsWith("run_"))} graph={graph} zh={zh} /></section>}</>;
+}
+
+function NodeInspector({ node, agents, zh, latest, events, onClose, onChange, onDelete }: { node: GraphNode; agents: AgentSettingsView[]; zh: boolean; latest?: GraphNodeRun; events: GraphRunEvent[]; onClose(): void; onChange(node: GraphNode): void; onDelete(): void }) {
   const availableAgents = sortAgents(agents.filter(isRunnableAgent));
   const selectedAgent = node.type === "agent" ? agents.find((agent) => agent.id === node.config.agentProductId) : undefined;
   const modelId = node.type === "agent" && selectedAgent?.catalog.models.includes(node.config.modelId ?? "") ? node.config.modelId ?? "" : "";
-  return <><h3>{zh ? "节点设置" : "Node settings"}</h3><label>{zh ? "名称" : "Name"}<input value={node.name} onChange={(event) => onChange({ ...node, name: event.currentTarget.value })} /></label><div className="graph-inspector__boundaries"><button type="button" data-active={isStart} onClick={() => onSetBoundary("start")}>{zh ? "设为起点" : "Set as start"}</button><button type="button" data-active={isEnd} onClick={() => onSetBoundary("end")}>{zh ? "设为终点" : "Set as end"}</button></div>{node.type === "loop_counter" && <label>{zh ? "最大迭代次数" : "Maximum iterations"}<input type="number" min="1" aria-label={zh ? "最大迭代次数" : "Maximum iterations"} value={node.config.maxIterations} onChange={(event) => onChange({ ...node, config: { maxIterations: Number(event.currentTarget.value) } })} /></label>}{node.type === "literal" && <label>{zh ? "固定文本" : "Value"}<textarea aria-label={zh ? "固定文本" : "Value"} value={node.config.value} onChange={(event) => onChange({ ...node, config: { value: event.currentTarget.value } })} /></label>}{node.type === "template" && <label>{zh ? "文本模板" : "Template"}<textarea aria-label={zh ? "文本模板" : "Template"} value={node.config.template} onChange={(event) => onChange({ ...node, config: { template: event.currentTarget.value } })} /></label>}{node.type === "agent" && <><label>Agent<select aria-label="Agent" value={node.config.agentProductId} onChange={(event) => { const agent = availableAgents.find((item) => item.id === event.currentTarget.value); if (agent) onChange({ ...node, config: { ...node.config, agentProductId: agent.id, modelId: agent.catalog.models[0] ?? null, permissionMode: agent.catalog.permissionModes[0] ?? "request_approval" } }); }}>{availableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agentLabel(agent.id)}</option>)}</select></label><label>{zh ? "模型" : "Model"}<select aria-label={zh ? "模型" : "Model"} value={modelId} onChange={(event) => onChange({ ...node, config: { ...node.config, modelId: event.currentTarget.value || null } })}><option value="">Default</option>{selectedAgent?.catalog.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>{zh ? "权限模式" : "Permission mode"}<select aria-label={zh ? "权限模式" : "Permission mode"} value={node.config.permissionMode} onChange={(event) => onChange({ ...node, config: { ...node.config, permissionMode: event.currentTarget.value as typeof node.config.permissionMode } })}>{selectedAgent?.catalog.permissionModes.map((mode) => <option key={mode} value={mode}>{mode}</option>)}</select></label><label>{zh ? "提示词" : "Prompt"}<textarea value={node.config.prompt} onChange={(event) => onChange({ ...node, config: { ...node.config, prompt: event.currentTarget.value } })} /></label></>}<button type="button" className="graph-inspector__delete" aria-label={zh ? "删除节点" : "Delete node"} onClick={onDelete}>{zh ? "删除节点" : "Delete node"}</button></>;
+  return <><InspectorHeader title={zh ? "节点设置" : "Node settings"} label={zh ? "关闭节点检查器" : "Close node inspector"} onClose={onClose} /><label>{zh ? "名称" : "Name"}<input value={node.name} onChange={(event) => onChange({ ...node, name: event.currentTarget.value })} /></label>{node.type === "input" && <PortEditor title={zh ? "用户输入字段" : "User input fields"} ports={node.config.fields} inputFields zh={zh} onChange={(fields) => onChange({ ...node, config: { fields: fields as GraphInputField[] } })} />}{node.type === "output" && <PortEditor title={zh ? "输出字段" : "Output fields"} ports={node.config.fields} zh={zh} onChange={(fields) => onChange({ ...node, config: { fields } })} />}{node.type === "loop_counter" && <label>{zh ? "最大迭代次数" : "Maximum iterations"}<input type="number" min="1" aria-label={zh ? "最大迭代次数" : "Maximum iterations"} value={node.config.maxIterations} onChange={(event) => onChange({ ...node, config: { maxIterations: Number(event.currentTarget.value) } })} /></label>}{node.type === "agent" && <><label>Agent<select aria-label="Agent" value={node.config.agentProductId} onChange={(event) => { const agent = availableAgents.find((item) => item.id === event.currentTarget.value); if (agent) onChange({ ...node, config: { ...node.config, agentProductId: agent.id, modelId: agent.catalog.models[0] ?? null, permissionMode: agent.catalog.permissionModes[0] ?? "request_approval" } }); }}>{availableAgents.map((agent) => <option key={agent.id} value={agent.id}>{agentLabel(agent.id)}</option>)}</select></label><label>{zh ? "模型" : "Model"}<select aria-label={zh ? "模型" : "Model"} value={modelId} onChange={(event) => onChange({ ...node, config: { ...node.config, modelId: event.currentTarget.value || null } })}><option value="">{zh ? "默认" : "Default"}</option>{selectedAgent?.catalog.models.map((model) => <option key={model}>{model}</option>)}</select></label><label>{zh ? "权限模式" : "Permission mode"}<select aria-label={zh ? "权限模式" : "Permission mode"} value={node.config.permissionMode} onChange={(event) => onChange({ ...node, config: { ...node.config, permissionMode: event.currentTarget.value as PermissionMode } })}>{(selectedAgent?.catalog.permissionModes ?? [node.config.permissionMode]).map((mode) => <option key={mode} value={mode}>{permissionLabels[mode][zh ? "zh" : "en"]}</option>)}</select></label><label>{zh ? "收到输入后执行" : "Instruction"}<textarea aria-label={zh ? "提示词" : "Instruction"} value={node.config.instruction ?? node.config.prompt ?? ""} onChange={(event) => onChange({ ...node, config: { ...node.config, instruction: event.currentTarget.value } })} /></label><PortEditor title={zh ? "输入端口" : "Input ports"} ports={node.config.inputs ?? [{ id: "input", name: zh ? "输入" : "Input", required: true }]} allowFeedback zh={zh} onChange={(inputs) => onChange({ ...node, config: { ...node.config, inputs } })} /><PortEditor title={zh ? "输出端口" : "Output ports"} ports={node.config.outputs ?? [{ id: "output", name: zh ? "输出" : "Output" }]} zh={zh} onChange={(outputs) => onChange({ ...node, config: { ...node.config, outputs } })} /></>}{latest && <section className="graph-node-run"><h3>{zh ? "最近一次运行" : "Latest node run"}</h3><span data-status={latest.status}>{statusLabel(latest.status, zh)}</span><Values title={zh ? "输入" : "Input"} values={latest.inputValues ?? { input: latest.input }} /><Values title={zh ? "输出" : "Output"} values={latest.outputValues ?? (latest.output !== null ? { output: latest.output } : {})} /><EventLog events={events} graph={null} zh={zh} /></section>}{node.type !== "input" && node.type !== "output" && <button type="button" className="graph-inspector__delete" aria-label={zh ? "删除节点" : "Delete node"} onClick={onDelete}>{zh ? "删除节点" : "Delete node"}</button>}</>;
 }
+
+function PortEditor({ title, ports, zh, inputFields = false, allowFeedback = false, onChange }: { title: string; ports: GraphPort[]; zh: boolean; inputFields?: boolean; allowFeedback?: boolean; onChange(ports: GraphPort[]): void }) {
+  const add = () => { const index = ports.length + 1; onChange([...ports, inputFields ? { id: `input_${index}`, name: `${zh ? "输入" : "Input"} ${index}`, description: "", multiline: true } as GraphInputField : { id: `port_${index}`, name: `${zh ? "端口" : "Port"} ${index}` }]); };
+  return <fieldset className="graph-ports-editor"><legend>{title}<button type="button" aria-label={`${zh ? "添加" : "Add"} ${title}`} onClick={add}>＋</button></legend>{ports.map((port, index) => <div key={`${port.id}-${index}`}><input aria-label={`${title} ${index + 1}`} value={port.name} onChange={(event) => onChange(ports.map((item, itemIndex) => itemIndex === index ? { ...item, name: event.currentTarget.value, id: slug(event.currentTarget.value) || item.id } : item))} />{allowFeedback && <select aria-label={`${port.name} ${zh ? "类型" : "type"}`} value={port.kind ?? "input"} onChange={(event) => onChange(ports.map((item, itemIndex) => itemIndex === index ? { ...item, kind: event.currentTarget.value as "input" | "feedback" } : item))}><option value="input">{zh ? "普通输入" : "Input"}</option><option value="feedback">{zh ? "循环输入" : "Loop input"}</option></select>}<button type="button" aria-label={`${zh ? "删除" : "Remove"} ${port.name}`} disabled={ports.length === 1} onClick={() => onChange(ports.filter((_, itemIndex) => itemIndex !== index))}>×</button></div>)}</fieldset>;
+}
+
+function RunHistory({ zh, graph, runs, run, nodeRuns, events, onOpen }: { zh: boolean; graph: GraphProject | null; runs: GraphRun[]; run: GraphRun | null; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[]; onOpen(run: GraphRun): void }) {
+  const snapshot = run?.graphSnapshot;
+  const [snapshotNodeId, setSnapshotNodeId] = useState<string | null>(null);
+  const snapshotNode = snapshot?.definition.nodes.find((node) => node.id === snapshotNodeId);
+  const selectedRuns = snapshotNodeId ? nodeRuns.filter((item) => item.nodeId === snapshotNodeId) : [];
+  return <section className="graph-run-view" data-testid="graph-canvas" aria-label={zh ? "最近运行" : "Recent runs"}><aside><h2>{zh ? "最近运行" : "Recent runs"}</h2>{runs.length ? runs.map((item) => <button type="button" key={item.id} data-active={item.id === run?.id} aria-label={`Run ${item.id}`} onClick={() => { setSnapshotNodeId(null); onOpen(item); }}><RunStatus run={item} zh={zh} /><small>{new Date(item.createdAt).toLocaleString()}</small><p>{item.input}</p></button>) : <p>{zh ? "暂无运行" : "No runs yet"}</p>}</aside><main>{run ? <><header><RunStatus run={run} zh={zh} /><time dateTime={run.updatedAt}>{new Date(run.updatedAt).toLocaleString()}</time></header>{snapshot ? <div className="graph-run-snapshot" aria-label={zh ? "运行快照" : "Run snapshot"}>{snapshot.definition.nodes.map((node) => <button type="button" key={node.id} style={{ left: snapshot.positions[node.id]?.x ?? 0, top: snapshot.positions[node.id]?.y ?? 0 }} data-kind={node.type} data-active={node.id === snapshotNodeId} onClick={() => setSnapshotNodeId(node.id)}>{nodeIcon(node.type)} {node.name}</button>)}</div> : null}{snapshotNode ? <section className="graph-run-detail"><h3>{snapshotNode.name}</h3>{selectedRuns.map((item) => <div key={item.id}><span>{zh ? `第 ${item.iteration} 次` : `Iteration ${item.iteration}`}</span><Values title={zh ? "输入" : "Input"} values={item.inputValues ?? { input: item.input }} /><Values title={zh ? "输出" : "Output"} values={item.outputValues ?? (item.output ? { output: item.output } : {})} /></div>)}<EventLog events={events.filter((event) => event.nodeId === snapshotNode.id)} graph={graph} zh={zh} /></section> : <><Values title={zh ? "用户输入" : "User input"} values={run.inputValues ?? { input: run.input }} /><Values title={zh ? "最终输出" : "Final output"} values={run.outputValues ?? (run.output ? { output: run.output } : {})} /><EventLog events={events} graph={graph} zh={zh} /></>}</> : <div className="graph-run-view__empty">{zh ? "选择一次运行查看详情" : "Select a run to inspect it"}</div>}</main></section>;
+}
+
+function InspectorHeader({ title, label, onClose }: { title: string; label: string; onClose(): void }) { return <header className="graph-inspector__header"><h3>{title}</h3><button type="button" aria-label={label} title={label} onClick={onClose}>×</button></header>; }
+function Values({ title, values }: { title: string; values: GraphValues }) { return <section className="graph-values"><h4>{title}</h4>{Object.entries(values).length ? Object.entries(values).map(([key, value]) => <div key={key}><strong>{key}</strong><Markdown options={{ disableParsingRawHTML: true }}>{value}</Markdown></div>) : <p>—</p>}</section>; }
+function EventLog({ events, graph, zh }: { events: GraphRunEvent[]; graph: GraphProject | null; zh: boolean }) { return events.length ? <ol className="graph-event-log" role="log" aria-label={zh ? "运行事件" : "Run events"}>{events.map((event) => <li key={event.id}><span className="graph-event-log__dot"/><div><code>{eventLabel(event.type, zh)}</code>{event.nodeId ? <span>{graph?.definition.nodes.find((node) => node.id === event.nodeId)?.name ?? event.nodeId}</span> : null}</div></li>)}</ol> : null; }
+function RunStatus({ run, zh }: { run: GraphRun; zh: boolean }) { return <span className="graph-status" data-status={run.status}>{statusLabel(run.status, zh)}</span>; }
+function statusLabel(status: string, zh: boolean): string { const labels: Record<string, [string, string]> = { running: ["运行中", "Running"], completed: ["已完成", "Completed"], failed: ["失败", "Failed"], cancelled: ["已取消", "Cancelled"], interrupted: ["已中断", "Interrupted"] }; return labels[status]?.[zh ? 0 : 1] ?? status; }
+function eventLabel(type: string, zh: boolean): string { const labels: Record<string, [string, string]> = { run_started: ["开始运行", "Run started"], run_completed: ["运行完成", "Run completed"], run_failed: ["运行失败", "Run failed"], node_started: ["节点开始", "Node started"], node_completed: ["节点完成", "Node completed"] }; return labels[type]?.[zh ? 0 : 1] ?? type.replaceAll("_", " "); }
 
 export function defaultGraph(agents: AgentSettingsView[] = []): Omit<GraphProject, "id" | "projectId" | "createdAt" | "updatedAt"> {
   const agent = sortAgents(agents.filter(isRunnableAgent))[0];
-  return { name: "Untitled graph", description: "", definition: { nodes: [{ id: "agent-1", type: "agent", name: "Agent 1", config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", prompt: "{{input}}" } }, { id: "loop-1", type: "loop_counter", name: "Loop Counter 1", config: { maxIterations: 3 } }, { id: "end-1", type: "passthrough", name: "Result", config: {} }], edges: [{ id: "agent-loop", source: "agent-1", target: "loop-1" }, { id: "loop-agent", source: "loop-1", target: "agent-1", condition: { branch: "loop" } }, { id: "loop-end", source: "loop-1", target: "end-1", condition: { branch: "done" } }], start: ["agent-1"], end: ["end-1"] }, viewport: { x: 0, y: 0, zoom: 1 }, positions: { "agent-1": { x: 220, y: 180 }, "loop-1": { x: 440, y: 180 }, "end-1": { x: 660, y: 180 } } };
+  return { name: "Untitled graph", description: "", definition: { nodes: [{ id: "input-1", type: "input", name: "User Input", config: { fields: [{ id: "task", name: "Task", description: "Describe what the Agent should do", required: true, multiline: true }] } }, { id: "agent-1", type: "agent", name: "Agent 1", config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", instruction: "Complete the task and return the result.", inputs: [{ id: "task", name: "Task", required: true }], outputs: [{ id: "result", name: "Result" }] } }, { id: "output-1", type: "output", name: "Output", config: { fields: [{ id: "result", name: "Result", required: true }] } }], edges: [{ id: "input-agent", source: "input-1", sourcePort: "task", target: "agent-1", targetPort: "task" }, { id: "agent-output", source: "agent-1", sourcePort: "result", target: "output-1", targetPort: "result" }], start: ["input-1"], end: ["output-1"] }, viewport: { x: 0, y: 0, zoom: 1 }, positions: { "input-1": { x: 80, y: 180 }, "agent-1": { x: 350, y: 180 }, "output-1": { x: 640, y: 180 } } };
 }
 
-function toFlowNodes(graph: GraphProject, nodeRuns: GraphNodeRun[], measurements = new Map<string, { width: number; height: number }>()): Node<GraphNodeData>[] {
-  const startId = graph.definition.start[0];
-  const endId = graph.definition.end[0];
-  return [
-    { id: "virtual-start", type: "workflow", position: { x: 20, y: 180 }, draggable: false, selectable: false, data: { kind: "start", label: "Start", subtitle: startId } },
-    ...graph.definition.nodes.map((node, index) => ({ id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 220 + index * 210, y: 180 }, measured: measurements.get(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? agentLabel(node.config.agentProductId) : node.type === "loop_counter" ? `× ${node.config.maxIterations}` : node.type === "literal" ? node.config.value : node.type === "template" ? "{{input}}" : undefined, status: nodeRuns.findLast((item) => item.nodeId === node.id)?.status } })),
-    { id: "virtual-end", type: "workflow", position: { x: 480 + graph.definition.nodes.length * 180, y: 180 }, draggable: false, selectable: false, data: { kind: "end", label: "End", subtitle: endId } },
-  ] as Node<GraphNodeData>[];
-}
-
-function toFlowEdges(graph: GraphProject): Edge[] {
-  return [
-    { id: "virtual-start-edge", source: "virtual-start", target: graph.definition.start[0] ?? "virtual-end", selectable: false },
-    ...graph.definition.edges.map((edge) => ({ ...edge, sourceHandle: edge.condition?.branch, label: edge.condition?.branch })),
-    { id: "virtual-end-edge", source: graph.definition.end[0] ?? "virtual-start", target: "virtual-end", selectable: false },
-  ].map((edge) => ({ ...edge, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: "#8fa8bf" } }));
-}
-
-function appendNode(graph: GraphProject, type: GraphNode["type"], agents: AgentSettingsView[]): GraphProject {
-  const count = graph.definition.nodes.filter((node) => node.type === type).length + 1;
-  const id = `${type}-${crypto.randomUUID()}`;
-  const agent = sortAgents(agents.filter(isRunnableAgent))[0];
-  const node: GraphNode = type === "agent"
-    ? { id, type, name: `Agent ${count}`, config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", prompt: "{{input}}" } }
-    : type === "loop_counter"
-      ? { id, type, name: `Loop Counter ${count}`, config: { maxIterations: 3 } }
-      : type === "literal"
-        ? { id, type, name: `Literal ${count}`, config: { value: "" } }
-        : type === "template"
-          ? { id, type, name: `Template ${count}`, config: { template: "{{input}}" } }
-          : { id, type, name: `Pass-through ${count}`, config: {} };
-  return { ...graph, definition: { ...graph.definition, nodes: [...graph.definition.nodes, node] }, positions: { ...graph.positions, [id]: { x: 260 + graph.definition.nodes.length * 190, y: 300 } } };
-}
-
-function applyPositionChanges(graph: GraphProject, changes: NodeChange[]): GraphProject {
-  const nodes = applyNodeChanges(changes, toFlowNodes(graph, []));
-  const positions = { ...graph.positions };
-  for (const node of nodes) if (!node.id.startsWith("virtual-")) positions[node.id] = node.position;
-  return { ...graph, positions };
-}
-
-function connect(graph: GraphProject, connection: Connection): GraphProject {
-  if (!connection.source || !connection.target || connection.source.startsWith("virtual-") || connection.target.startsWith("virtual-")) return graph;
-  const edge = { id: crypto.randomUUID(), source: connection.source, target: connection.target, ...(connection.sourceHandle === "loop" || connection.sourceHandle === "done" ? { condition: { branch: connection.sourceHandle } } : {}) } as GraphDefinition["edges"][number];
-  return { ...graph, definition: { ...graph.definition, edges: addEdge(edge, graph.definition.edges) as GraphDefinition["edges"] } };
-}
-function removeNodes(graph: GraphProject, ids: string[]): GraphProject {
-  const removed = new Set(ids.filter((id) => !id.startsWith("virtual-")));
-  return { ...graph, definition: { ...graph.definition, nodes: graph.definition.nodes.filter((node) => !removed.has(node.id)), edges: graph.definition.edges.filter((edge) => !removed.has(edge.source) && !removed.has(edge.target)), start: graph.definition.start.filter((id) => !removed.has(id)), end: graph.definition.end.filter((id) => !removed.has(id)) }, positions: Object.fromEntries(Object.entries(graph.positions).filter(([id]) => !removed.has(id))) };
-}
-
+function toFlowNodes(graph: GraphProject, nodeRuns: GraphNodeRun[], measurements: Map<string, { width: number; height: number }>, selected: Set<string>): Node<GraphNodeData>[] { return graph.definition.nodes.map((node, index) => ({ id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 100 + index * 250, y: 180 }, measured: measurements.get(node.id), selected: selected.has(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? agentLabel(node.config.agentProductId) : node.type === "loop_counter" ? `× ${node.config.maxIterations}` : undefined, inputs: nodeInputs(node), outputs: nodeOutputs(node), status: nodeRuns.findLast((item) => item.nodeId === node.id)?.status } })); }
+function toFlowEdges(graph: GraphProject, selected: Set<string>): Edge[] { return graph.definition.edges.map((edge) => ({ ...edge, sourceHandle: edge.sourcePort, targetHandle: edge.targetPort, label: edge.condition?.branch, type: "smoothstep", reconnectable: true, selected: selected.has(edge.id), markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: selected.has(edge.id) ? "#4f83d1" : "#8fa8bf", strokeWidth: selected.has(edge.id) ? 2 : 1.4 } })); }
+function nodeInputs(node: GraphNode): GraphPort[] { if (node.type === "agent") return node.config.inputs ?? [{ id: "input", name: "Input", required: true }]; if (node.type === "output") return node.config.fields; if (node.type === "loop_counter") return [{ id: "input", name: "Input", required: true }]; if (node.type === "literal" || node.type === "template" || node.type === "passthrough") return [{ id: "input", name: "Input" }]; return []; }
+function nodeOutputs(node: GraphNode): GraphPort[] { if (node.type === "agent") return node.config.outputs ?? [{ id: "output", name: "Output" }]; if (node.type === "input") return node.config.fields; if (node.type === "loop_counter") return [{ id: "loop", name: "Loop" }, { id: "done", name: "Done" }]; if (node.type === "literal" || node.type === "template" || node.type === "passthrough") return [{ id: "output", name: "Output" }]; return []; }
+function appendNode(graph: GraphProject, type: "input" | "agent" | "loop_counter" | "output", agents: AgentSettingsView[]): GraphProject { const count = graph.definition.nodes.filter((node) => node.type === type).length + 1; const id = `${type}-${crypto.randomUUID()}`; const agent = sortAgents(agents.filter(isRunnableAgent))[0]; const node: GraphNode = type === "input" ? { id, type, name: `Input ${count}`, config: { fields: [{ id: "input", name: "Input", description: "", required: true, multiline: true }] } } : type === "output" ? { id, type, name: `Output ${count}`, config: { fields: [{ id: "output", name: "Output", required: true }] } } : type === "loop_counter" ? { id, type, name: `Loop ${count}`, config: { maxIterations: 3 } } : { id, type, name: `Agent ${count}`, config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", instruction: "", inputs: [{ id: "input", name: "Input", required: true }], outputs: [{ id: "output", name: "Output" }] } }; const definition = { ...graph.definition, nodes: [...graph.definition.nodes, node], ...(type === "input" ? { start: [id] } : {}), ...(type === "output" ? { end: [id] } : {}) }; return { ...graph, definition, positions: { ...graph.positions, [id]: { x: 180 + graph.definition.nodes.length * 220, y: 260 } } }; }
+function applyPositionChanges(graph: GraphProject, changes: NodeChange[]): GraphProject { const nodes = applyNodeChanges(changes, toFlowNodes(graph, [], new Map(), new Set())); const positions = { ...graph.positions }; for (const node of nodes) positions[node.id] = node.position; return { ...graph, positions }; }
+function connect(graph: GraphProject, connection: Connection): GraphProject { if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) return graph; const source = graph.definition.nodes.find((node) => node.id === connection.source); const branch = connection.sourceHandle === "loop" || connection.sourceHandle === "done" ? connection.sourceHandle : null; const condition: GraphDefinition["edges"][number]["condition"] = source?.type === "loop_counter" && branch ? { branch } : undefined; const edge: GraphDefinition["edges"][number] = { id: crypto.randomUUID(), source: connection.source, sourcePort: connection.sourceHandle, target: connection.target, targetPort: connection.targetHandle, ...(condition ? { condition } : {}) }; return { ...graph, definition: { ...graph.definition, edges: addEdge(edge, graph.definition.edges) as GraphDefinition["edges"] } }; }
+function reconnect(graph: GraphProject, edgeId: string, connection: Connection): GraphProject { if (!connection.source || !connection.target || !connection.sourceHandle || !connection.targetHandle) return graph; const without = { ...graph, definition: { ...graph.definition, edges: graph.definition.edges.filter((edge) => edge.id !== edgeId) } }; return connect(without, connection); }
+function removeSelection(graph: GraphProject, nodeIds: Set<string>, edgeIds: Set<string>): GraphProject { return { ...graph, definition: { ...graph.definition, nodes: graph.definition.nodes.filter((node) => !nodeIds.has(node.id)), edges: graph.definition.edges.filter((edge) => !edgeIds.has(edge.id) && !nodeIds.has(edge.source) && !nodeIds.has(edge.target)), start: graph.definition.start.filter((id) => !nodeIds.has(id)), end: graph.definition.end.filter((id) => !nodeIds.has(id)) }, positions: Object.fromEntries(Object.entries(graph.positions).filter(([id]) => !nodeIds.has(id))) }; }
+function copySelection(graph: GraphProject, nodeIds: Set<string>, edgeIds: Set<string>): ClipboardGraph { const ids = nodeIds.size ? nodeIds : new Set<string>(); return { nodes: structuredClone(graph.definition.nodes.filter((node) => ids.has(node.id))), edges: structuredClone(graph.definition.edges.filter((edge) => edgeIds.has(edge.id) || (ids.has(edge.source) && ids.has(edge.target)))), positions: structuredClone(Object.fromEntries(Object.entries(graph.positions).filter(([id]) => ids.has(id)))) }; }
+function pasteSelection(graph: GraphProject, copied: ClipboardGraph, count: number): { graph: GraphProject; nodeIds: string[]; edgeIds: string[] } { const idMap = new Map(copied.nodes.map((node) => [node.id, crypto.randomUUID()])); const nodes = copied.nodes.filter((node) => node.type !== "input" && node.type !== "output").map((node) => ({ ...structuredClone(node), id: idMap.get(node.id)!, name: `${node.name} copy` })); const edges = copied.edges.filter((edge) => nodes.some((node) => node.id === idMap.get(edge.source)) && nodes.some((node) => node.id === idMap.get(edge.target))).map((edge) => ({ ...edge, id: crypto.randomUUID(), source: idMap.get(edge.source)!, target: idMap.get(edge.target)! })); const positions = Object.fromEntries(nodes.map((node) => { const original = [...idMap].find(([, id]) => id === node.id)![0]; const position = copied.positions[original] ?? { x: 0, y: 0 }; return [node.id, { x: position.x + 32 * count, y: position.y + 32 * count }]; })); return { graph: { ...graph, definition: { ...graph.definition, nodes: [...graph.definition.nodes, ...nodes], edges: [...graph.definition.edges, ...edges] }, positions: { ...graph.positions, ...positions } }, nodeIds: nodes.map((node) => node.id), edgeIds: edges.map((edge) => edge.id) }; }
+function beginResize(event: React.PointerEvent, width: number, setWidth: (width: number) => void) { event.currentTarget.setPointerCapture?.(event.pointerId); const start = event.clientX; const move = (next: PointerEvent) => setWidth(Math.min(520, Math.max(240, width + start - next.clientX))); const up = (next: PointerEvent) => { const value = Math.min(520, Math.max(240, width + start - next.clientX)); globalThis.localStorage?.setItem("ain-one.graph.inspector-width", String(value)); window.removeEventListener("pointermove", move); window.removeEventListener("pointerup", up); }; window.addEventListener("pointermove", move); window.addEventListener("pointerup", up); }
+function hasRequiredInput(node: GraphNode | undefined, values: GraphValues): boolean { return node?.type === "input" ? node.config.fields.every((field) => field.required === false || Boolean(values[field.id]?.trim())) : Boolean(values.input?.trim()); }
+function isEditableTarget(target: EventTarget | null): boolean { return target instanceof HTMLElement && (target.matches("input, textarea, select, [contenteditable='true']") || Boolean(target.closest("input, textarea, select, [contenteditable='true']"))); }
+function nodeAction(type: "input" | "agent" | "loop_counter" | "output", zh: boolean): string { const labels = { input: ["添加输入", "Add Input"], agent: ["添加 Agent", "Add Agent"], loop_counter: ["添加循环", "Add Loop"], output: ["添加输出", "Add Output"] } as const; return labels[type][zh ? 0 : 1]; }
+function nodeName(type: "input" | "agent" | "loop_counter" | "output", zh: boolean): string { const labels = { input: ["用户输入", "User Input"], agent: ["Agent", "Agent"], loop_counter: ["循环", "Loop"], output: ["输出", "Output"] } as const; return labels[type][zh ? 0 : 1]; }
+function nodeIcon(type: GraphNode["type"]): string { return type === "input" ? "↳" : type === "agent" ? "✦" : type === "loop_counter" ? "↻" : "↗"; }
+function slug(value: string): string { return value.trim().toLowerCase().replace(/[^a-z0-9\u4e00-\u9fff]+/g, "_").replace(/^_+|_+$/g, ""); }
 function message(error: unknown): string { return error instanceof Error ? error.message : String(error); }
 function isRunnableAgent(agent: AgentSettingsView): boolean { return agent.enabled !== false && agent.status !== "not_installed" && agent.status !== "runtime_error" && agent.status !== "version_unsupported"; }
 function editableFingerprint(graph: GraphProject): string { return JSON.stringify([graph.name, graph.description, graph.definition, graph.viewport, graph.positions]); }
-function FullscreenIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M7 3H3v4M13 3h4v4M7 17H3v-4M13 17h4v-4" /></svg>; }
 function HandIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M6.5 9V5.5a1.2 1.2 0 0 1 2.4 0V8m0-3.5a1.2 1.2 0 0 1 2.4 0V8m0-2.5a1.2 1.2 0 0 1 2.4 0V9m0-1.5a1.2 1.2 0 0 1 2.4 0v4c0 3-2 5-5 5H9c-2 0-3.1-.8-4.1-2.2L2.8 12a1.2 1.2 0 0 1 1.9-1.5L6.5 12Z" /></svg>; }
 function PointerIcon() { return <svg viewBox="0 0 20 20" aria-hidden="true"><path d="M5 3l10 8-5 .8-2.4 4.5Z" /></svg>; }

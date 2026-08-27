@@ -130,6 +130,9 @@ function migrate(db: DatabaseSync): void {
       input TEXT NOT NULL,
       output TEXT,
       error_json TEXT,
+      input_values_json TEXT,
+      output_values_json TEXT,
+      graph_snapshot_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -143,6 +146,8 @@ function migrate(db: DatabaseSync): void {
       input TEXT NOT NULL,
       output TEXT,
       error_json TEXT,
+      input_values_json TEXT,
+      output_values_json TEXT,
       created_at TEXT NOT NULL,
       updated_at TEXT NOT NULL
     );
@@ -176,6 +181,13 @@ function migrate(db: DatabaseSync): void {
 function migrateGraphManagement(db: DatabaseSync): void {
   const columns = new Set((db.prepare("PRAGMA table_info(graphs)").all() as Array<{ name: string }>).map((item) => item.name));
   if (!columns.has("archived_at")) db.exec("ALTER TABLE graphs ADD COLUMN archived_at TEXT");
+  const runColumns = new Set((db.prepare("PRAGMA table_info(graph_runs)").all() as Array<{ name: string }>).map((item) => item.name));
+  if (!runColumns.has("input_values_json")) db.exec("ALTER TABLE graph_runs ADD COLUMN input_values_json TEXT");
+  if (!runColumns.has("output_values_json")) db.exec("ALTER TABLE graph_runs ADD COLUMN output_values_json TEXT");
+  if (!runColumns.has("graph_snapshot_json")) db.exec("ALTER TABLE graph_runs ADD COLUMN graph_snapshot_json TEXT");
+  const nodeRunColumns = new Set((db.prepare("PRAGMA table_info(graph_node_runs)").all() as Array<{ name: string }>).map((item) => item.name));
+  if (!nodeRunColumns.has("input_values_json")) db.exec("ALTER TABLE graph_node_runs ADD COLUMN input_values_json TEXT");
+  if (!nodeRunColumns.has("output_values_json")) db.exec("ALTER TABLE graph_node_runs ADD COLUMN output_values_json TEXT");
 }
 
 function migrateQueueDeliveries(db: DatabaseSync): void {

@@ -164,7 +164,8 @@ export interface AinOneApi {
   archiveGraph?(graphId: string, archived: boolean): Promise<GraphProject>;
   forkGraph?(graphId: string): Promise<GraphProject>;
   deleteGraph(graphId: string): Promise<void>;
-  runGraph(graphId: string, input: string): Promise<GraphRun>;
+  runGraph(graphId: string, input: string | Record<string, string>): Promise<GraphRun>;
+  listGraphRuns?(graphId: string): Promise<GraphRun[]>;
   getGraphRun(runId: string): Promise<{ run: GraphRun; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[] }>;
   cancelGraphRun(runId: string): Promise<boolean>;
 }
@@ -683,6 +684,9 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
     },
     async runGraph(graphId, input): Promise<GraphRun> {
       return (await postJson<{ run: GraphRun }>(`/api/graphs/${encodeURIComponent(graphId)}/runs`, { input })).run;
+    },
+    async listGraphRuns(graphId): Promise<GraphRun[]> {
+      return (await getJson<{ runs: GraphRun[] }>(`/api/graphs/${encodeURIComponent(graphId)}/runs`)).runs;
     },
     async getGraphRun(runId) {
       return getJson<{ run: GraphRun; nodeRuns: GraphNodeRun[]; events: GraphRunEvent[] }>(`/api/graph-runs/${encodeURIComponent(runId)}`);

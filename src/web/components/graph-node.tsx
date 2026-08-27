@@ -1,31 +1,30 @@
 import { Handle, Position, type NodeProps } from "@xyflow/react";
+import type { GraphNodeRunStatus, GraphPort } from "../../shared/contracts.js";
 
 export interface GraphNodeData extends Record<string, unknown> {
   label: string;
-  kind: "start" | "end" | "agent" | "literal" | "template" | "loop_counter" | "passthrough";
+  kind: "input" | "agent" | "output" | "loop_counter" | "literal" | "template" | "passthrough";
   subtitle?: string;
-  status?: string;
+  inputs: GraphPort[];
+  outputs: GraphPort[];
+  status?: GraphNodeRunStatus;
 }
 
 export function GraphNodeView({ data, selected }: NodeProps) {
   const value = data as GraphNodeData;
   return <div className="graph-node" data-kind={value.kind} data-selected={selected || undefined} data-status={value.status}>
-    {value.kind !== "start" && <Handle type="target" position={Position.Left} />}
-    <span className="graph-node__icon" aria-hidden="true">{icon(value.kind)}</span>
-    <span className="graph-node__copy"><strong>{value.label}</strong>{value.subtitle && <small>{value.subtitle}</small>}</span>
-    {value.kind === "loop_counter" ? <>
-      <Handle id="loop" type="source" position={Position.Right} style={{ top: "38%" }} />
-      <Handle id="done" type="source" position={Position.Right} style={{ top: "72%" }} />
-    </> : value.kind !== "end" && <Handle type="source" position={Position.Right} />}
+    <header><span className="graph-node__icon" aria-hidden="true">{icon(value.kind)}</span><span className="graph-node__copy"><strong>{value.label}</strong>{value.subtitle && <small>{value.subtitle}</small>}</span></header>
+    {(value.inputs.length > 0 || value.outputs.length > 0) && <div className="graph-node__ports">
+      <div>{value.inputs.map((port) => <div className="graph-node__port graph-node__port--input" key={port.id}><Handle id={port.id} type="target" position={Position.Left} /><span>{port.name}</span>{port.kind === "feedback" ? <em>loop</em> : null}</div>)}</div>
+      <div>{value.outputs.map((port) => <div className="graph-node__port graph-node__port--output" key={port.id}><span>{port.name}</span><Handle id={port.id} type="source" position={Position.Right} /></div>)}</div>
+    </div>}
   </div>;
 }
 
 function icon(kind: GraphNodeData["kind"]): string {
-  if (kind === "start") return "▶";
-  if (kind === "end") return "■";
+  if (kind === "input") return "↳";
+  if (kind === "output") return "↗";
   if (kind === "agent") return "✦";
-  if (kind === "literal") return "T";
-  if (kind === "template") return "{ }";
   if (kind === "loop_counter") return "↻";
-  return "→";
+  return "·";
 }

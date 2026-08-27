@@ -101,7 +101,7 @@ interface ApiServerOptions {
   validatePluginVersions?: (scope: PluginScope, pluginVersions: PluginVersion[]) => void;
   pluginHandler?: (request: PluginRequest) => Promise<PluginResponse>;
   graphRepository?: GraphRepository;
-  graphRuntime?: { run(graphId: string, input: string): Promise<GraphRun>; cancel(runId: string): Promise<boolean> };
+  graphRuntime?: { run(graphId: string, input: string | Record<string, string>): Promise<GraphRun>; cancel(runId: string): Promise<boolean> };
 }
 
 interface OriginRules {
@@ -282,6 +282,11 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
     }
 
     const graphRunsMatch = match(pathname, /^\/api\/graphs\/([^/]+)\/runs$/);
+    if (graphRunsMatch && request.method === "GET") {
+      if (!options.graphRepository?.getGraph(graphRunsMatch[0])) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      sendJson(response, 200, { runs: options.graphRepository.listRuns(graphRunsMatch[0]) });
+      return;
+    }
     if (graphRunsMatch && request.method === "POST") {
       const graph = options.graphRepository?.getGraph(graphRunsMatch[0]);
       if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
@@ -292,8 +297,8 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       const graphRepository = options.graphRepository;
       if (!graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
       const body = readRecord(await readJsonBody(request, bodyLimitBytes), "Invalid graph run payload");
-      if (typeof body.input !== "string") throw new ValidationError("input must be a string");
-      const runPromise = options.graphRuntime.run(graph.id, body.input);
+      if (typeof body.input !== "string" && (!body.input || typeof body.input !== "object" || Array.isArray(body.input) || Object.values(body.input).some((value) => typeof value !== "string"))) throw new ValidationError("input must be a string or string map");
+      const runPromise = options.graphRuntime.run(graph.id, body.input as string | Record<string, string>);
       await new Promise((resolve) => setImmediate(resolve));
       const run = graphRepository.getLatestRun(graph.id) ?? await runPromise;
       void runPromise.catch(() => undefined);

@@ -236,8 +236,14 @@ export interface QueueMessageRequest {
   content: string;
 }
 
+export interface GraphPort { id: string; name: string; required?: boolean; kind?: "input" | "feedback"; }
+export interface GraphInputField extends GraphPort { description: string; multiline: boolean; }
+export type GraphValues = Record<string, string>;
+
 export type GraphNode =
-  | { id: string; type: "agent"; name: string; config: { agentProductId: AgentProductId; modelId: string | null; permissionMode: PermissionMode; prompt: string } }
+  | { id: string; type: "input"; name: string; config: { fields: GraphInputField[] } }
+  | { id: string; type: "agent"; name: string; config: { agentProductId: AgentProductId; modelId: string | null; permissionMode: PermissionMode; prompt?: string; instruction?: string; inputs?: GraphPort[]; outputs?: GraphPort[] } }
+  | { id: string; type: "output"; name: string; config: { fields: GraphPort[] } }
   | { id: string; type: "loop_counter"; name: string; config: { maxIterations: number } }
   | { id: string; type: "literal"; name: string; config: { value: string } }
   | { id: string; type: "template"; name: string; config: { template: string } }
@@ -246,8 +252,11 @@ export type GraphNode =
 export interface GraphEdge {
   id: string;
   source: string;
+  sourcePort?: string;
   target: string;
+  targetPort?: string;
   condition?: { branch: "loop" | "done" };
+  route?: { x: number; y: number };
 }
 
 export interface GraphDefinition {
@@ -281,7 +290,10 @@ export interface GraphRun {
   graphId: string;
   status: GraphRunStatus;
   input: string;
+  inputValues?: GraphValues;
   output: string | null;
+  outputValues?: GraphValues | null;
+  graphSnapshot?: Pick<GraphProject, "name" | "definition" | "viewport" | "positions"> | null;
   error: NormalizedError | null;
   createdAt: string;
   updatedAt: string;
@@ -294,7 +306,9 @@ export interface GraphNodeRun {
   iteration: number;
   status: GraphNodeRunStatus;
   input: string;
+  inputValues?: GraphValues;
   output: string | null;
+  outputValues?: GraphValues | null;
   error: NormalizedError | null;
   createdAt: string;
   updatedAt: string;

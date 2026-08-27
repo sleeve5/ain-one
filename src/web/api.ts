@@ -90,6 +90,7 @@ export interface ConversationView {
   events: NormalizedEvent[];
   rawEvents?: NormalizedEvent[];
   archivedAt?: string | null;
+  lastTurnAt?: string;
 }
 
 export interface ArchivedWorkspaceState {
@@ -99,6 +100,8 @@ export interface ArchivedWorkspaceState {
 
 export interface WorkspaceState {
   projects: ProjectView[];
+  graphs?: GraphProject[];
+  graphError?: string | null;
   selectedProjectId: string | null;
   conversations: ConversationView[];
   selectedConversationId: string | null;
@@ -330,6 +333,8 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       if (!primaryProject) {
         return {
           projects,
+          graphs: [],
+          graphError: null,
           selectedProjectId: null,
           conversations: [],
           selectedConversationId: null,
@@ -341,16 +346,19 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         };
       }
 
-      const projectConversations = await Promise.all(
-        projects.map(async (project) => ({
+      const [projectConversations, projectGraphs] = await Promise.all([
+        Promise.all(projects.map(async (project) => ({
           project,
-          conversations: (
-            await getJson<{ conversations: Conversation[] }>(
-              `/api/projects/${encodeURIComponent(project.id)}/conversations`,
-            )
-          ).conversations,
+          conversations: (await getJson<{ conversations: Conversation[] }>(`/api/projects/${encodeURIComponent(project.id)}/conversations`)).conversations,
+        }))),
+        Promise.all(projects.map(async (project) => {
+          try {
+            return { ...(await getJson<{ graphs: GraphProject[] }>(`/api/projects/${encodeURIComponent(project.id)}/graphs`)), error: null };
+          } catch (error) {
+            return { graphs: [], error: error instanceof Error ? error.message : String(error) };
+          }
         })),
-      );
+      ]);
       const conversations = await Promise.all(
         projectConversations.flatMap(({ project, conversations: projectItems }) =>
           projectItems
@@ -382,6 +390,8 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
 
       return {
         projects,
+        graphs: projectGraphs.flatMap((payload) => payload.graphs),
+        graphError: projectGraphs.find((payload) => payload.error)?.error ?? null,
         selectedProjectId,
         conversations,
         selectedConversationId: selectedConversation?.id ?? null,
@@ -707,6 +717,7 @@ function toConversationView(
     events: coalesceConversationEvents(detail.events ?? []),
     rawEvents: detail.events ?? [],
     archivedAt: conversation.archivedAt ?? null,
+    lastTurnAt: detail.latestTurn?.updatedAt ?? conversation.createdAt,
   };
 }
 

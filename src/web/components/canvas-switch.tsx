@@ -28,15 +28,6 @@ export function CanvasSwitch(props: CanvasSwitchProps) {
       >
         {zh ? "轨迹" : "Trajectory"}
       </button>
-      <button
-        type="button"
-        className="canvas-switch__button"
-        data-active={props.value === "graph"}
-        aria-pressed={props.value === "graph"}
-        onClick={() => props.onChange("graph")}
-      >
-        {zh ? "图编排" : "Graph"}
-      </button>
     </div>
   );
 }

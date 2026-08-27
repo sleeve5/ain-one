@@ -1,13 +1,14 @@
 import type { NormalizedEvent, TurnStatus } from "../shared/contracts.js";
 import type { ConversationView, WorkspaceState } from "./api.js";
 
-export type CanvasKind = "conversation" | "trajectory" | "graph";
+export type CanvasKind = "conversation" | "trajectory";
 
 export interface WorkspaceUiState {
   status: "loading" | "ready" | "error";
   errorMessage: string | null;
   actionError: string | null;
   activeCanvas: CanvasKind;
+  selectedGraphId: string | null;
   leftDrawerOpen: boolean;
   workspace: WorkspaceState;
 }
@@ -18,9 +19,11 @@ export function createInitialWorkspaceUiState(): WorkspaceUiState {
     errorMessage: null,
     actionError: null,
     activeCanvas: "conversation",
+    selectedGraphId: null,
     leftDrawerOpen: false,
     workspace: {
       projects: [],
+      graphs: [],
       selectedProjectId: null,
       conversations: [],
       selectedConversationId: null,

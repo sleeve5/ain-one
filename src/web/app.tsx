@@ -11,7 +11,7 @@ import { isPhaseOneAgentProductId } from "./api.js";
 import { CanvasSwitch } from "./components/canvas-switch.js";
 import { AppSettings, type SettingsSection } from "./components/app-settings.js";
 import { ConversationCanvas, type NewConversationDraft } from "./components/conversation-canvas.js";
-import { GraphCanvas } from "./components/graph-canvas.js";
+import { defaultGraph, GraphCanvas } from "./components/graph-canvas.js";
 import { GeneralSettings } from "./components/general-settings.js";
 import { ArchivedSettings } from "./components/archived-settings.js";
 import { AgentBadge } from "./components/agent-badge.js";
@@ -51,6 +51,7 @@ export function App(props: AppProps) {
   const [pluginEnablementsLoading, setPluginEnablementsLoading] = useState(false);
   const [archived, setArchived] = useState<ArchivedWorkspaceState>({ projects: [], conversations: [] });
   const [newConversation, setNewConversation] = useState<NewConversationDraft | null>(null);
+  const [graphMode, setGraphMode] = useState<"editor" | "runs">("editor");
   const [unreadConversationIds, setUnreadConversationIds] = useState<Set<string>>(() => new Set());
   const selectedConversationIdRef = useRef<string | null>(null);
   const workspaceRequest = useRef(0);
@@ -64,6 +65,8 @@ export function App(props: AppProps) {
   const configurationFailures = useRef<Record<ConfigurationWriteKey, string>>({});
   const agentExecutableWrites = useRef(new Map<AgentProductId, Promise<void>>());
   const enabledPluginVersionsRef = useRef<PluginVersion[]>([]);
+  const creatingGraph = useRef(false);
+  const resourceSelection = useRef(0);
   const [narrowScreen, setNarrowScreen] = useState(
     () => globalThis.matchMedia?.("(max-width: 960px)").matches ?? false,
   );
@@ -83,6 +86,7 @@ export function App(props: AppProps) {
       setState((current) => {
         const workspace = {
           ...loadedWorkspace,
+          graphs: (loadedWorkspace.graphError ? current.workspace.graphs ?? [] : loadedWorkspace.graphs ?? []).filter((graph) => !locallyArchivedProjects.current.has(graph.projectId)),
           projects: loadedWorkspace.projects.filter((project) => !locallyArchivedProjects.current.has(project.id)),
           agents: loadedWorkspace.agents.filter((agent) => isPhaseOneAgentProductId(agent.id)),
           conversations: loadedWorkspace.conversations.filter((conversation) =>
@@ -121,6 +125,10 @@ export function App(props: AppProps) {
             ) ??
             conversations.find((item) => item.projectId === selectedProjectId) ??
             null;
+        } else if (current.selectedGraphId) {
+          const graph = workspace.graphs.find((item) => item.id === current.selectedGraphId);
+          selectedProjectId = graph?.projectId ?? current.workspace.selectedProjectId;
+          selectedConversation = null;
         } else {
           selectedConversation =
             conversations.find((item) => item.id === current.workspace.selectedConversationId) ??
@@ -131,6 +139,11 @@ export function App(props: AppProps) {
               ? current.workspace.selectedProjectId
               : workspace.selectedProjectId);
         }
+        const selectedGraphId = selectedConversation
+          ? null
+          : current.selectedGraphId && workspace.graphs.some((item) => item.id === current.selectedGraphId)
+            ? current.selectedGraphId
+            : workspace.graphs.find((item) => item.projectId === selectedProjectId)?.id ?? null;
         return {
           ...current,
           status: "ready",
@@ -142,6 +155,7 @@ export function App(props: AppProps) {
             selectedConversationId: selectedConversation?.id ?? null,
             conversation: selectedConversation,
           },
+          selectedGraphId,
         };
       });
       const pendingSelection = pendingWorkspaceSelection.current;
@@ -189,13 +203,14 @@ export function App(props: AppProps) {
 
   const selectedConversation = state.workspace.conversation;
   const selectedProjectId = state.workspace.selectedProjectId;
+  const selectedGraph = state.workspace.graphs?.find((graph) => graph.id === state.selectedGraphId) ?? null;
   selectedConversationIdRef.current = state.workspace.selectedConversationId;
   useEffect(() => {
-    if (state.status !== "ready" || newConversation || selectedConversation || !selectedProjectId) return;
+    if (state.status !== "ready" || newConversation || selectedConversation || selectedGraph || !selectedProjectId) return;
     if (state.workspace.conversations.some((item) => item.projectId === selectedProjectId)) return;
     const agent = preferredAgent(state.workspace.agents);
     if (agent) setNewConversation(createNewConversationDraft(agent, selectedProjectId, preferences.defaultPermissionMode));
-  }, [state.status, state.workspace.agents, state.workspace.conversations, selectedConversation, selectedProjectId, newConversation, preferences.defaultPermissionMode]);
+  }, [state.status, state.workspace.agents, state.workspace.conversations, selectedConversation, selectedGraph, selectedProjectId, newConversation, preferences.defaultPermissionMode]);
   const resolvePluginScope = (scope: PluginScopeKind): PluginScope | null => {
     if (scope === "global") {
       return { type: "global" };
@@ -309,8 +324,10 @@ export function App(props: AppProps) {
       return;
     }
     pendingWorkspaceSelection.current = null;
+    resourceSelection.current += 1;
     setUnreadConversationIds((current) => { const next = new Set(current); next.delete(conversationId); return next; });
     setNewConversation(null);
+    setGraphMode("editor");
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
@@ -321,14 +338,27 @@ export function App(props: AppProps) {
         selectedConversationId: conversationId,
         conversation,
       },
+      selectedGraphId: null,
+      activeCanvas: "conversation",
     }));
+  };
+
+  const selectGraph = (graphId: string): void => {
+    const graph = state.workspace.graphs?.find((item) => item.id === graphId);
+    if (!graph) return;
+    resourceSelection.current += 1;
+    setNewConversation(null);
+    setGraphMode("editor");
+    setState((current) => ({ ...current, actionError: null, activeCanvas: "conversation", selectedGraphId: graphId, workspace: { ...current.workspace, selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } }));
   };
 
   const selectProject = (projectId: string): void => {
     const conversation =
       state.workspace.conversations.find((item) => item.projectId === projectId) ?? null;
+    const graph = conversation ? null : state.workspace.graphs?.find((item) => item.projectId === projectId) ?? null;
 
     pendingWorkspaceSelection.current = null;
+    resourceSelection.current += 1;
     setNewConversation(null);
     workspaceGeneration.current += 1;
     setState((current) => ({
@@ -340,6 +370,8 @@ export function App(props: AppProps) {
         selectedConversationId: conversation?.id ?? null,
         conversation,
       },
+      selectedGraphId: graph?.id ?? null,
+      activeCanvas: "conversation",
     }));
   };
 
@@ -503,13 +535,28 @@ export function App(props: AppProps) {
     if (!selectedProjectId) return;
     const agent = preferredAgent(state.workspace.agents);
     if (!agent) return;
+    resourceSelection.current += 1;
     setNewConversation(createNewConversationDraft(agent, selectedProjectId, preferences.defaultPermissionMode));
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
       actionError: null,
-      workspace: { ...current.workspace, selectedConversationId: null, conversation: null },
+      selectedGraphId: null, activeCanvas: "conversation", workspace: { ...current.workspace, selectedConversationId: null, conversation: null },
     }));
+  };
+
+  const startNewGraph = async (): Promise<void> => {
+    if (!selectedProjectId || creatingGraph.current) return;
+    creatingGraph.current = true;
+    const selection = ++resourceSelection.current;
+    workspaceGeneration.current += 1;
+    try {
+      const graph = await props.api.createGraph(selectedProjectId, defaultGraph(state.workspace.agents));
+      const selectCreated = resourceSelection.current === selection;
+      if (selectCreated) { setNewConversation(null); setGraphMode("editor"); }
+      setState((current) => ({ ...current, actionError: null, ...(selectCreated ? { activeCanvas: "conversation" as const, selectedGraphId: graph.id } : {}), workspace: { ...current.workspace, graphs: [graph, ...(current.workspace.graphs ?? []).filter((item) => item.id !== graph.id)], ...(selectCreated ? { selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } : {}) } }));
+    } catch (error) { if (resourceSelection.current === selection) showActionError(actionError(error, "Could not create Graph")); }
+    finally { creatingGraph.current = false; }
   };
 
   const openProject = async (): Promise<void> => {
@@ -517,6 +564,7 @@ export function App(props: AppProps) {
       const project = await props.api.pickProject();
       if (!project) return;
       const agent = preferredAgent(state.workspace.agents);
+      resourceSelection.current += 1;
       workspaceGeneration.current += 1;
       setNewConversation(agent
         ? createNewConversationDraft(agent, project.id, preferences.defaultPermissionMode)
@@ -524,6 +572,8 @@ export function App(props: AppProps) {
       setState((current) => ({
         ...current,
         actionError: null,
+        selectedGraphId: null,
+        activeCanvas: "conversation",
         workspace: {
           ...current.workspace,
           projects: current.workspace.projects.some((item) => item.id === project.id)
@@ -557,11 +607,12 @@ export function App(props: AppProps) {
       availablePlugins: state.workspace.installedPlugins.filter((plugin) => plugin.compatibleAgents.includes(created.agentProductId)),
       activeTurnStatus, latestTurnId: null, latestTurnStatus: activeTurnStatus, queuePaused: created.queuePaused,
       queuedMessages: [], events, rawEvents: events, archivedAt: created.archivedAt ?? null,
+      lastTurnAt: created.createdAt,
     };
     workspaceGeneration.current += 1;
     setNewConversation(null);
     setState((current) => ({ ...current, actionError: null, workspace: {
-      ...current.workspace, conversations: [...current.workspace.conversations, conversationView],
+      ...current.workspace, conversations: [conversationView, ...current.workspace.conversations.filter((item) => item.id !== conversationView.id)],
       selectedProjectId: conversationView.projectId, selectedConversationId: conversationView.id, conversation: conversationView,
     } }));
     return conversationView;
@@ -590,9 +641,9 @@ export function App(props: AppProps) {
       <header className="workspace__header">
         <div>
           <h1>Ain One</h1>
-          {state.actionError ? (
+          {state.actionError ?? state.workspace.graphError ? (
             <p className="workspace__action-error" role="alert">
-              {state.actionError}
+              {state.actionError ?? state.workspace.graphError}
             </p>
           ) : null}
         </div>
@@ -629,8 +680,10 @@ export function App(props: AppProps) {
           <ProjectSidebar
             projects={state.workspace.projects}
             conversations={state.workspace.conversations}
+            graphs={state.workspace.graphs}
             selectedProjectId={state.workspace.selectedProjectId}
             selectedConversationId={state.workspace.selectedConversationId}
+            selectedGraphId={state.selectedGraphId}
             unreadConversationIds={unreadConversationIds}
             onOpenProject={openProject}
             onRestartWorkspace={async () => {
@@ -642,10 +695,12 @@ export function App(props: AppProps) {
               }
             }}
             onCreateConversation={startNewConversation}
+            onCreateGraph={() => { void startNewGraph(); }}
             onSelectProject={(projectId) => {
               selectProject(projectId);
             }}
             onSelectConversation={selectConversation}
+            onSelectGraph={selectGraph}
             onRenameProject={async (projectId, name) => {
               if (!props.api.renameProject) return;
               await runSidebarAction(async () => {
@@ -698,21 +753,17 @@ export function App(props: AppProps) {
         <main className="workspace__center">
           <div className="workspace__toolbar">
             <div className="workspace__conversation-title">
-              <h2>{conversation?.title ?? (newConversation ? (preferences.language === "zh" ? "新对话" : "New conversation") : (preferences.language === "zh" ? "选择会话" : "Select a conversation"))}</h2>
-              {(conversation ?? newConversation) ? <AgentBadge agent={(conversation ?? newConversation)!.agentProductId}/> : null}
+              <h2>{selectedGraph?.name ?? conversation?.title ?? (newConversation ? (preferences.language === "zh" ? "新对话" : "New conversation") : (preferences.language === "zh" ? "选择资源" : "Select a resource"))}</h2>
+              {!selectedGraph && (conversation ?? newConversation) ? <AgentBadge agent={(conversation ?? newConversation)!.agentProductId}/> : null}
             </div>
-            <CanvasSwitch
-              value={state.activeCanvas}
-              language={preferences.language}
-              onChange={changeCanvas}
-            />
+            {selectedGraph ? <div className="canvas-switch" role="group" aria-label="Graph view"><button type="button" className="canvas-switch__button" data-active={graphMode === "editor"} aria-pressed={graphMode === "editor"} onClick={() => setGraphMode("editor")}>{preferences.language === "zh" ? "编排" : "Editor"}</button><button type="button" className="canvas-switch__button" data-active={graphMode === "runs"} aria-pressed={graphMode === "runs"} onClick={() => setGraphMode("runs")}>{preferences.language === "zh" ? "最近运行" : "Latest run"}</button></div> : <CanvasSwitch value={state.activeCanvas} language={preferences.language} onChange={changeCanvas} />}
           </div>
 
           <section
             className="workspace__canvas"
-            hidden={state.activeCanvas !== "conversation"}
-            aria-hidden={state.activeCanvas !== "conversation"}
-            inert={state.activeCanvas !== "conversation"}
+            hidden={Boolean(selectedGraph) || state.activeCanvas !== "conversation"}
+            aria-hidden={Boolean(selectedGraph) || state.activeCanvas !== "conversation"}
+            inert={Boolean(selectedGraph) || state.activeCanvas !== "conversation"}
           >
             {state.workspace.projects.length === 0 ? <section className="workspace-empty workspace-empty--import"><div><h2>{preferences.language === "zh" ? "导入项目以开始对话" : "Import a project to start a conversation."}</h2><button type="button" onClick={() => void openProject()}>{preferences.language === "zh" ? "导入项目" : "Import project"}</button></div></section> : <ConversationCanvas
               conversation={newConversation ? null : conversation}
@@ -856,20 +907,20 @@ export function App(props: AppProps) {
 
           <section
             className="workspace__canvas"
-            hidden={state.activeCanvas !== "trajectory"}
-            aria-hidden={state.activeCanvas !== "trajectory"}
-            inert={state.activeCanvas !== "trajectory"}
+            hidden={Boolean(selectedGraph) || state.activeCanvas !== "trajectory"}
+            aria-hidden={Boolean(selectedGraph) || state.activeCanvas !== "trajectory"}
+            inert={Boolean(selectedGraph) || state.activeCanvas !== "trajectory"}
           >
             <TrajectoryCanvas language={preferences.language} events={conversation?.rawEvents ?? conversation?.events ?? []} />
           </section>
 
           <section
             className="workspace__canvas"
-            hidden={state.activeCanvas !== "graph"}
-            aria-hidden={state.activeCanvas !== "graph"}
-            inert={state.activeCanvas !== "graph"}
+            hidden={!selectedGraph}
+            aria-hidden={!selectedGraph}
+            inert={!selectedGraph}
           >
-            <GraphCanvas language={preferences.language} api={props.api} projectId={selectedProjectId} agents={state.workspace.agents} active={state.activeCanvas === "graph"} />
+            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={state.workspace.agents} view={graphMode} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} onGraphDeleted={(graphId) => setState((current) => { const graphs = (current.workspace.graphs ?? []).filter((item) => item.id !== graphId); const nextGraph = graphs.find((item) => item.projectId === selectedGraph.projectId) ?? null; const fallback = nextGraph ? null : current.workspace.conversations.find((item) => item.projectId === selectedGraph.projectId) ?? null; return { ...current, selectedGraphId: nextGraph?.id ?? null, workspace: { ...current.workspace, graphs, selectedConversationId: fallback?.id ?? null, conversation: fallback } }; })} /> : null}
           </section>
 
           <AppSettings

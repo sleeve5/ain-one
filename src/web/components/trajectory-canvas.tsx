@@ -34,7 +34,7 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
   const calls = records.filter((record) => ["tool", "shell", "file"].includes(record.kind)).length;
   const timelinePoint = (clientX: number, element: HTMLElement) => {
     const box = element.getBoundingClientRect();
-    return Math.max(0, Math.min(timelineWidth, clientX - box.left + element.scrollLeft));
+    return Math.max(0, Math.min(timelineWidth, clientX - box.left));
   };
   const selectRecord = (record: TrajectoryRecord) => {
     setSelectedId(record.id);
@@ -60,24 +60,28 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
           className="trajectory-canvas__track"
           data-testid="trajectory-track"
           tabIndex={0}
-          onPointerDown={(event) => {
-            if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
-            const start = timelinePoint(event.clientX, event.currentTarget);
-            timelineDrag.current = { pointerId: event.pointerId, start, moved: false };
-            setFocusRange({ start, end: start });
-          }}
-          onPointerMove={(event) => {
-            const drag = timelineDrag.current;
-            if (!drag || drag.pointerId !== event.pointerId) return;
-            const point = timelinePoint(event.clientX, event.currentTarget);
-            if (Math.abs(point - drag.start) >= 3) drag.moved = true;
-            setFocusRange({ start: Math.min(drag.start, point), end: Math.max(drag.start, point) });
-          }}
-          onPointerUp={(event) => { const drag = timelineDrag.current; if (drag?.pointerId === event.pointerId) { suppressTimelineClick.current = drag.moved; timelineDrag.current = null; } }}
-          onDoubleClick={(event) => { if ((event.target as HTMLElement).closest("button")) return; timelineDrag.current = null; setFocusRange(null); }}
           onKeyDown={(event) => { if (event.key === "Escape") setFocusRange(null); }}
         >
-          <div className="trajectory-canvas__track-content" data-testid="trajectory-track-content" style={{ width: timelineWidth }}>
+          <div
+            className="trajectory-canvas__track-content"
+            data-testid="trajectory-track-content"
+            style={{ width: timelineWidth }}
+            onPointerDown={(event) => {
+              if (event.button !== 0 || (event.target as HTMLElement).closest("button")) return;
+              const start = timelinePoint(event.clientX, event.currentTarget);
+              timelineDrag.current = { pointerId: event.pointerId, start, moved: false };
+              setFocusRange({ start, end: start });
+            }}
+            onPointerMove={(event) => {
+              const drag = timelineDrag.current;
+              if (!drag || drag.pointerId !== event.pointerId) return;
+              const point = timelinePoint(event.clientX, event.currentTarget);
+              if (Math.abs(point - drag.start) >= 3) drag.moved = true;
+              setFocusRange({ start: Math.min(drag.start, point), end: Math.max(drag.start, point) });
+            }}
+            onPointerUp={(event) => { const drag = timelineDrag.current; if (drag?.pointerId === event.pointerId) { suppressTimelineClick.current = drag.moved; timelineDrag.current = null; } }}
+            onDoubleClick={(event) => { if ((event.target as HTMLElement).closest("button")) return; timelineDrag.current = null; setFocusRange(null); }}
+          >
             {focusRange ? <div className="trajectory-canvas__selection" style={{ left: focusRange.start, width: Math.max(2, focusRange.end - focusRange.start) }} /> : null}
             {records.map((record) => {
               const position = timelinePosition(record, records);

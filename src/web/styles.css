@@ -233,8 +233,8 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .trajectory-canvas__lanes { position: relative; border-right: 1px solid var(--line); color: var(--text-muted); font-size: 10px; line-height: 1; }
 .trajectory-canvas__lanes span { position: absolute; right: 3px; }
 .trajectory-canvas__lanes span:nth-child(1) { top: 9px; } .trajectory-canvas__lanes span:nth-child(2) { top: 27px; } .trajectory-canvas__lanes span:nth-child(3) { top: 45px; }
-.trajectory-canvas__track { position: relative; overflow-x: auto; overflow-y: hidden; touch-action: none; user-select: none; scrollbar-color: var(--line-strong) transparent; scrollbar-width: thin; }
-.trajectory-canvas__track-content { position: relative; min-width: 100%; height: 60px; }
+.trajectory-canvas__track { position: relative; overflow-x: auto; overflow-y: hidden; touch-action: pan-x; user-select: none; scrollbar-color: var(--line-strong) transparent; scrollbar-width: thin; }
+.trajectory-canvas__track-content { position: relative; min-width: 100%; height: 60px; touch-action: none; }
 .trajectory-canvas__selection { position: absolute; z-index: 1; inset-block: 0; border-inline: 2px solid var(--accent); background: color-mix(in srgb, var(--accent) 10%, transparent); pointer-events: none; }
 .trajectory-canvas__track:focus-visible { outline: 1px solid var(--accent); outline-offset: -1px; }
 .trajectory-canvas__track button { position: absolute; z-index: 2; height: 10px; min-width: 6px; border: 1px solid rgb(255 255 255 / 70%); border-radius: 2px; background: #8d76db; opacity: .88; cursor: pointer; box-shadow: 0 0 0 1px rgb(75 65 130 / 7%); }

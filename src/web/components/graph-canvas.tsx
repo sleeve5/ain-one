@@ -51,7 +51,14 @@ export function automaticOrthogonalPath({ sourceX, sourceY, targetX, targetY }: 
   const middleX = (sourceX + targetX) / 2;
   return roundedPolyline([{ x: sourceX, y: sourceY }, { x: middleX, y: sourceY }, { x: middleX, y: targetY }, { x: targetX, y: targetY }]);
 }
-function normalizeRoute(route: EdgeRoute | undefined, sourceX: number, sourceY: number, targetX: number, targetY: number): EdgeRoute { const span = targetX - sourceX; return route ?? { x: sourceX + span * 0.25, y: span >= 0 ? (sourceY + targetY) / 2 : Math.max(sourceY, targetY) + 96, targetX: targetX - span * 0.25 }; }
+export function normalizeRoute(route: EdgeRoute | undefined, sourceX: number, sourceY: number, targetX: number, targetY: number): EdgeRoute {
+  const span = targetX - sourceX;
+  if (span < 0) {
+    const value = route ?? { x: sourceX + 32, y: Math.max(sourceY, targetY) + 96, targetX: targetX - 24 };
+    return { ...value, x: Math.max(value.x, sourceX + 32), targetX: Math.min(value.targetX ?? targetX - 24, targetX - 24) };
+  }
+  return route ?? { x: sourceX + span * 0.25, y: (sourceY + targetY) / 2, targetX: targetX - span * 0.25 };
+}
 function roundedPolyline(points: Array<{ x: number; y: number }>, radius = 10): string { const snapped = points.reduce<Array<{ x: number; y: number }>>((result, point) => { const previous = result.at(-1); const next = previous ? { x: Math.abs(point.x - previous.x) < .01 ? previous.x : point.x, y: Math.abs(point.y - previous.y) < .01 ? previous.y : point.y } : point; if (!previous || next.x !== previous.x || next.y !== previous.y) result.push(next); return result; }, []); const compact = snapped.filter((point, index) => { const previous = snapped[index - 1]; const next = snapped[index + 1]; if (!previous || !next) return true; return !(previous.x === point.x && point.x === next.x) && !(previous.y === point.y && point.y === next.y); }); if (compact.length < 2) return ""; let path = `M ${compact[0]!.x} ${compact[0]!.y}`; for (let index = 1; index < compact.length - 1; index++) { const previous = compact[index - 1]!; const corner = compact[index]!; const next = compact[index + 1]!; const incoming = Math.hypot(corner.x - previous.x, corner.y - previous.y); const outgoing = Math.hypot(next.x - corner.x, next.y - corner.y); const curve = Math.min(radius, incoming / 2, outgoing / 2); const before = { x: corner.x - Math.sign(corner.x - previous.x) * curve, y: corner.y - Math.sign(corner.y - previous.y) * curve }; const after = { x: corner.x + Math.sign(next.x - corner.x) * curve, y: corner.y + Math.sign(next.y - corner.y) * curve }; path += ` L ${before.x} ${before.y} Q ${corner.x} ${corner.y} ${after.x} ${after.y}`; } const last = compact.at(-1)!; return `${path} L ${last.x} ${last.y}`; }
 export function graphEdgeLabel(edge: Pick<GraphDefinition["edges"][number], "condition">): string | undefined { return edge.condition?.branch === "loop" ? "loop" : undefined; }
 
@@ -273,7 +280,7 @@ function NodeRunValues({ node, run, zh }: { node: GraphNode; run: GraphNodeRun; 
 function GraphRunResults({ nodes, runs, zh }: { nodes: GraphNode[]; runs: GraphNodeRun[]; zh: boolean }) {
   const byId = new Map(nodes.map((node) => [node.id, node]));
   const repeated = new Set(runs.filter((run, index) => runs.findIndex((item) => item.nodeId === run.nodeId) !== index).map((run) => run.nodeId));
-  return <div className="graph-run-results" aria-label={zh ? "最近一次图运行结果" : "Latest Graph run results"}>{runs.map((item) => { const node = byId.get(item.nodeId); if (!node) return null; return <section key={item.id} className="graph-run-result"><header><strong>{node.name}</strong>{repeated.has(item.nodeId) ? <span>{zh ? `第 ${item.iteration} 次` : `Iteration ${item.iteration}`}</span> : null}</header><NodeRunValues node={node} run={item} zh={zh} />{item.error ? <p className="graph-run-error">{item.error.message}</p> : null}</section>; })}</div>;
+  return <div className="graph-run-results" aria-label={zh ? "最近一次图运行结果" : "Latest Graph run results"}>{runs.toReversed().map((item) => { const node = byId.get(item.nodeId); if (!node) return null; return <section key={item.id} className="graph-run-result"><header><strong>{node.name}</strong>{repeated.has(item.nodeId) ? <span>{zh ? `第 ${item.iteration} 次` : `Iteration ${item.iteration}`}</span> : null}</header><NodeRunValues node={node} run={item} zh={zh} />{item.error ? <p className="graph-run-error">{item.error.message}</p> : null}</section>; })}</div>;
 }
 
 interface PromptEditorHandle { insert(portId: string): void; }

@@ -54,6 +54,7 @@ export function App(props: AppProps) {
   const [newConversation, setNewConversation] = useState<NewConversationDraft | null>(null);
   const [graphMode, setGraphMode] = useState<"editor" | "runs">("editor");
   const [clearGraphRequest, setClearGraphRequest] = useState(0);
+  const [configGraphRequest, setConfigGraphRequest] = useState(0);
   const [graphValidation, setGraphValidation] = useState<string[] | null>(null);
   const [unreadConversationIds, setUnreadConversationIds] = useState<Set<string>>(() => new Set());
   const selectedConversationIdRef = useRef<string | null>(null);
@@ -625,7 +626,7 @@ export function App(props: AppProps) {
   if (state.status === "loading") {
     return (
       <div className="workspace-empty">
-        {preferences.language === "zh" ? "正在加载工作区…" : "Loading workspace..."}
+        {preferences.language === "zh" ? "正在加载项目…" : "Loading projects..."}
       </div>
     );
   }
@@ -633,7 +634,7 @@ export function App(props: AppProps) {
   if (state.status === "error") {
     return (
       <div className="workspace-empty">
-        {state.errorMessage ?? (preferences.language === "zh" ? "工作区加载失败。" : "Workspace failed to load.")}
+        {state.errorMessage ?? (preferences.language === "zh" ? "项目加载失败。" : "Projects failed to load.")}
       </div>
     );
   }
@@ -695,7 +696,7 @@ export function App(props: AppProps) {
                 await props.api.restartWorkspace?.();
                 if (await loadWorkspace()) clearActionError();
               } catch {
-                showActionError(preferences.language === "zh" ? "无法重启工作区" : "Could not restart workspace");
+                showActionError(preferences.language === "zh" ? "无法重启项目" : "Could not restart project");
               }
             }}
             onCreateConversation={startNewConversation}
@@ -787,7 +788,7 @@ export function App(props: AppProps) {
             <div className="workspace__conversation-title">
               <h2>{selectedGraph?.name ?? conversation?.title ?? (newConversation ? (preferences.language === "zh" ? "新对话" : "New conversation") : (preferences.language === "zh" ? "选择资源" : "Select a resource"))}</h2>
               {!selectedGraph && (conversation ?? newConversation) ? <AgentBadge agent={(conversation ?? newConversation)!.agentProductId}/> : null}
-              {selectedGraph ? <div className="workspace__graph-actions">{graphValidation ? <span className="workspace__graph-status" data-valid={graphValidation.length === 0}>{graphValidation.length === 0 ? (preferences.language === "zh" ? "可运行" : "Runnable") : (preferences.language === "zh" ? "待完善" : "Incomplete")}</span> : null}<button type="button" onClick={() => setClearGraphRequest((value) => value + 1)}>{preferences.language === "zh" ? "清空图" : "Clear graph"}</button></div> : null}
+              {selectedGraph ? <div className="workspace__graph-actions">{graphValidation ? <span className="workspace__graph-status" data-valid={graphValidation.length === 0}>{graphValidation.length === 0 ? (preferences.language === "zh" ? "可运行" : "Runnable") : (preferences.language === "zh" ? "待完善" : "Incomplete")}</span> : null}<button type="button" onClick={() => setClearGraphRequest((value) => value + 1)}>{preferences.language === "zh" ? "清空图" : "Clear graph"}</button><button type="button" aria-label={preferences.language === "zh" ? "打开图配置" : "Open Graph configuration"} onClick={() => { setGraphMode("editor"); setConfigGraphRequest((value) => value + 1); }}>{preferences.language === "zh" ? "图配置" : "Graph configuration"}</button></div> : null}
             </div>
             {selectedGraph ? <div className="canvas-switch" role="group" aria-label="Graph view"><button type="button" className="canvas-switch__button" data-active={graphMode === "editor"} aria-pressed={graphMode === "editor"} onClick={() => setGraphMode("editor")}>{preferences.language === "zh" ? "编排" : "Editor"}</button><button type="button" className="canvas-switch__button" data-active={graphMode === "runs"} aria-pressed={graphMode === "runs"} onClick={() => setGraphMode("runs")}>{preferences.language === "zh" ? "最近运行" : "Latest run"}</button></div> : <CanvasSwitch value={state.activeCanvas} language={preferences.language} onChange={changeCanvas} />}
           </div>
@@ -953,7 +954,7 @@ export function App(props: AppProps) {
             aria-hidden={!selectedGraph}
             inert={!selectedGraph}
           >
-            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={agentsForProject(state.workspace.agents, selectedGraph.projectId)} view={graphMode} clearRequest={clearGraphRequest} onValidationChange={setGraphValidation} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} /> : null}
+            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={agentsForProject(state.workspace.agents, selectedGraph.projectId)} view={graphMode} clearRequest={clearGraphRequest} configRequest={configGraphRequest} onValidationChange={setGraphValidation} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} /> : null}
           </section>
 
           <AppSettings

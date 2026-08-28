@@ -249,8 +249,8 @@ function turnError(event: NormalizedEvent, zh: boolean): string | null {
   if (!message) return null;
   if (/thread-store conflict:[\s\S]*already has an active writer/i.test(message)) {
     return zh
-      ? "Agent 会话仍被其他进程占用，请重启工作区后重试。"
-      : "This Agent session is still in use. Restart the workspace and try again.";
+      ? "Agent 会话仍被其他进程占用，请重启项目后重试。"
+      : "This Agent session is still in use. Restart the project and try again.";
   }
   return message;
 }

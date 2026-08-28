@@ -256,7 +256,7 @@ export interface GraphEdge {
   target: string;
   targetPort?: string;
   condition?: { branch: "loop" | "done" };
-  route?: { x: number; y: number };
+  route?: { x: number; y: number; targetX?: number };
 }
 
 export interface GraphDefinition {

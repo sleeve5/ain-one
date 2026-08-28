@@ -2,9 +2,8 @@ import type { NormalizedEvent } from "../../shared/contracts.js";
 
 export type TrajectoryRecordKind =
   | "user" | "assistant" | "reasoning" | "tool" | "shell"
-  | "file" | "permission" | "usage" | "warning" | "status";
+  | "file" | "permission" | "warning" | "status";
 
-export interface TrajectoryUsage { input?: number; output?: number; cacheRead?: number; cacheWrite?: number; }
 export interface TrajectoryRecord {
   id: string;
   index: number;
@@ -14,7 +13,6 @@ export interface TrajectoryRecord {
   payload: Record<string, unknown>;
   createdAt: string;
   durationMs: number | null;
-  usage?: TrajectoryUsage;
   error: boolean;
   eventCount: number;
   sourceEventIds: string[];
@@ -36,6 +34,7 @@ export function projectTrajectory(events: readonly NormalizedEvent[]): Trajector
   for (const event of events) {
     if (event.type === "queue_status") continue;
     if (event.type === "user_message" && turns.at(-1)?.records.length) turn = null;
+    if (event.type === "usage") continue;
     const current = ensureTurn();
     const streamId = event.type === "assistant_message" ? stringValue(event.payload.streamId) : null;
     const streamed = streamId
@@ -71,7 +70,6 @@ export function projectTrajectory(events: readonly NormalizedEvent[]): Trajector
       continue;
     }
     const kind = recordKind(event.type);
-    const usage = event.type === "usage" ? readUsage(event.payload) : undefined;
     current.records.push({
       id: event.id,
       index: event.sequence,
@@ -81,7 +79,6 @@ export function projectTrajectory(events: readonly NormalizedEvent[]): Trajector
       payload: event.payload,
       createdAt: event.createdAt,
       durationMs: numberValue(event.payload.durationMs) ?? numberValue(event.payload.duration_ms),
-      ...(usage ? { usage } : {}),
       error: isError(event.type, event.payload),
       eventCount: 1,
       sourceEventIds: [event.id],
@@ -104,10 +101,10 @@ export function searchTrajectory(model: TrajectoryModel, query: string): Traject
   };
 }
 
-function recordKind(type: NormalizedEvent["type"]): TrajectoryRecordKind {
+function recordKind(type: Exclude<NormalizedEvent["type"], "usage" | "queue_status">): TrajectoryRecordKind {
   if (type === "assistant_message") return "assistant";
   if (type === "user_message") return "user";
-  if (type === "turn_status" || type === "queue_status") return "status";
+  if (type === "turn_status") return "status";
   return type;
 }
 function title(type: NormalizedEvent["type"], payload: Record<string, unknown>): string {
@@ -126,15 +123,6 @@ function summarize(type: NormalizedEvent["type"], payload: Record<string, unknow
   if (type === "turn_status") return stringValue(payload.status) ?? "unknown";
   const selected = Object.fromEntries(Object.entries(payload).filter(([key]) => !["id", "callId"].includes(key)));
   return Object.keys(selected).length ? JSON.stringify(selected) : title(type, payload);
-}
-function readUsage(payload: Record<string, unknown>): TrajectoryUsage | undefined {
-  const usage: TrajectoryUsage = {
-    input: numberValue(payload.input_tokens) ?? numberValue(payload.inputTokens) ?? undefined,
-    output: numberValue(payload.output_tokens) ?? numberValue(payload.outputTokens) ?? undefined,
-    cacheRead: numberValue(payload.cache_read_tokens) ?? numberValue(payload.cacheReadTokens) ?? undefined,
-    cacheWrite: numberValue(payload.cache_write_tokens) ?? numberValue(payload.cacheWriteTokens) ?? undefined,
-  };
-  return Object.values(usage).some((value) => value !== undefined) ? usage : undefined;
 }
 function isError(type: NormalizedEvent["type"], payload: Record<string, unknown>): boolean {
   if (type === "warning") return false;

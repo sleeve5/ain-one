@@ -97,6 +97,7 @@ export interface ArchivedWorkspaceState {
   projects: Project[];
   conversations: Conversation[];
   graphs?: GraphProject[];
+  projectNames?: Record<string, string>;
 }
 
 export interface WorkspaceState {
@@ -486,13 +487,22 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       ]);
       const projects = uniqueById(archived.projects);
       const allProjects = uniqueById([...active.projects, ...projects]);
-      const conversations = uniqueById((await Promise.all(allProjects.map(async (project) =>
-        (await getJson<{ conversations: Conversation[] }>(`/api/projects/${encodeURIComponent(project.id)}/conversations?archived=true`)).conversations
-      ))).flat());
-      const graphs = uniqueById((await Promise.all(allProjects.map(async (project) =>
-        (await getJson<{ graphs?: GraphProject[] }>(`/api/projects/${encodeURIComponent(project.id)}/graphs?archived=true`)).graphs ?? []
-      ))).flat());
-      return { projects, conversations, graphs };
+      const archivedProjectIds = new Set(projects.map((project) => project.id));
+      const conversations = uniqueById((await Promise.all(allProjects.flatMap((project) => {
+        const path = `/api/projects/${encodeURIComponent(project.id)}/conversations`;
+        return [
+          getJson<{ conversations: Conversation[] }>(`${path}?archived=true`),
+          ...(archivedProjectIds.has(project.id) ? [getJson<{ conversations: Conversation[] }>(path)] : []),
+        ];
+      }))).flatMap((payload) => payload.conversations));
+      const graphs = uniqueById((await Promise.all(allProjects.flatMap((project) => {
+        const path = `/api/projects/${encodeURIComponent(project.id)}/graphs`;
+        return [
+          getJson<{ graphs?: GraphProject[] }>(`${path}?archived=true`),
+          ...(archivedProjectIds.has(project.id) ? [getJson<{ graphs?: GraphProject[] }>(path)] : []),
+        ];
+      }))).flatMap((payload) => payload.graphs ?? []));
+      return { projects, conversations, graphs, projectNames: Object.fromEntries(allProjects.map((project) => [project.id, project.name])) };
     },
 
     async queueMessage(conversationId, content): Promise<void> {

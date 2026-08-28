@@ -7,13 +7,13 @@ import { validateGraphDefinition, validateGraphDraft } from "../../shared/valida
 import type { AinOneApi, AgentSettingsView } from "../api.js";
 import { agentLabel, sortAgents } from "../agent-meta.js";
 import { autoLayoutGraph, parseGraphConfig, serializeGraphConfig } from "../graph-config.js";
-import { GraphNodeView, type GraphNodeData } from "./graph-node.js";
+import { GRAPH_NODE_HEADER_HEIGHT, GRAPH_NODE_PORT_HEIGHT, GRAPH_NODE_PORT_PADDING, GRAPH_NODE_WIDTH, GraphNodeView, type GraphNodeData } from "./graph-node.js";
 import { GraphTrajectory } from "./graph-trajectory.js";
 
 interface GraphCanvasProps { language?: "zh" | "en"; api?: AinOneApi; graphId: string; agents?: AgentSettingsView[]; view?: "editor" | "runs"; clearRequest?: number; configRequest?: number; onGraphSaved?(graph: GraphProject): void; onValidationChange?(errors: string[]): void; }
 interface ClipboardGraph { nodes: GraphNode[]; edges: GraphDefinition["edges"]; positions: GraphProject["positions"]; }
 interface EdgeRoute { x: number; y: number; targetX?: number; }
-interface RoutableEdgeData extends Record<string, unknown> { route?: EdgeRoute; routeLabel?: string; onRoute?(edgeId: string, route: EdgeRoute): void; }
+interface RoutableEdgeData extends Record<string, unknown> { route?: EdgeRoute; automaticRoute?: EdgeRoute; routeLabel?: string; onRoute?(edgeId: string, route: EdgeRoute): void; }
 const nodeTypes = { workflow: GraphNodeView };
 const edgeTypes = { routable: RoutableEdge };
 const permissionLabels: Record<PermissionMode, { zh: string; en: string }> = { request_approval: { zh: "需要审批", en: "Ask for approval" }, help_me_approve: { zh: "自动审批", en: "Auto approve" }, full_access: { zh: "完全访问", en: "Full access" } };
@@ -21,8 +21,8 @@ const permissionLabels: Record<PermissionMode, { zh: string; en: string }> = { r
 function RoutableEdge({ id, sourceX, sourceY, sourcePosition, targetX, targetY, targetPosition, markerEnd, label, style, selected, data }: EdgeProps<Edge<RoutableEdgeData>>) {
   const { screenToFlowPosition } = useReactFlow();
   void sourcePosition; void targetPosition;
-  const route = normalizeRoute(data?.route, sourceX, sourceY, targetX, targetY);
-  const path = roundedOrthogonalPath({ sourceX, sourceY, targetX, targetY, route });
+  const route = normalizeRoute(data?.route ?? data?.automaticRoute, sourceX, sourceY, targetX, targetY);
+  const path = data?.route || data?.automaticRoute ? roundedOrthogonalPath({ sourceX, sourceY, targetX, targetY, route }) : automaticOrthogonalPath({ sourceX, sourceY, targetX, targetY });
   const targetRouteX = route.targetX ?? targetX - 48;
   const beginRoute = (axis: "source" | "middle" | "target", event: React.PointerEvent<SVGPathElement>) => {
     event.stopPropagation();
@@ -36,6 +36,11 @@ function RoutableEdge({ id, sourceX, sourceY, sourcePosition, targetX, targetY, 
 export function roundedOrthogonalPath({ sourceX, sourceY, targetX, targetY, route }: { sourceX: number; sourceY: number; targetX: number; targetY: number; route: EdgeRoute }): string {
   const endX = route.targetX ?? targetX - 48;
   return roundedPolyline([{ x: sourceX, y: sourceY }, { x: route.x, y: sourceY }, { x: route.x, y: route.y }, { x: endX, y: route.y }, { x: endX, y: targetY }, { x: targetX, y: targetY }]);
+}
+export function automaticOrthogonalPath({ sourceX, sourceY, targetX, targetY }: { sourceX: number; sourceY: number; targetX: number; targetY: number }): string {
+  if (Math.abs(sourceY - targetY) < 0.5) return `M ${sourceX} ${sourceY} L ${targetX} ${targetY}`;
+  const middleX = (sourceX + targetX) / 2;
+  return roundedPolyline([{ x: sourceX, y: sourceY }, { x: middleX, y: sourceY }, { x: middleX, y: targetY }, { x: targetX, y: targetY }]);
 }
 function normalizeRoute(route: EdgeRoute | undefined, sourceX: number, sourceY: number, targetX: number, targetY: number): EdgeRoute { const span = targetX - sourceX; return route ?? { x: sourceX + span * 0.25, y: span >= 0 ? (sourceY + targetY) / 2 : Math.max(sourceY, targetY) + 96, targetX: targetX - span * 0.25 }; }
 function roundedPolyline(points: Array<{ x: number; y: number }>, radius = 10): string { const compact = points.filter((point, index) => index === 0 || point.x !== points[index - 1]!.x || point.y !== points[index - 1]!.y); if (compact.length < 2) return ""; let path = `M ${compact[0]!.x} ${compact[0]!.y}`; for (let index = 1; index < compact.length - 1; index++) { const previous = compact[index - 1]!; const corner = compact[index]!; const next = compact[index + 1]!; const incoming = Math.hypot(corner.x - previous.x, corner.y - previous.y); const outgoing = Math.hypot(next.x - corner.x, next.y - corner.y); const curve = Math.min(radius, incoming / 2, outgoing / 2); const before = { x: corner.x - Math.sign(corner.x - previous.x) * curve, y: corner.y - Math.sign(corner.y - previous.y) * curve }; const after = { x: corner.x + Math.sign(next.x - corner.x) * curve, y: corner.y + Math.sign(next.y - corner.y) * curve }; path += ` L ${before.x} ${before.y} Q ${corner.x} ${corner.y} ${after.x} ${after.y}`; } const last = compact.at(-1)!; return `${path} L ${last.x} ${last.y}`; }
@@ -129,7 +134,7 @@ export function GraphCanvas({ language = "en", api, graphId, agents = [], view =
   }, [api, graphId, run?.id, run?.status]);
 
   const selectedNode = graph?.definition.nodes.find((node) => selectedNodeIds.size === 1 && selectedNodeIds.has(node.id)) ?? null;
-  const flowNodes = useMemo(() => graph ? toFlowNodes(graph, nodeRuns, measurements.current, selectedNodeIds, zh) : [], [graph, nodeRuns, selectedNodeIds, zh]);
+  const flowNodes = useMemo(() => graph ? toFlowNodes(graph, nodeRuns, measurements.current, selectedNodeIds, zh, run?.status) : [], [graph, nodeRuns, selectedNodeIds, zh, run?.status]);
   const setEdgeRoute = useCallback((edgeId: string, route: { x: number; y: number }) => setGraph((current) => current ? { ...current, definition: { ...current.definition, edges: current.definition.edges.map((edge) => edge.id === edgeId ? { ...edge, route } : edge) } } : current), []);
   const flowEdges = useMemo(() => graph ? toFlowEdges(graph, selectedEdgeIds, setEdgeRoute, zh ? "调整连线路径" : "Adjust connection path") : [], [graph, selectedEdgeIds, setEdgeRoute, zh]);
   const validation = graph ? validateGraphDefinition(graph.definition) : [];
@@ -318,11 +323,39 @@ export function defaultGraph(agents: AgentSettingsView[] = []): Omit<GraphProjec
   return { name: "Untitled graph", description: "", definition: { nodes: [{ id: "input-1", type: "input", name: "User Input", config: { fields: [{ id: "task", name: "Task", description: "Describe what the Agent should do", required: true, multiline: true }] } }, { id: "agent-1", type: "agent", name: "Agent 1", config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", instruction: "Complete the task and return the result.", inputs: [{ id: "task", name: "Task", required: true }], outputs: [{ id: "result", name: "Result" }] } }, { id: "output-1", type: "output", name: "Output", config: { fields: [{ id: "result", name: "Result", required: true }] } }], edges: [{ id: "input-agent", source: "input-1", sourcePort: "task", target: "agent-1", targetPort: "task" }, { id: "agent-output", source: "agent-1", sourcePort: "result", target: "output-1", targetPort: "result" }], start: ["input-1"], end: ["output-1"] }, viewport: { x: 0, y: 0, zoom: 1 }, positions: { "input-1": { x: 80, y: 180 }, "agent-1": { x: 350, y: 180 }, "output-1": { x: 640, y: 180 } } };
 }
 
-function toFlowNodes(graph: Pick<GraphProject, "definition" | "positions">, nodeRuns: GraphNodeRun[], measurements: Map<string, { width: number; height: number }>, selected: Set<string>, zh = false): Node<GraphNodeData>[] { return graph.definition.nodes.map((node, index) => ({ id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 100 + index * 250, y: 180 }, measured: measurements.get(node.id), selected: selected.has(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? agentLabel(node.config.agentProductId) : node.type === "loop_counter" ? `× ${node.config.maxIterations}` : undefined, inputs: nodeInputs(node, zh), outputs: nodeOutputs(node, zh), status: nodeRuns.findLast((item) => item.nodeId === node.id)?.status, acceptsNewInput: node.type === "agent" } })); }
-function toFlowEdges(graph: Pick<GraphProject, "definition">, selected: Set<string>, onRoute?: RoutableEdgeData["onRoute"], routeLabel?: string): Edge<RoutableEdgeData>[] { return graph.definition.edges.map((edge) => ({ ...edge, sourceHandle: edge.sourcePort, targetHandle: edge.targetPort, label: edge.condition?.branch, type: "routable", reconnectable: Boolean(onRoute), selected: selected.has(edge.id), data: { route: edge.route, routeLabel, onRoute }, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: selected.has(edge.id) ? "#4f83d1" : "#8fa8bf", strokeWidth: selected.has(edge.id) ? 2 : 1.4 } })); }
+function toFlowNodes(graph: Pick<GraphProject, "definition" | "positions">, nodeRuns: GraphNodeRun[], measurements: Map<string, { width: number; height: number }>, selected: Set<string>, zh = false, runStatus?: GraphRun["status"]): Node<GraphNodeData>[] { return graph.definition.nodes.map((node, index) => { const latest = nodeRuns.findLast((item) => item.nodeId === node.id); const loopInProgress = node.type === "loop_counter" && runStatus === "running" && latest && (latest.status === "running" || latest.iteration < node.config.maxIterations); return { id: node.id, type: "workflow", position: graph.positions[node.id] ?? { x: 100 + index * 250, y: 180 }, measured: measurements.get(node.id), selected: selected.has(node.id), data: { kind: node.type, label: node.name, subtitle: node.type === "agent" ? agentLabel(node.config.agentProductId) : node.type === "loop_counter" ? loopInProgress ? (zh ? `第 ${latest.iteration}/${node.config.maxIterations} 次` : `Iteration ${latest.iteration}/${node.config.maxIterations}`) : `× ${node.config.maxIterations}` : undefined, inputs: nodeInputs(node, zh), outputs: nodeOutputs(node, zh), status: loopInProgress ? "running" : latest?.status, acceptsNewInput: node.type === "agent" } }; } ); }
+function toFlowEdges(graph: Pick<GraphProject, "definition" | "positions">, selected: Set<string>, onRoute?: RoutableEdgeData["onRoute"], routeLabel?: string): Edge<RoutableEdgeData>[] { return graph.definition.edges.map((edge) => ({ ...edge, sourceHandle: edge.sourcePort, targetHandle: edge.targetPort, label: edge.condition?.branch, type: "routable", reconnectable: Boolean(onRoute), selected: selected.has(edge.id), data: { route: edge.route, automaticRoute: edge.route ? undefined : automaticEdgeRoute(graph, edge.id), routeLabel, onRoute }, markerEnd: { type: MarkerType.ArrowClosed }, style: { stroke: selected.has(edge.id) ? "#4f83d1" : "#8fa8bf", strokeWidth: selected.has(edge.id) ? 2 : 1.4 } })); }
 function displayPorts(ports: GraphPort[], zh: boolean): GraphPort[] { return ports.length === 1 ? [{ ...ports[0]!, name: zh ? "内容" : "Content" }] : ports; }
 function nodeInputs(node: GraphNode, zh = false): GraphPort[] { if (node.type === "agent") return node.config.inputs ?? []; if (node.type === "output") return displayPorts(node.config.fields, zh); if (node.type === "loop_counter") return [{ id: "input", name: zh ? "内容" : "Content", required: true }]; if (node.type === "literal" || node.type === "template" || node.type === "passthrough") return [{ id: "input", name: zh ? "内容" : "Content" }]; return []; }
 function nodeOutputs(node: GraphNode, zh = false): GraphPort[] { if (node.type === "agent") return node.config.outputs ?? [{ id: "output", name: "Output" }]; if (node.type === "input") return displayPorts(node.config.fields, zh); if (node.type === "loop_counter") return [{ id: "done", name: zh ? "完成" : "Done" }, { id: "loop", name: zh ? "循环" : "Loop" }]; if (node.type === "literal" || node.type === "template" || node.type === "passthrough") return [{ id: "output", name: zh ? "内容" : "Content" }]; return []; }
+function graphNodeHeight(node: GraphNode): number { const rows = Math.max(nodeInputs(node).length, nodeOutputs(node).length); return GRAPH_NODE_HEADER_HEIGHT + (rows ? GRAPH_NODE_PORT_PADDING + rows * GRAPH_NODE_PORT_HEIGHT : 0); }
+export function automaticEdgeRoute(graph: Pick<GraphProject, "definition" | "positions">, edgeId: string): EdgeRoute | undefined {
+  const edge = graph.definition.edges.find((candidate) => candidate.id === edgeId);
+  if (!edge) return undefined;
+  const source = graph.positions[edge.source]; const target = graph.positions[edge.target];
+  if (!source || !target) return undefined;
+  if (edge.condition?.branch !== "loop" && target.x > source.x) {
+    const sourceNode = graph.definition.nodes.find((node) => node.id === edge.source); const targetNode = graph.definition.nodes.find((node) => node.id === edge.target);
+    const sourcePort = Math.max(0, sourceNode ? nodeOutputs(sourceNode).findIndex((port) => port.id === edge.sourcePort) : 0);
+    const targetPort = Math.max(0, targetNode ? nodeInputs(targetNode).findIndex((port) => port.id === edge.targetPort) : 0);
+    const sourceY = source.y + GRAPH_NODE_HEADER_HEIGHT + GRAPH_NODE_PORT_PADDING / 2 + GRAPH_NODE_PORT_HEIGHT * (sourcePort + .5);
+    const targetY = target.y + GRAPH_NODE_HEADER_HEIGHT + GRAPH_NODE_PORT_PADDING / 2 + GRAPH_NODE_PORT_HEIGHT * (targetPort + .5);
+    const blockers = graph.definition.nodes.filter((node) => node.id !== edge.source && node.id !== edge.target && (graph.positions[node.id]?.x ?? Infinity) > source.x && (graph.positions[node.id]?.x ?? -Infinity) < target.x);
+    if (blockers.length) {
+      const bottom = Math.max(...graph.definition.nodes.map((node) => (graph.positions[node.id]?.y ?? 0) + graphNodeHeight(node)));
+      return { x: source.x + GRAPH_NODE_WIDTH + 32, y: bottom + 48, targetX: target.x - 32 };
+    }
+    if (Math.abs(sourceY - targetY) < .5) return undefined;
+    const siblings = graph.definition.edges.filter((candidate) => { const from = graph.positions[candidate.source]; const to = graph.positions[candidate.target]; return Boolean(from && to && to.x > from.x && Math.abs((from.x + GRAPH_NODE_WIDTH + to.x) / 2 - (source.x + GRAPH_NODE_WIDTH + target.x) / 2) < 1); });
+    const lane = Math.max(0, siblings.findIndex((candidate) => candidate.id === edgeId));
+    const gapStart = source.x + GRAPH_NODE_WIDTH + 20; const gapEnd = target.x - 20; const laneX = gapStart < gapEnd ? gapStart + (gapEnd - gapStart) * (lane + 1) / (siblings.length + 1) : (source.x + GRAPH_NODE_WIDTH + target.x) / 2;
+    return { x: laneX, y: targetY, targetX: laneX };
+  }
+  const returns = graph.definition.edges.filter((candidate) => { const from = graph.positions[candidate.source]; const to = graph.positions[candidate.target]; return Boolean(from && to && (candidate.condition?.branch === "loop" || to.x <= from.x)); });
+  const lane = Math.max(0, returns.findIndex((candidate) => candidate.id === edgeId));
+  const bottom = Math.max(...graph.definition.nodes.map((node) => (graph.positions[node.id]?.y ?? 0) + graphNodeHeight(node)));
+  return { x: source.x + GRAPH_NODE_WIDTH + 32 + lane * 14, y: bottom + 48 + lane * 28, targetX: target.x - 32 - lane * 14 };
+}
 function appendNode(graph: GraphProject, type: "input" | "agent" | "loop_counter" | "output", agents: AgentSettingsView[]): GraphProject { const count = graph.definition.nodes.filter((node) => node.type === type).length + 1; const id = `${type}-${crypto.randomUUID()}`; const agent = sortAgents(agents.filter(isRunnableAgent))[0]; const node: GraphNode = type === "input" ? { id, type, name: `Input ${count}`, config: { fields: [{ id: "input", name: "Input", description: "", required: true, multiline: true }] } } : type === "output" ? { id, type, name: `Output ${count}`, config: { fields: [{ id: "output", name: "Output", required: true }] } } : type === "loop_counter" ? { id, type, name: `Loop ${count}`, config: { maxIterations: 3 } } : { id, type, name: `Agent ${count}`, config: { agentProductId: agent?.id ?? "codex", modelId: agent?.catalog.models[0] ?? null, permissionMode: agent?.catalog.permissionModes[0] ?? "request_approval", instruction: "", outputs: [{ id: "output", name: "Output 1" }] } }; const definition = { ...graph.definition, nodes: [...graph.definition.nodes, node], ...(type === "input" ? { start: [id] } : {}), ...(type === "output" ? { end: [id] } : {}) }; const points = Object.values(graph.positions); const right = points.length ? Math.max(...points.map((position) => position.x)) : 80; const rows = points.filter((position) => position.x >= right - 40).length; return { ...graph, definition, positions: { ...graph.positions, [id]: { x: right + 220, y: 120 + (rows % 3) * 140 } } }; }
 function applyPositionChanges(graph: GraphProject, changes: NodeChange[]): GraphProject { const nodes = applyNodeChanges(changes, toFlowNodes(graph, [], new Map(), new Set())); const positions = { ...graph.positions }; for (const node of nodes) positions[node.id] = node.position; return { ...graph, positions }; }
 function updateNode(graph: GraphProject, next: GraphNode): GraphProject {
@@ -406,11 +439,10 @@ function isRunnableAgent(agent: AgentSettingsView): boolean { return agent.enabl
 function editableFingerprint(graph: GraphProject): string { return JSON.stringify([graph.name, graph.description, graph.definition, graph.viewport, graph.positions]); }
 export function graphBounds(graph: GraphProject): { x: number; y: number; width: number; height: number } {
   const positions = graph.positions;
-  const points = [...graph.definition.nodes.flatMap((node) => { const position = positions[node.id] ?? { x: 0, y: 0 }; return [position, { x: position.x + 176, y: position.y + 100 }]; })];
+  const points = [...graph.definition.nodes.flatMap((node) => { const position = positions[node.id] ?? { x: 0, y: 0 }; return [position, { x: position.x + GRAPH_NODE_WIDTH, y: position.y + graphNodeHeight(node) }]; })];
   for (const edge of graph.definition.edges) {
-    if (edge.route) { points.push(edge.route); if (edge.route.targetX !== undefined) points.push({ x: edge.route.targetX, y: edge.route.y }); continue; }
-    const source = positions[edge.source]; const target = positions[edge.target];
-    if (source && target && target.x < source.x) points.push({ x: (source.x + target.x + 176) / 2, y: Math.max(source.y, target.y) + 146 });
+    const route = edge.route ?? automaticEdgeRoute(graph, edge.id);
+    if (route) { points.push(route); if (route.targetX !== undefined) points.push({ x: route.targetX, y: route.y }); }
   }
   if (!points.length) return { x: 0, y: 0, width: 1, height: 1 };
   const x = Math.min(...points.map((point) => point.x));

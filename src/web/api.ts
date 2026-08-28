@@ -40,6 +40,7 @@ export interface PluginOption {
   id: string;
   pluginId: string;
   versionId: string;
+  version?: string;
   name: string;
   type: "skill" | "mcp";
   compatibleAgents: AgentProductId[];
@@ -837,7 +838,8 @@ function parseInstalledPlugin(value: unknown): PluginOption | null {
     id: pluginKey({ pluginId: record.pluginId, versionId: record.versionId }),
     pluginId: record.pluginId,
     versionId: record.versionId,
-    name: `${record.pluginId} ${record.versionId.slice(0, 8)}`,
+    version: typeof record.version === "string" && /^\d+\.\d+\.\d+$/.test(record.version) ? record.version : undefined,
+    name: record.pluginId,
     type: record.type,
     compatibleAgents,
     materializations,

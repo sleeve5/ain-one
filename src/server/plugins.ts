@@ -63,6 +63,7 @@ export interface PluginCandidate {
 
 export interface InstalledPluginVersion extends PluginVersion {
   type: PluginType;
+  version?: string;
   contentHash: string;
   canonicalPath: string;
 }
@@ -122,6 +123,7 @@ interface StoredVersion {
   pluginId: string;
   versionId: string;
   type: PluginType;
+  version?: string;
   contentHash: string;
   canonicalPath: string;
   compatibility: CompatibilityMap;
@@ -220,6 +222,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
 
         const installed = getStoredVersion(metadata, source.pluginId, source.contentHash);
         if (installed) {
+          installed.version ??= source.version;
           installed.compatibility = mergeCompatibility(installed.compatibility, source.compatibility);
           for (const [candidateId, candidate] of Object.entries(metadata.candidates)) {
             if (candidate.pluginId === source.pluginId && candidate.versionId === source.contentHash) {
@@ -424,6 +427,7 @@ function inspectSource(
   path: string;
   pluginId: string;
   type: PluginType;
+  version?: string;
   contentHash: string;
   compatibility: CompatibilityMap;
 } {
@@ -452,6 +456,7 @@ function inspectSource(
       path: absolutePath,
       pluginId,
       type: "skill",
+      version: readSkillVersion(absolutePath),
       contentHash,
       compatibility,
     };
@@ -466,6 +471,7 @@ function inspectSource(
     path: absolutePath,
     pluginId: normalizePluginId(parsed.pluginId),
     type: "mcp",
+    version: parsed.version,
     contentHash: hash,
     compatibility,
   };
@@ -480,6 +486,7 @@ function inspectSourceForNativeScan(
   path: string;
   pluginId: string;
   type: PluginType;
+  version?: string;
   contentHash: string;
   compatibility: CompatibilityMap;
 } | null {
@@ -515,6 +522,7 @@ function inspectSourceForCandidate(
   path: string;
   pluginId: string;
   type: PluginType;
+  version?: string;
   contentHash: string;
   compatibility: CompatibilityMap;
 } {
@@ -538,6 +546,7 @@ function storeVersion(input: {
     path: string;
     pluginId: string;
     type: PluginType;
+    version?: string;
     contentHash: string;
     compatibility: CompatibilityMap;
   };
@@ -574,6 +583,7 @@ function storeVersion(input: {
     pluginId: input.source.pluginId,
     versionId,
     type: input.source.type,
+    version: input.source.version,
     contentHash: input.source.contentHash,
     canonicalPath,
     compatibility: input.source.compatibility,
@@ -1310,6 +1320,7 @@ function applyScope(
 
 function parseMcpDefinition(raw: string): {
   pluginId: string;
+  version?: string;
   compatibility: CompatibilityMap;
 } {
   let parsed: unknown;
@@ -1364,6 +1375,7 @@ function parseMcpDefinition(raw: string): {
 
   return {
     pluginId: record.pluginId,
+    version: userFacingVersion(record.version),
     compatibility,
   };
 }
@@ -1694,9 +1706,31 @@ function mapInstalled(version: StoredVersion): InstalledPluginVersion {
     pluginId: version.pluginId,
     versionId: version.versionId,
     type: version.type,
+    version: version.version,
     contentHash: version.contentHash,
     canonicalPath: version.canonicalPath,
   };
+}
+
+function readSkillVersion(skillPath: string): string | undefined {
+  const roots = [skillPath];
+  if (basename(dirname(skillPath)) === "skills") roots.push(dirname(dirname(skillPath)));
+  for (const root of roots) {
+    for (const directory of [".codex-plugin", ".claude-plugin"]) {
+      try {
+        const manifest = JSON.parse(readFileSync(join(root, directory, "plugin.json"), "utf8")) as { version?: unknown };
+        const version = userFacingVersion(manifest.version);
+        if (version) return version;
+      } catch {
+        // Standalone Skills do not have a plugin manifest.
+      }
+    }
+  }
+  return undefined;
+}
+
+function userFacingVersion(value: unknown): string | undefined {
+  return typeof value === "string" ? value.match(/^(\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$/)?.[1] : undefined;
 }
 
 function mapCandidate(candidate: StoredCandidate): PluginCandidate {

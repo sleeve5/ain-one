@@ -137,18 +137,18 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           {conversation?.queuedMessages.length ? <section className="conversation-canvas__pending"><h3>{zh ? "待发送消息" : "Unsent messages"}</h3><ul>{conversation.queuedMessages.map((message, index) => <li key={message.id} data-status={message.status ?? "pending"}><span>{message.content}</span>{message.status === "uncertain" ? <div className="conversation-canvas__pending-recovery"><strong>{zh ? "投递结果待确认" : "Delivery needs confirmation"}</strong><button type="button" onClick={() => void props.onResolveUncertainMessage?.(message.id, "accept")}>{zh ? "确认已接收" : "Mark received"}</button><button type="button" onClick={() => void props.onResolveUncertainMessage?.(message.id, "retry")}>{zh ? "重新发送" : "Send again"}</button></div> : message.status === "staged" ? <strong>{zh ? "正在投递" : "Delivering"}</strong> : <button type="button" aria-label={`Delete pending message ${index + 1}: ${message.content}`} onClick={() => void props.onDeletePendingMessage(message.id).catch(() => undefined)}>{zh ? "删除" : "Delete"}</button>}</li>)}</ul></section> : null}
         </div>
         <button type="button" className="conversation-canvas__scroll-bottom" aria-label={zh ? "滑到底部" : "Scroll to bottom"} onClick={() => scrollRef.current?.scrollTo({ top: scrollRef.current.scrollHeight, behavior: "smooth" })}>↓</button>
-        <div className="conversation-canvas__composer-seat">
-          <Composer
-            disabled={draftUnavailable || sendBlocked}
-            language={props.language}
-            leadingControls={leadingControls}
-            trailingControls={trailingControls}
-            stopControl={turnActive ? <button type="button" className="composer__stop" onClick={props.onCancelTurn}>{zh ? "停止" : "Stop"}</button> : null}
-            value={drafts[conversation?.id ?? `new:${draft!.projectId}`] ?? ""}
-            onChange={(value) => { const id = conversation?.id ?? `new:${draft!.projectId}`; setDrafts((current) => ({ ...current, [id]: value })); }}
-            onSubmit={async (content) => { const id = conversation?.id ?? `new:${draft!.projectId}`; const value = drafts[id] ?? ""; setDrafts((current) => ({ ...current, [id]: "" })); setSubmitting(true); try { await props.onQueueMessage(content); } catch (error) { setDrafts((current) => current[id] ? current : { ...current, [id]: value }); throw error; } finally { setSubmitting(false); } }}
-          />
-        </div>
+      </div>
+      <div className="conversation-canvas__composer-seat">
+        <Composer
+          disabled={draftUnavailable || sendBlocked}
+          language={props.language}
+          leadingControls={leadingControls}
+          trailingControls={trailingControls}
+          stopControl={turnActive ? <button type="button" className="composer__stop" onClick={props.onCancelTurn}>{zh ? "停止" : "Stop"}</button> : null}
+          value={drafts[conversation?.id ?? `new:${draft!.projectId}`] ?? ""}
+          onChange={(value) => { const id = conversation?.id ?? `new:${draft!.projectId}`; setDrafts((current) => ({ ...current, [id]: value })); }}
+          onSubmit={async (content) => { const id = conversation?.id ?? `new:${draft!.projectId}`; const value = drafts[id] ?? ""; setDrafts((current) => ({ ...current, [id]: "" })); setSubmitting(true); try { await props.onQueueMessage(content); } catch (error) { setDrafts((current) => current[id] ? current : { ...current, [id]: value }); throw error; } finally { setSubmitting(false); } }}
+        />
       </div>
     </section>
   );

@@ -195,7 +195,7 @@ button:focus-visible, input:focus-visible, select:focus-visible, textarea:focus-
 .conversation-trajectory__detail { min-width: 0; width: 100%; overflow-wrap: break-word; word-break: normal; }
 .conversation-trajectory__detail > :first-child { margin-top: 0; }.conversation-trajectory__detail > :last-child { margin-bottom: 0; }
 .conversation-trajectory__detail pre { overflow-x: auto; margin: 6px 0; white-space: pre-wrap; }
-.conversation-canvas__composer-seat { position: sticky; z-index: 7; bottom: 0; padding: 8px 24px 16px; background: linear-gradient(to bottom, transparent, var(--panel) 24%); }
+.conversation-canvas__composer-seat { z-index: 7; flex: none; padding: 8px 24px 16px; background: linear-gradient(to bottom, transparent, var(--panel) 24%); }
 .composer-selectors { display: flex; min-width: 0; align-items: center; gap: 2px; }
 .composer-selectors--trailing { justify-content: flex-end; }
 .agent-selector { width: 128px; }.composer-selector { width: 152px; }.permission-selector { width: 132px; }

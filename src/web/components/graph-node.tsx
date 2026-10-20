@@ -8,7 +8,7 @@ export const GRAPH_NODE_PORT_PADDING = 8;
 
 export interface GraphNodeData extends Record<string, unknown> {
   label: string;
-  kind: "input" | "agent" | "output" | "loop_counter" | "literal" | "template" | "passthrough";
+  kind: "input" | "agent" | "output" | "loop_counter";
   subtitle?: string;
   inputs: GraphPort[];
   outputs: GraphPort[];

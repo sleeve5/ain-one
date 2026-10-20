@@ -10,7 +10,6 @@ import type {
   LiveSession,
   MaterializeInput,
   MaterializeResult,
-  NativePluginCandidate,
   PermissionDecision,
   SessionInput,
   StartTurnInput,
@@ -140,10 +139,6 @@ export abstract class BaseConnector implements AgentConnector {
     })();
 
     return runtime.closePromise;
-  }
-
-  async discoverPlugins(): Promise<NativePluginCandidate[]> {
-    return [];
   }
 
   async materializePlugins(input: MaterializeInput): Promise<MaterializeResult> {

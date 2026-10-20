@@ -1,4 +1,5 @@
 import { DatabaseSync } from "node:sqlite";
+import { migrateLegacyGraphDefinition } from "../shared/validation.js";
 
 export function createDatabase(filename: string): DatabaseSync {
   const db = new DatabaseSync(filename);
@@ -110,6 +111,16 @@ function migrate(db: DatabaseSync): void {
       updated_at TEXT NOT NULL
     );
 
+    CREATE TABLE IF NOT EXISTS migration_diagnostics (
+      entity_type TEXT NOT NULL,
+      entity_id TEXT NOT NULL,
+      code TEXT NOT NULL,
+      message TEXT NOT NULL,
+      details_json TEXT NOT NULL,
+      created_at TEXT NOT NULL,
+      PRIMARY KEY (entity_type, entity_id, code)
+    );
+
     CREATE TABLE IF NOT EXISTS graphs (
       id TEXT PRIMARY KEY,
       project_id TEXT NOT NULL REFERENCES projects(id) ON DELETE CASCADE,
@@ -176,6 +187,149 @@ function migrate(db: DatabaseSync): void {
   migrateGraphManagement(db);
   migrateTraeQueue(db);
   migrateQueueDeliveries(db);
+  migratePersistedCompatibility(db);
+}
+
+function migratePersistedCompatibility(db: DatabaseSync): void {
+  db.exec("BEGIN IMMEDIATE");
+  try {
+    migratePersistedGraphs(db);
+    retireOpenCodeData(db);
+    db.exec("COMMIT");
+  } catch (error) {
+    db.exec("ROLLBACK");
+    throw error;
+  }
+}
+
+function migratePersistedGraphs(db: DatabaseSync): void {
+  const rows = db.prepare("SELECT id, definition_json FROM graphs").all() as Array<{
+    id: string;
+    definition_json: string;
+  }>;
+  for (const row of rows) {
+    let definition: unknown;
+    try {
+      definition = JSON.parse(row.definition_json);
+    } catch {
+      quarantineGraph(
+        db,
+        row.id,
+        "legacy_graph_manual_migration_required",
+        "Graph definition is not valid JSON",
+      );
+      continue;
+    }
+    const result = migrateLegacyGraphDefinition(definition);
+    if (result.status === "current") continue;
+    if (result.status === "migrated") {
+      db.prepare("UPDATE graphs SET definition_json = ?, updated_at = ? WHERE id = ?")
+        .run(JSON.stringify(result.definition), new Date().toISOString(), row.id);
+      continue;
+    }
+    quarantineGraph(db, row.id, result.code, result.reason);
+  }
+}
+
+function quarantineGraph(
+  db: DatabaseSync,
+  graphId: string,
+  code: string,
+  reason: string,
+): void {
+  const now = new Date().toISOString();
+  db.prepare(`
+    UPDATE graphs
+    SET archived_at = ?, updated_at = ?
+    WHERE id = ? AND archived_at IS NULL
+  `).run(now, now, graphId);
+  recordMigrationDiagnostic(db, {
+    entityType: "graph",
+    entityId: graphId,
+    code,
+    message: "Graph was archived because it cannot be migrated safely",
+    details: { reason, definitionPreserved: true },
+    createdAt: now,
+  });
+}
+
+function retireOpenCodeData(db: DatabaseSync): void {
+  const conversations = db.prepare(`
+    SELECT id FROM conversations WHERE agent_product_id = 'opencode'
+  `).all() as Array<{ id: string }>;
+  for (const conversation of conversations) {
+    const now = new Date().toISOString();
+    const code = "opencode_connector_retired";
+    const message = "OpenCode connector was retired; the Conversation was archived and its queue was preserved";
+    db.prepare(`
+      UPDATE queued_messages
+      SET status = 'uncertain', updated_at = ?
+      WHERE conversation_id = ? AND status = 'staged'
+    `).run(now, conversation.id);
+    db.prepare(`
+      UPDATE turns
+      SET status = 'interrupted',
+          error_json = COALESCE(error_json, ?),
+          updated_at = ?
+      WHERE conversation_id = ? AND status IN ('starting', 'running', 'cancelling')
+    `).run(JSON.stringify({ code, message }), now, conversation.id);
+    db.prepare(`
+      UPDATE conversations
+      SET queue_paused = 1,
+          archived_at = COALESCE(archived_at, ?),
+          updated_at = ?
+      WHERE id = ? AND (queue_paused <> 1 OR archived_at IS NULL)
+    `).run(now, now, conversation.id);
+    recordMigrationDiagnostic(db, {
+      entityType: "conversation",
+      entityId: conversation.id,
+      code,
+      message,
+      details: {
+        agentProductId: "opencode",
+        action: "archived_and_paused",
+        queuedMessagesPreserved: true,
+      },
+      createdAt: now,
+    });
+    const sequence = (db.prepare(`
+      SELECT COALESCE(MAX(sequence), 0) + 1 AS sequence
+      FROM events WHERE conversation_id = ?
+    `).get(conversation.id) as { sequence: number }).sequence;
+    db.prepare(`
+      INSERT OR IGNORE INTO events (
+        id, conversation_id, sequence, type, payload_json, created_at
+      ) VALUES (?, ?, ?, 'warning', ?, ?)
+    `).run(
+      `migration-warning:opencode:${conversation.id}`,
+      conversation.id,
+      sequence,
+      JSON.stringify({ code, message, queuedMessagesPreserved: true }),
+      now,
+    );
+  }
+}
+
+function recordMigrationDiagnostic(db: DatabaseSync, input: {
+  entityType: string;
+  entityId: string;
+  code: string;
+  message: string;
+  details: Record<string, unknown>;
+  createdAt: string;
+}): void {
+  db.prepare(`
+    INSERT OR IGNORE INTO migration_diagnostics (
+      entity_type, entity_id, code, message, details_json, created_at
+    ) VALUES (?, ?, ?, ?, ?, ?)
+  `).run(
+    input.entityType,
+    input.entityId,
+    input.code,
+    input.message,
+    JSON.stringify(input.details),
+    input.createdAt,
+  );
 }
 
 function migrateGraphManagement(db: DatabaseSync): void {

@@ -10,7 +10,6 @@ import type {
   LiveSession,
   MaterializeInput,
   MaterializeResult,
-  NativePluginCandidate,
   NativeTurn,
   NormalizedError,
   PermissionDecision,
@@ -47,12 +46,16 @@ class ControlledConnector implements AgentConnector {
   startAttempts = 0;
   startedTurnIds: string[] = [];
   createSessionCalls = 0;
+  sessionEvents = new Map<string, NonNullable<SessionInput["onEvent"]>>();
   closeSessionCalls = 0;
   cancelRequests: Array<{ sessionId: string; nativeTurnId: string | null }> = [];
+  permissionResponses: Array<{ sessionId: string; requestId: string; decision: PermissionDecision }> = [];
   cancelMode: "confirm" | "reject" | "throw" = "confirm";
   sessionMode: "ok" | "definite_fail" | "uncertain_fail" = "ok";
   private callbacks: TurnCallbacks | null = null;
   private startedTurns: StartedTurn[] = [];
+  continuedPrompts: unknown[] = [];
+  continueResult = false;
 
   setTurnCallbacks(callbacks: TurnCallbacks): void {
     this.callbacks = callbacks;
@@ -71,6 +74,7 @@ class ControlledConnector implements AgentConnector {
 
   async createOrResumeSession(input: SessionInput): Promise<LiveSession> {
     this.createSessionCalls += 1;
+    if (input.onEvent) this.sessionEvents.set(input.conversationId, input.onEvent);
 
     if (this.sessionMode === "definite_fail") {
       const error = new Error("session create rejected") as Error & {
@@ -111,6 +115,15 @@ class ControlledConnector implements AgentConnector {
     return { nativeTurnId: started.nativeTurnId };
   }
 
+  async continueTurn(_session: LiveSession, input: Parameters<NonNullable<AgentConnector["continueTurn"]>>[1]): Promise<boolean> {
+    this.continuedPrompts.push(input);
+    return this.continueResult;
+  }
+
+  async emitEvent(conversationId: string, event: Parameters<NonNullable<SessionInput["onEvent"]>>[0]): Promise<void> {
+    await this.sessionEvents.get(conversationId)?.(event);
+  }
+
   async emitTerminal(
     turnId: string,
     status: TerminalTurnStatus = "completed",
@@ -134,11 +147,11 @@ class ControlledConnector implements AgentConnector {
   }
 
   async respondToPermission(
-    _session: LiveSession,
-    _requestId: string,
-    _decision: PermissionDecision,
+    session: LiveSession,
+    requestId: string,
+    decision: PermissionDecision,
   ): Promise<void> {
-    return undefined;
+    this.permissionResponses.push({ sessionId: session.id, requestId, decision });
   }
 
   async cancelTurn(
@@ -161,10 +174,6 @@ class ControlledConnector implements AgentConnector {
   async closeSession(_session: LiveSession): Promise<void> {
     this.closeSessionCalls += 1;
     return undefined;
-  }
-
-  async discoverPlugins(): Promise<NativePluginCandidate[]> {
-    return [];
   }
 
   async materializePlugins(_input: MaterializeInput): Promise<MaterializeResult> {
@@ -279,6 +288,18 @@ function createTestCoordinator(connector: ControlledConnector): {
 }
 
 describe("TurnCoordinator", () => {
+  it("routes permission responses to the active Conversation session", async () => {
+    const connector = new ControlledConnector();
+    const app = createTestCoordinator(connector);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "needs permission");
+
+    await expect(app.coordinator.respondToPermission(conversation.id, "approval-1", "allow_once")).resolves.toBe(true);
+    expect(connector.permissionResponses).toEqual([{
+      sessionId: conversation.id, requestId: "approval-1", decision: "allow_once",
+    }]);
+    app.db.close();
+  });
   it("uses a replaced Connector for later Turns", async () => {
     const initial = new ControlledConnector();
     const replacement = new ControlledConnector();
@@ -434,6 +455,22 @@ describe("TurnCoordinator", () => {
     db.close();
   });
 
+  it("does not activate the hidden Trae queue capability from a legacy Conversation setting", async () => {
+    const runtime = new ControlledConnector();
+    const db = createDatabase(":memory:");
+    const repositories = createRepositories(db);
+    const project = repositories.createProject(`/tmp/project-${randomUUID()}`, "test");
+    const conversation = repositories.createConversation({
+      projectId: project.id, agentProductId: "trae", modelId: "trae-test", autoQueue: true,
+    });
+    const coordinator = new TurnCoordinator({ repositories, connectors: { trae: runtime } });
+
+    await coordinator.enqueueMessage(conversation.id, "run without hidden queue hooks");
+
+    expect(runtime.snapshots[0]).not.toHaveProperty("autoQueue");
+    db.close();
+  });
+
   it("requeues and pauses when plugin materialization fails before native start", async () => {
     const runtime = new ControlledConnector();
     const db = createDatabase(":memory:");
@@ -490,15 +527,15 @@ describe("TurnCoordinator", () => {
       expect.objectContaining({ content: "keep exactly once" }),
     ]);
     expect(repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
-    expect(repositories.eventsAfter(conversation.id, 0)).toEqual([
-      expect.objectContaining({
+    expect(repositories.eventsAfter(conversation.id, 0)).toEqual(
+      expect.arrayContaining([expect.objectContaining({
         type: "warning",
         payload: {
           code: "queue_dispatch_failed",
           message: "broken plugin settings",
         },
-      }),
-    ]);
+      })]),
+    );
     db.close();
   });
 
@@ -521,6 +558,259 @@ describe("TurnCoordinator", () => {
 
     expect(runtime.prompts).toEqual(["first", "second"]);
   });
+
+  it("starts a later message after a normal Agent process has completed", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)!.id;
+    await runtime.emitTerminal(firstTurnId, "completed");
+
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+
+    expect(runtime.prompts).toEqual(["first", "second"]);
+    expect(runtime.continuedPrompts).toEqual([]);
+  });
+
+  it("keeps a staged follow-up durable until the native Hook acknowledges its exact delivery", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)?.id;
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "processing", hasPendingInput: false, acceptingInput: true },
+    });
+    await app.coordinator.enqueueMessage(conversation.id, "follow up");
+
+    expect(runtime.prompts).toEqual(["first"]);
+    expect(runtime.continuedPrompts).toEqual([expect.objectContaining({ content: "follow up" })]);
+    expect(app.repositories.getActiveTurn(conversation.id)?.id).toBe(firstTurnId);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "follow up", status: "staged" }),
+    ]);
+    expect(app.repositories.eventsAfter(conversation.id, 0).filter((event) =>
+      event.type === "user_message" && event.payload.text === "follow up"
+    )).toHaveLength(1);
+
+    const delivery = runtime.continuedPrompts[0] as { messageId: string; deliveryId: string };
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status",
+      payload: { status: "processing", hasPendingInput: false, acceptingInput: true, acknowledged: delivery },
+    });
+
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([]);
+    expect(app.repositories.getActiveTurn(conversation.id)?.messageId).toBe(delivery.messageId);
+    expect(app.repositories.eventsAfter(conversation.id, 0)).toEqual(expect.arrayContaining([
+      expect.objectContaining({ type: "user_message", payload: expect.objectContaining({ text: "follow up", messageId: delivery.messageId }) }),
+    ]));
+  });
+
+  it("keeps a follow-up pending when native continuation fails", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueTurn = async () => { throw new Error("bridge unavailable"); };
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "keep me");
+
+    expect(runtime.prompts).toEqual(["first"]);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "keep me" }),
+    ]);
+  });
+
+  it("delivers the FIFO head when the native Hook reaches a safe point", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "adjust one");
+    await app.coordinator.enqueueMessage(conversation.id, "adjust two");
+    expect(app.repositories.listQueuedMessages(conversation.id).map((message) => message.content))
+      .toEqual(["adjust one", "adjust two"]);
+
+    runtime.continuedPrompts = [];
+    runtime.continueResult = true;
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "processing", hasPendingInput: false, acceptingInput: true },
+    });
+
+    expect(runtime.continuedPrompts).toEqual([expect.objectContaining({ content: "adjust one" })]);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "adjust one", status: "staged" }),
+      expect.objectContaining({ content: "adjust two", status: "pending" }),
+    ]);
+  });
+
+  it("completes the logical Turn when Trae enters its reusable waiting lease", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const turnId = app.repositories.getActiveTurn(conversation.id)?.id;
+
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+
+    expect(app.repositories.getActiveTurn(conversation.id)).toBeNull();
+    expect(app.repositories.getTurn(turnId!)?.status).toBe("completed");
+  });
+
+  it("releases an exited waiting runtime lease without rewriting its completed logical Turn", async () => {
+    const runtime = new ControlledConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)!.id;
+
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+    await runtime.emitTerminal(firstTurnId, "interrupted");
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+
+    expect(app.repositories.getTurn(firstTurnId)?.status).toBe("completed");
+    expect(runtime.prompts).toEqual(["first", "second"]);
+  });
+
+  it("keeps rapid messages in one FIFO while a waiting runtime lease is alive", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+
+    await Promise.all([
+      app.coordinator.enqueueMessage(conversation.id, "second"),
+      app.coordinator.enqueueMessage(conversation.id, "third"),
+    ]);
+
+    expect(runtime.startAttempts).toBe(1);
+    expect(runtime.continuedPrompts).toHaveLength(1);
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "second", status: "staged" }),
+      expect.objectContaining({ content: "third", status: "pending" }),
+    ]);
+  });
+
+  it("ignores an acknowledgement that does not match the staged delivery", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await app.coordinator.enqueueMessage(conversation.id, "follow up");
+    const staged = app.repositories.listQueuedMessages(conversation.id)[0]!;
+
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status",
+      payload: { status: "processing", hasPendingInput: false, acceptingInput: true, acknowledged: { messageId: staged.id, deliveryId: "wrong" } },
+    });
+
+    expect(app.repositories.listQueuedMessages(conversation.id)[0]).toMatchObject({ id: staged.id, status: "staged" });
+  });
+
+  it("marks an unacknowledged staged delivery uncertain during startup recovery", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+    await app.coordinator.enqueueMessage(conversation.id, "possibly delivered");
+    await app.coordinator.enqueueMessage(conversation.id, "must stay behind it");
+
+    await app.coordinator.recoverInterruptedTurns();
+    await app.coordinator.recoverPendingQueues();
+    app.repositories.setConversationQueuePaused(conversation.id, false);
+    await app.coordinator.dispatchNext(conversation.id);
+
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "possibly delivered", status: "uncertain" }),
+      expect.objectContaining({ content: "must stay behind it", status: "pending" }),
+    ]);
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+    expect(runtime.startAttempts).toBe(1);
+  });
+
+  it("does not let an old runtime callback release a newer reusable lease", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)!.id;
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+    await runtime.emitTerminal(firstTurnId, "interrupted");
+
+    await app.coordinator.enqueueMessage(conversation.id, "second");
+    const secondTurnId = app.repositories.getActiveTurn(conversation.id)!.id;
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+    await runtime.emitTerminal(firstTurnId, "interrupted");
+    await app.coordinator.enqueueMessage(conversation.id, "third");
+
+    expect(app.repositories.getTurn(secondTurnId)?.status).toBe("completed");
+    expect(runtime.startAttempts).toBe(2);
+    expect(runtime.continuedPrompts).toEqual([expect.objectContaining({ content: "third" })]);
+  });
+
+  it("marks a staged delivery uncertain as soon as its runtime lease exits", async () => {
+    const runtime = new ControlledConnector();
+    runtime.continueResult = true;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+    const firstTurnId = app.repositories.getActiveTurn(conversation.id)!.id;
+    await runtime.emitEvent(conversation.id, {
+      type: "queue_status", payload: { status: "waiting", hasPendingInput: false, acceptingInput: true },
+    });
+    await app.coordinator.enqueueMessage(conversation.id, "maybe accepted");
+
+    await runtime.emitTerminal(firstTurnId, "interrupted");
+
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "maybe accepted", status: "uncertain" }),
+    ]);
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+  });
+
+  it.each(["retry", "accept"] as const)(
+    "resolves an uncertain delivery with an explicit %s decision before releasing FIFO",
+    async (action) => {
+      const runtime = new ControlledConnector();
+      const app = createTestCoordinator(runtime);
+      const conversation = app.createConversation();
+      const uncertain = app.repositories.enqueueMessage(conversation.id, "uncertain task");
+      app.repositories.stageMessage(conversation.id, uncertain.id, "delivery-1");
+      app.repositories.enqueueMessage(conversation.id, "next task");
+      app.repositories.interruptActiveTurns();
+
+      await expect(
+        app.coordinator.resolveUncertainDelivery(conversation.id, uncertain.id, action),
+      ).resolves.toBe(true);
+
+      expect(runtime.prompts).toEqual([action === "retry" ? "uncertain task" : "next task"]);
+      expect(app.repositories.listQueuedMessages(conversation.id).map((message) => message.content))
+        .toEqual(action === "retry" ? ["next task"] : []);
+    },
+  );
 
   it("retries transient SQLite failures before acknowledging a terminal Turn", async () => {
     const runtime = new ControlledConnector();
@@ -1210,6 +1500,45 @@ describe("TurnCoordinator", () => {
     expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
   });
 
+  it("waits for runtime shutdown before restarting the workspace without replaying messages", async () => {
+    const runtime = new BlockingCloseConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "running");
+    app.repositories.setConversationQueuePaused(conversation.id, true);
+
+    let resolved = false;
+    const restarting = app.coordinator.restartWorkspace().then(() => { resolved = true; });
+    await runtime.closeStarted;
+
+    expect(resolved).toBe(false);
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(true);
+    runtime.finishClose();
+    await restarting;
+
+    expect(app.repositories.getActiveTurn(conversation.id)).toBeNull();
+    expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(false);
+    expect(runtime.startAttempts).toBe(1);
+  });
+
+  it("keeps messages queued while a workspace restart owns the runtime", async () => {
+    const runtime = new BlockingCloseConnector();
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "running");
+
+    const restarting = app.coordinator.restartWorkspace();
+    await runtime.closeStarted;
+    await app.coordinator.enqueueMessage(conversation.id, "after restart");
+
+    expect(runtime.startAttempts).toBe(1);
+    runtime.finishClose();
+    await restarting;
+    expect(app.repositories.listQueuedMessages(conversation.id)).toEqual([
+      expect.objectContaining({ content: "after restart", status: "pending" }),
+    ]);
+  });
+
   it("treats uncertain session creation failure as interrupted and keeps message bound", async () => {
     const runtime = new ControlledConnector();
     runtime.sessionMode = "uncertain_fail";
@@ -1261,6 +1590,28 @@ describe("TurnCoordinator", () => {
     expect(app.repositories.getConversation(conversation.id)?.queuePaused).toBe(false);
   });
 
+  it("claims concurrent cancellation once and preserves the confirmed result", async () => {
+    const runtime = new ControlledConnector();
+    const firstCancellation = deferred<void>();
+    const cancelTurn = vi.fn(async () => {
+      await firstCancellation.promise;
+      return { confirmed: true };
+    });
+    runtime.cancelTurn = cancelTurn;
+    const app = createTestCoordinator(runtime);
+    const conversation = app.createConversation();
+    await app.coordinator.enqueueMessage(conversation.id, "first");
+
+    const first = app.coordinator.cancelActiveTurn(conversation.id);
+    await vi.waitFor(() => expect(cancelTurn).toHaveBeenCalledOnce());
+    const second = app.coordinator.cancelActiveTurn(conversation.id);
+    firstCancellation.resolve();
+
+    await expect(Promise.all([first, second])).resolves.toEqual([true, false]);
+    expect(cancelTurn).toHaveBeenCalledOnce();
+    expect(app.repositories.getLatestTurn(conversation.id)?.status).toBe("cancelled");
+  });
+
   it("marks cancel_failed and keeps queue paused when cancel is not confirmed", async () => {
     const runtime = new ControlledConnector();
     runtime.cancelMode = "reject";
@@ -1299,3 +1650,13 @@ describe("TurnCoordinator", () => {
     ]);
   });
 });
+
+function deferred<T>() {
+  let resolve!: (value: T) => void;
+  let reject!: (reason?: unknown) => void;
+  const promise = new Promise<T>((resolvePromise, rejectPromise) => {
+    resolve = resolvePromise;
+    reject = rejectPromise;
+  });
+  return { promise, resolve, reject };
+}

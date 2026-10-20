@@ -1,4 +1,4 @@
-import { useEffect, useState } from "react";
+import { useEffect, useRef, useState } from "react";
 import type { AgentProductId, PluginVersion } from "../../shared/contracts.js";
 import { isPhaseOneAgentProductId, type PluginMaterializationView } from "../api.js";
 import { AgentBadge } from "./agent-badge.js";
@@ -10,8 +10,10 @@ interface Props { installedVersions: InstalledPluginVersion[]; error?: string | 
 const agents: AgentProductId[]=["codex","claude","trae"];
 export function PluginSettings(props: Props) {
   const [type,setType]=useState<PluginType>("skill"); const [query,setQuery]=useState(""); const zh=props.language==="zh";
+  const onEnableChange=useRef(props.onEnableChange);
+  onEnableChange.current=props.onEnableChange;
   const installed=latestVersions(props.installedVersions.filter((v)=>v.type===type&&v.pluginId.toLocaleLowerCase().includes(query.trim().toLocaleLowerCase())),props.enabledVersions);
-  useEffect(()=>{for(const latest of latestVersions(props.installedVersions,props.enabledVersions)){const enabled=props.enabledVersions.find((item)=>item.pluginId===latest.pluginId);if(enabled&&enabled.versionId!==latest.versionId)props.onEnableChange(props.scope,{pluginId:latest.pluginId,versionId:latest.versionId,enabled:true});}},[props.installedVersions,props.enabledVersions,props.scope,props.onEnableChange]);
+  useEffect(()=>{for(const latest of latestVersions(props.installedVersions,props.enabledVersions)){const enabled=props.enabledVersions.find((item)=>item.pluginId===latest.pluginId);if(enabled&&enabled.versionId!==latest.versionId)onEnableChange.current(props.scope,{pluginId:latest.pluginId,versionId:latest.versionId,enabled:true});}},[props.installedVersions,props.enabledVersions,props.scope]);
   const choose=async()=>{ const path=await props.onPickLocalPath(type==="skill"?"directory":"file"); if(path) props.onInstallLocalPath(path,type,type==="skill"?agents:[]); };
   return <section className="plugin-settings" aria-label="Plugin settings">
     <div className="plugin-settings__heading"><div><h1>{zh?"插件":"Plugins"}</h1><p>{zh?"已自动发现本机 Skills 与 MCP。开关决定它们是否在所选范围生效；只有添加其他位置时才需要选择文件。":"Installed Skills and MCP are automatically discovered. Use the switch for the selected scope; choose a file only to add another location."}</p></div><button type="button" onClick={props.onRefreshImports}>{zh?"自动导入":"Auto import"}</button></div>

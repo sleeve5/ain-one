@@ -1,12 +1,11 @@
 import { readFileSync } from "node:fs";
-import { act, fireEvent, render, screen, within } from "@testing-library/react";
+import { act, render, screen, within } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
 import { describe, expect, it, vi } from "vitest";
 import { App } from "../../src/web/app.js";
 import type {
   AinOneApi,
   ConversationView,
-  InspectorState,
   WorkspaceState,
 } from "../../src/web/api.js";
 import type {
@@ -17,18 +16,18 @@ import type {
 } from "../../src/shared/contracts.js";
 
 describe("web app", () => {
-  it("queues a message while a Turn is active and disables Turn settings", async () => {
+  it("disables sending while a Turn is active along with Turn settings", async () => {
     const user = userEvent.setup();
-    render(<App api={fakeApi({ activeTurn: true })} />);
+    const queueMessage = vi.fn(async () => undefined);
+    render(<App api={fakeApi({ activeTurn: true, queueMessage })} />);
 
     expect(await screen.findByLabelText("Model")).toBeDisabled();
     expect(screen.getByLabelText("Permission mode")).toBeDisabled();
-    expect(screen.getByLabelText("Plugins")).toBeDisabled();
 
     await user.type(screen.getByLabelText("Message"), "next task");
-    await user.click(screen.getByRole("button", { name: "Queue message" }));
-
-    expect(await screen.findByText("next task")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    await user.keyboard("{enter}");
+    expect(queueMessage).not.toHaveBeenCalled();
   });
 
   it("cancels an active Turn from the Stop button", async () => {
@@ -41,10 +40,9 @@ describe("web app", () => {
     expect(cancelActiveTurn).toHaveBeenCalledWith("conv-1");
   });
 
-  it("continues pending work or retries the interrupted Turn explicitly", async () => {
+  it("restarts the workspace from the sidebar instead of showing an inline recovery banner", async () => {
     const user = userEvent.setup();
-    const continueConversation = vi.fn(async () => undefined);
-    const retryInterruptedTurn = vi.fn(async () => undefined);
+    const restartWorkspace = vi.fn(async () => undefined);
     render(
       <App
         api={fakeApi({
@@ -53,42 +51,69 @@ describe("web app", () => {
             latestTurnStatus: "interrupted",
           },
           initialQueuedMessages: ["next task"],
-          continueConversation,
-          retryInterruptedTurn,
+          restartWorkspace,
         })}
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Continue pending queue" }));
-    expect(continueConversation).toHaveBeenCalledWith("conv-1");
-
-    await user.click(screen.getByRole("button", { name: "Retry interrupted Turn" }));
-    expect(retryInterruptedTurn).toHaveBeenCalledWith("conv-1", "turn-interrupted");
-    expect(screen.getByText(/confirm native work is inactive/i)).toBeVisible();
+    await user.click(await screen.findByRole("button", { name: "Restart project" }));
+    expect(restartWorkspace).toHaveBeenCalledTimes(1);
+    expect(screen.queryByText(/confirm native work is inactive/i)).toBeNull();
+    expect(screen.queryByRole("button", { name: "Continue sending" })).toBeNull();
+    expect(screen.getByRole("button", { name: "Restart project" })).toHaveAttribute("data-tooltip");
+    expect(screen.getByRole("button", { name: "Search projects" })).toHaveAttribute("data-tooltip");
+    expect(screen.getByRole("button", { name: "Open Project Folder" })).toHaveAttribute("data-tooltip");
   });
 
-  it.each(["start_failed", "failed", "cancel_failed"] as const)(
-    "offers Continue but not Retry after %s",
-    async (status) => {
-      render(
-        <App
-          api={fakeApi({
-            recoveryTurn: {
-              latestTurnId: `turn-${status}`,
-              latestTurnStatus: status,
-            },
-            initialQueuedMessages: ["next task"],
-          })}
-        />,
-      );
+  it("uses the latest Agent capabilities after restarting a hydrated Conversation", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    const hydrated = {
+      ...initial.conversation!,
+      hydrated: true,
+      availableModels: ["old-model"],
+      availablePermissionModes: ["request_approval" as const],
+    };
+    const refreshed = {
+      ...hydrated,
+      hydrated: false,
+      modelId: "new-model",
+      permissionMode: "full_access" as const,
+      availableModels: ["new-model"],
+      availablePermissionModes: ["full_access" as const],
+      events: [],
+      rawEvents: [],
+    };
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce({
+        ...initial,
+        conversation: hydrated,
+        conversations: [hydrated],
+      })
+      .mockResolvedValueOnce({
+        ...initial,
+        conversation: refreshed,
+        conversations: [refreshed],
+      });
+    api.loadConversation = vi.fn(async () => ({
+      ...refreshed,
+      hydrated: true,
+      latestTurnStatus: "completed" as const,
+    }));
 
-      expect(await screen.findByRole("button", { name: "Continue pending queue" })).toBeVisible();
-      expect(screen.queryByRole("button", { name: "Retry interrupted Turn" })).toBeNull();
-      if (status === "cancel_failed") {
-        expect(screen.getByText(/confirm native work is inactive/i)).toBeVisible();
-      }
-    },
-  );
+    render(<App api={api} />);
+    await user.click(await screen.findByRole("button", { name: "Restart project" }));
+
+    await vi.waitFor(() => expect(api.loadConversation).toHaveBeenCalledWith("conv-1"));
+    await user.click(screen.getByRole("button", { name: "Model" }));
+    expect(screen.getByRole("menuitemradio", { name: "new-model" })).toBeVisible();
+    expect(screen.queryByRole("menuitemradio", { name: "old-model" })).toBeNull();
+    await user.click(screen.getByRole("button", { name: "Model" }));
+    await user.click(screen.getByRole("button", { name: "Permission mode" }));
+    expect(screen.getByRole("menuitemradio", { name: "Full access" })).toBeVisible();
+    expect(screen.queryByRole("menuitemradio", { name: "Ask for approval" })).toBeNull();
+  });
 
   it("preserves the draft and surfaces queue failures inline", async () => {
     const user = userEvent.setup();
@@ -104,7 +129,7 @@ describe("web app", () => {
     await user.type(message, "keep this draft");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not queue message");
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not send message");
     expect(message).toHaveValue("keep this draft");
   });
 
@@ -121,7 +146,7 @@ describe("web app", () => {
         id: "event-live",
         conversationId: "conv-1",
         sequence: 1,
-        type: "assistant_message",
+        type: "assistant_message" as const,
         payload: { text: "live before refresh" },
         createdAt: new Date().toISOString(),
       });
@@ -131,12 +156,144 @@ describe("web app", () => {
     await user.type(await screen.findByRole("textbox", { name: "Message" }), "start");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(await screen.findByText("live before refresh")).toBeVisible();
+    expect(await within(screen.getByTestId("conversation-canvas")).findByText("live before refresh")).toBeVisible();
   });
 
-  it("refreshes persisted queue state after a terminal SSE event", async () => {
+  it("hydrates missing events when a workspace summary advances beyond local SSE state", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    const hydrated = {
+      ...initial.conversation!,
+      hydrated: true,
+      latestEventSequence: 0,
+    };
+    const advanced = {
+      ...hydrated,
+      hydrated: false,
+      latestEventSequence: 2,
+      events: [],
+      rawEvents: [],
+    };
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce({
+        ...initial,
+        conversation: hydrated,
+        conversations: [hydrated],
+      })
+      .mockResolvedValueOnce({
+        ...initial,
+        conversation: advanced,
+        conversations: [advanced],
+      });
+    api.loadConversation = vi.fn(async () => ({
+      ...advanced,
+      hydrated: true,
+      events: [{
+        id: "missed-output",
+        conversationId: "conv-1",
+        sequence: 2,
+        type: "assistant_message" as const,
+        payload: { text: "Recovered missed output" },
+        createdAt: "2026-08-24T00:00:02.000Z",
+      }],
+    }));
+    render(<App api={api} />);
+
+    await user.type(await screen.findByRole("textbox", { name: "Message" }), "start");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(
+      await within(screen.getByTestId("conversation-canvas")).findByText("Recovered missed output"),
+    ).toBeVisible();
+    expect(api.loadConversation).toHaveBeenCalledWith("conv-1");
+  });
+
+  it("hydrates the selected Conversation after loading workspace summaries", async () => {
+    const api = fakeApi();
+    const workspace = await api.loadWorkspace();
+    const summary = {
+      ...workspace.conversation!,
+      hydrated: false,
+      events: [],
+      rawEvents: [],
+    };
+    api.loadWorkspace = vi.fn(async () => ({
+      ...workspace,
+      conversations: [summary],
+      conversation: summary,
+    }));
+    api.loadConversation = vi.fn(async (): Promise<ConversationView> => ({
+      ...summary,
+      hydrated: true,
+      events: [{
+        id: "hydrated-answer",
+        conversationId: summary.id,
+        sequence: 1,
+        type: "assistant_message",
+        payload: { text: "Loaded on demand" },
+        createdAt: "2026-08-24T00:00:00.000Z",
+      }],
+    }));
+
+    render(<App api={api} />);
+
+    const canvas = await screen.findByTestId("conversation-canvas");
+    expect(await within(canvas).findByText("Loaded on demand")).toBeVisible();
+    expect(api.loadConversation).toHaveBeenCalledOnce();
+    expect(api.loadConversation).toHaveBeenCalledWith("conv-1");
+  });
+
+  it("retries failed Conversation hydration when the same Conversation is selected again", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const workspace = await api.loadWorkspace();
+    const summary = {
+      ...workspace.conversation!,
+      hydrated: false,
+      events: [],
+      rawEvents: [],
+    };
+    api.loadWorkspace = vi.fn(async () => ({
+      ...workspace,
+      conversations: [summary],
+      conversation: summary,
+    }));
+    api.loadConversation = vi.fn()
+      .mockRejectedValueOnce(new Error("detail unavailable"))
+      .mockResolvedValueOnce({
+        ...summary,
+        hydrated: true,
+        events: [{
+          id: "hydrated-after-retry",
+          conversationId: summary.id,
+          sequence: 1,
+          type: "assistant_message",
+          payload: { text: "Loaded after retry" },
+          createdAt: "2026-08-24T00:00:00.000Z",
+        }],
+      });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load Conversation");
+    await user.click(screen.getByRole("button", { name: "Main Conversation" }));
+
+    expect(
+      await within(screen.getByTestId("conversation-canvas")).findByText("Loaded after retry"),
+    ).toBeVisible();
+    expect(api.loadConversation).toHaveBeenCalledTimes(2);
+  });
+
+  it("refreshes persisted Turn state from Conversation detail after a terminal SSE event", async () => {
     const api = fakeApi({ activeTurn: true });
-    const loadWorkspace = vi.spyOn(api, "loadWorkspace");
+    const initial = await api.loadWorkspace();
+    api.loadConversation = vi.fn(async () => ({
+      ...initial.conversation!,
+      activeTurnStatus: null,
+      latestTurnStatus: "failed" as const,
+      hydrated: true,
+    }));
     let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
     api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
       onEvent = callback;
@@ -154,17 +311,47 @@ describe("web app", () => {
       createdAt: new Date().toISOString(),
     });
 
-    await vi.waitFor(() => expect(loadWorkspace).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() =>
+      expect(screen.queryByRole("button", { name: "Stop" })).toBeNull()
+    );
+    expect(api.loadConversation).toHaveBeenCalledWith("conv-1");
+  });
+
+  it("reconciles the durable queue after a delivery acknowledgement", async () => {
+    const api = fakeApi({ initialQueuedMessages: ["follow up"] });
+    const initial = await api.loadWorkspace();
+    api.loadConversation = vi.fn(async () => ({
+      ...initial.conversation!,
+      queuedMessages: [],
+      hydrated: true,
+    }));
+    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
+    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
+      onEvent = callback;
+      return () => undefined;
+    };
+    render(<App api={api} />);
+    expect(await screen.findByText("follow up")).toBeVisible();
+
+    onEvent({
+      id: "event-ack", conversationId: "conv-1", sequence: 1, type: "queue_status",
+      payload: {
+        status: "processing", acceptingInput: true, hasPendingInput: false,
+        acknowledged: { messageId: "msg-1", deliveryId: "delivery-1" },
+      },
+      createdAt: new Date().toISOString(),
+    });
+
+    await vi.waitFor(() => expect(screen.queryByText("follow up")).toBeNull());
+    expect(api.loadConversation).toHaveBeenCalledWith("conv-1");
   });
 
   it("applies the terminal refresh when the next queued Turn emits an ordinary event", async () => {
     const api = fakeApi({ activeTurn: true, initialQueuedMessages: ["next task"] });
     const initial = await api.loadWorkspace();
-    const refresh = deferred<WorkspaceState>();
+    const refresh = deferred<ConversationView>();
     let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockImplementationOnce(async () => refresh.promise);
+    api.loadConversation = vi.fn(async () => refresh.promise);
     api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
       onEvent = callback;
       return () => undefined;
@@ -180,7 +367,7 @@ describe("web app", () => {
       payload: { turnId: "turn-first", status: "completed" },
       createdAt: new Date().toISOString(),
     });
-    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(api.loadConversation).toHaveBeenCalledWith("conv-1"));
     onEvent({
       id: "event-next-output",
       conversationId: "conv-1",
@@ -192,68 +379,100 @@ describe("web app", () => {
 
     const continuedConversation = {
       ...initial.conversation!,
-      activeTurnStatus: "running" as const,
-      latestTurnId: "turn-next",
-      latestTurnStatus: "running" as const,
+      activeTurnStatus: null,
+      latestTurnId: "turn-first",
+      latestTurnStatus: "completed" as const,
       queuedMessages: [],
+      latestEventSequence: 1,
     };
-    await act(async () => refresh.resolve({
-      ...initial,
-      conversation: continuedConversation,
-      conversations: initial.conversations.map((conversation) =>
-        conversation.id === continuedConversation.id ? continuedConversation : conversation,
-      ),
-    }));
+    onEvent({
+      id: "event-next-running",
+      conversationId: "conv-1",
+      sequence: 3,
+      type: "turn_status",
+      payload: { turnId: "turn-next", status: "running" },
+      createdAt: new Date().toISOString(),
+    });
+    await act(async () => refresh.resolve(continuedConversation));
 
     expect(await screen.findByRole("button", { name: "Stop" })).toBeVisible();
     expect(screen.queryByText("next task")).toBeNull();
+    expect(
+      within(screen.getByTestId("conversation-canvas")).getByText("continuing queued work"),
+    ).toBeVisible();
   });
 
-  it("keeps the selected Project Inspector after a background workspace refresh", async () => {
-    const user = userEvent.setup();
-    const api = fakeApi({
-      twoProjects: true,
-      initialInspector: createInspector("one.ts", "."),
-      inspectorByProject: {
-        "project-2": createInspector("two.ts", "."),
-      },
-    });
-    const loadWorkspace = vi.spyOn(api, "loadWorkspace");
-    const subscriptions = new Map<
-      string,
-      (event: ConversationView["events"][number]) => void
-    >();
-    api.subscribeConversationEvents = (conversationId, _afterSequence, callback) => {
-      subscriptions.set(conversationId, callback);
-      return () => subscriptions.delete(conversationId);
+  it("does not duplicate streamed output when Conversation detail resolves late", async () => {
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    const summary = {
+      ...initial.conversation!,
+      hydrated: false,
+      latestEventSequence: 0,
+      events: [],
+      rawEvents: [],
+    };
+    const refresh = deferred<ConversationView>();
+    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
+    api.loadWorkspace = vi.fn(async () => ({
+      ...initial,
+      conversations: [summary],
+      conversation: summary,
+    }));
+    api.loadConversation = vi.fn(async () => refresh.promise);
+    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
+      onEvent = callback;
+      return () => undefined;
     };
     render(<App api={api} />);
+    await vi.waitFor(() => expect(api.loadConversation).toHaveBeenCalledWith("conv-1"));
 
-    await user.click(await screen.findByRole("button", { name: "Conversation Two" }));
-    expect(await screen.findByRole("button", { name: "two.ts" })).toBeVisible();
-
-    subscriptions.get("conv-2")?.({
-      id: "event-project-two-terminal",
-      conversationId: "conv-2",
-      sequence: 1,
-      type: "turn_status",
-      payload: { turnId: "turn-project-two", status: "completed" },
-      createdAt: new Date().toISOString(),
+    await act(async () => {
+      onEvent({
+        id: "delta-1",
+        conversationId: "conv-1",
+        sequence: 1,
+        type: "assistant_message",
+        payload: { text: "Hello", streamId: "answer", delta: true },
+        createdAt: new Date().toISOString(),
+      });
+      onEvent({
+        id: "delta-2",
+        conversationId: "conv-1",
+        sequence: 2,
+        type: "assistant_message",
+        payload: { text: " world", streamId: "answer", delta: true },
+        createdAt: new Date().toISOString(),
+      });
     });
+    expect(
+      await within(screen.getByTestId("conversation-canvas")).findByText("Hello world"),
+    ).toBeVisible();
+    await act(async () => refresh.resolve({
+      ...initial.conversation!,
+      modelId: "gpt-late",
+      availableModels: ["gpt-late"],
+      hydrated: true,
+      latestEventSequence: 0,
+      events: [],
+      rawEvents: [],
+    }));
 
-    await vi.waitFor(() => expect(loadWorkspace).toHaveBeenCalledTimes(2));
-    expect(screen.getByRole("button", { name: "two.ts" })).toBeVisible();
-    expect(screen.queryByRole("button", { name: "one.ts" })).toBeNull();
+    await vi.waitFor(() => {
+      expect(
+        within(screen.getByTestId("conversation-canvas")).getByText("Hello world"),
+      ).toBeVisible();
+      expect(screen.queryByText("HelloHello world")).toBeNull();
+    });
   });
 
-  it("keeps both Canvases mounted when a background workspace refresh fails", async () => {
+  it("keeps the selected Chat canvas mounted when terminal detail reconciliation fails", async () => {
     const user = userEvent.setup();
     const api = fakeApi({ activeTurn: true });
-    const initial = await api.loadWorkspace();
     let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockRejectedValueOnce(new Error("refresh unavailable"));
+    api.loadConversation = vi.fn(async () => {
+      throw new Error("detail unavailable");
+    });
     api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
       onEvent = callback;
       return () => undefined;
@@ -270,13 +489,14 @@ describe("web app", () => {
       createdAt: new Date().toISOString(),
     });
 
-    expect(await screen.findByRole("alert")).toHaveTextContent("refresh unavailable");
+    await vi.waitFor(() => expect(api.loadConversation).toHaveBeenCalledWith("conv-1"));
     expect(screen.getByTestId("conversation-canvas")).toBeInTheDocument();
-    expect(screen.getByTestId("graph-canvas")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-canvas")).not.toBeInTheDocument();
     expect(screen.getByLabelText("Message")).toHaveValue("draft survives refresh");
   });
 
-  it("subscribes to background Conversations and updates their sidebar status", async () => {
+  it("marks completed background Conversations unread and clears the dot when opened", async () => {
+    const user = userEvent.setup();
     const api = fakeApi({ twoProjects: true });
     const subscriptions = new Map<
       string,
@@ -291,18 +511,69 @@ describe("web app", () => {
     await screen.findByRole("button", { name: "Main Conversation" });
     await vi.waitFor(() => expect([...subscriptions.keys()].sort()).toEqual(["conv-1", "conv-2"]));
     subscriptions.get("conv-2")?.({
-      id: "event-background-running",
+      id: "event-background-complete",
       conversationId: "conv-2",
       sequence: 1,
       type: "turn_status",
-      payload: { turnId: "turn-background", status: "running" },
+      payload: { turnId: "turn-background", status: "completed" },
       createdAt: new Date().toISOString(),
     });
 
-    await vi.waitFor(() =>
-      expect(within(screen.getByRole("button", { name: /Conversation Two/ })).getByText("running"))
-        .toBeVisible(),
-    );
+    const backgroundButton = screen.getByRole("button", { name: "Conversation Two" });
+    await vi.waitFor(() => expect(within(backgroundButton).getByLabelText("Unread")).toBeVisible());
+    await user.click(backgroundButton);
+    expect(within(backgroundButton).queryByLabelText("Unread")).toBeNull();
+  });
+
+  it("shows starting feedback before queueMessage resolves", async () => {
+    const user = userEvent.setup();
+    const queued = deferred<void>();
+    render(<App api={fakeApi({ queueMessage: async () => queued.promise })} />);
+
+    await user.type(await screen.findByLabelText("Message"), "start slowly");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Connecting");
+    await act(async () => queued.resolve());
+  });
+
+  it("keeps the current running status and blocks follow-up submission", async () => {
+    const user = userEvent.setup();
+    const queueMessage = vi.fn(async () => undefined);
+    render(<App api={fakeApi({ activeTurn: true, queueMessage })} />);
+
+    await user.type(await screen.findByLabelText("Message"), "follow up");
+    await user.keyboard("{enter}");
+
+    expect(screen.getByRole("status")).toHaveTextContent("Analyzing");
+    expect(screen.getByRole("status")).not.toHaveTextContent("Connecting");
+    expect(queueMessage).not.toHaveBeenCalled();
+  });
+
+  it("shows starting feedback for a newly created Conversation before its first queue resolves", async () => {
+    const user = userEvent.setup();
+    const created = deferred<Conversation>();
+    render(<App api={fakeApi({ createConversation: async () => created.promise })} />);
+
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "first message");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("status")).toHaveTextContent("Connecting");
+    await act(async () => created.resolve(conversationDto("conv-created", null)));
+  });
+
+  it("clears starting feedback when a new Conversation cannot queue its first message", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({ queueMessage: async () => { throw new Error("offline"); } })} />);
+
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "first message");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("Could not create Conversation");
+    expect(screen.queryByRole("status")).toBeNull();
+    expect(screen.getByLabelText("Message")).toHaveValue("first message");
   });
 
   it("preserves a Conversation draft while visiting a Project without Conversations", async () => {
@@ -318,7 +589,8 @@ describe("web app", () => {
 
     await user.type(await screen.findByLabelText("Message"), "draft across empty project");
     await user.click(screen.getByRole("button", { name: "Project Two" }));
-    expect(screen.getByText("Create a conversation to start.")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "New conversation" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeVisible();
     await user.click(screen.getByRole("button", { name: "Project One" }));
 
     expect(screen.getByLabelText("Message")).toHaveValue("draft across empty project");
@@ -342,7 +614,7 @@ describe("web app", () => {
     );
   });
 
-  it("selects a newly opened Project even when it has no Conversation", async () => {
+  it("adds and selects a newly opened Project without reloading the workspace", async () => {
     const user = userEvent.setup();
     const api = fakeApi();
     const initial = await api.loadWorkspace();
@@ -353,14 +625,8 @@ describe("web app", () => {
       createdAt: "2026-08-22T00:00:00.000Z",
       updatedAt: "2026-08-22T00:00:00.000Z",
     };
-    const refreshed: WorkspaceState = {
-      ...initial,
-      projects: [...initial.projects, { id: opened.id, path: opened.path, name: opened.name }],
-    };
     api.pickProject = (async () => opened) as AinOneApi["pickProject"];
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refreshed);
+    api.loadWorkspace = vi.fn().mockResolvedValue(initial);
     render(<App api={api} />);
 
     await user.click(await screen.findByRole("button", { name: "Open Project Folder" }));
@@ -369,7 +635,160 @@ describe("web app", () => {
       "data-active",
       "true",
     );
-    expect(screen.getByText("Create a conversation to start.")).toBeVisible();
+    expect(screen.getByRole("heading", { name: "New conversation" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeVisible();
+    expect(api.loadWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it("does not let a pending Project import replace a newer Project selection", async () => {
+    const user = userEvent.setup();
+    const catalog = deferred<{
+      models: string[];
+      permissionModes: PermissionMode[];
+    }>();
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    codex.projectCatalogs = { "project-1": codex.catalog };
+    render(<App api={fakeApi({
+      agents: [codex],
+      pickProject: async () => ({
+        id: "project-new",
+        path: "/tmp/new-project",
+        name: "New Project",
+        createdAt: "2026-08-22T00:00:00.000Z",
+        updatedAt: "2026-08-22T00:00:00.000Z",
+      }),
+      loadAgentCatalog: async () => catalog.promise,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Open Project Folder" }));
+    await user.click(screen.getByRole("button", { name: "Main Conversation" }));
+    await act(async () => catalog.resolve({
+      models: ["new-model"],
+      permissionModes: ["request_approval"],
+    }));
+
+    expect(screen.getByRole("heading", { name: "Main Conversation" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Ain One" })).toHaveAttribute("data-active", "true");
+  });
+
+  it("leaves the selected Graph when opening another Project", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    const graph = {
+      id: "graph-1", projectId: "project-1", name: "Current graph", description: "",
+      definition: { nodes: [], edges: [], start: [], end: [] },
+      viewport: { x: 0, y: 0, zoom: 1 }, positions: {},
+      createdAt: "2026-08-22T00:00:00.000Z", updatedAt: "2026-08-22T00:00:00.000Z",
+    };
+    api.loadWorkspace = vi.fn(async () => ({ ...initial, graphs: [graph] }));
+    api.getGraph = vi.fn(async () => ({ graph, latestRun: null }));
+    api.pickProject = vi.fn(async () => ({
+      id: "project-new", path: "/tmp/new-project", name: "New Project",
+      createdAt: "2026-08-22T00:00:00.000Z", updatedAt: "2026-08-22T00:00:00.000Z",
+    }));
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Current graph" }));
+    expect(await screen.findByTestId("graph-canvas")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Open Project Folder" }));
+
+    expect(await screen.findByRole("heading", { name: "New conversation" })).toBeVisible();
+    expect(screen.queryByTestId("graph-canvas")).not.toBeInTheDocument();
+  });
+
+  it("opens the portable Graph configuration from the Graph toolbar", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    const graph = {
+      id: "graph-1", projectId: "project-1", name: "Current graph", description: "",
+      definition: { nodes: [], edges: [], start: [], end: [] },
+      viewport: { x: 0, y: 0, zoom: 1 }, positions: {},
+      createdAt: "2026-08-22T00:00:00.000Z", updatedAt: "2026-08-22T00:00:00.000Z",
+    };
+    api.loadWorkspace = vi.fn(async () => ({ ...initial, graphs: [graph] }));
+    api.getGraph = vi.fn(async () => ({ graph, latestRun: null }));
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Current graph" }));
+    await user.click(await screen.findByRole("button", { name: "Latest run" }));
+    await user.click(await screen.findByRole("button", { name: "Open Graph configuration" }));
+
+    expect(screen.getByRole("dialog", { name: "Graph configuration" })).toBeVisible();
+    expect(screen.queryByText("Runnable")).toBeNull();
+    expect(screen.queryByText("Incomplete")).toBeNull();
+  });
+
+  it("opens a new Conversation draft when the selected Project has no Conversations", async () => {
+    const api = fakeApi();
+    const workspace = await api.loadWorkspace();
+    api.loadWorkspace = async () => ({
+      ...workspace,
+      conversations: [],
+      selectedConversationId: null,
+      conversation: null,
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "New conversation" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeVisible();
+    expect(screen.queryByText("Create a conversation to start.")).toBeNull();
+  });
+
+  it("keeps the new Conversation draft visible when the local Agent is unavailable", async () => {
+    const api = fakeApi({ agents: [agent("codex", "Codex", "not_installed")] });
+    const workspace = await api.loadWorkspace();
+    api.loadWorkspace = async () => ({
+      ...workspace,
+      conversations: [],
+      selectedConversationId: null,
+      conversation: null,
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByRole("heading", { name: "New conversation" })).toBeVisible();
+    expect(screen.getByLabelText("Message")).toBeVisible();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeDisabled();
+    expect(screen.queryByText("Create a conversation to start.")).toBeNull();
+  });
+
+  it("shows an import action in the main empty state when no Project exists", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const workspace = await api.loadWorkspace();
+    const pickProject = vi.fn(async () => null);
+    api.pickProject = pickProject;
+    api.loadWorkspace = async () => ({
+      ...workspace,
+      projects: [],
+      selectedProjectId: null,
+      conversations: [],
+      selectedConversationId: null,
+      conversation: null,
+    });
+
+    render(<App api={api} />);
+
+    expect(await screen.findByText("Import a project to start a conversation.")).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "Import project" }));
+    expect(pickProject).toHaveBeenCalledOnce();
+  });
+
+  it("shows progress while the native Project folder picker is open", async () => {
+    const user = userEvent.setup();
+    const picked = deferred<Project | null>();
+    render(<App api={fakeApi({ pickProject: async () => picked.promise })} />);
+
+    const button = await screen.findByRole("button", { name: "Open Project Folder" });
+    await user.click(button);
+
+    expect(button).toBeDisabled();
+    expect(button).toHaveAttribute("aria-busy", "true");
+    expect(screen.getByText("Opening…")).toBeVisible();
+    await act(async () => picked.resolve(null));
   });
 
   it("keeps the current workspace when the native folder picker is cancelled", async () => {
@@ -387,13 +806,14 @@ describe("web app", () => {
     );
   });
 
-  it("selects a newly created Conversation instead of retaining the previous one", async () => {
+  it("adds and selects a newly created Conversation without reloading the workspace", async () => {
     const user = userEvent.setup();
     const api = fakeApi();
     const initial = await api.loadWorkspace();
     const created: Conversation = {
       id: "conv-new",
       projectId: "project-1",
+      title: "New Conversation",
       agentProductId: "codex",
       modelId: "gpt-5",
       permissionMode: "request_approval",
@@ -401,29 +821,20 @@ describe("web app", () => {
       createdAt: "2026-08-22T00:00:00.000Z",
       updatedAt: "2026-08-22T00:00:00.000Z",
     };
-    const newConversation: ConversationView = {
-      ...initial.conversation!,
-      id: created.id,
-      title: "New Conversation",
-      events: [],
-      queuedMessages: [],
-    };
-    const refreshed: WorkspaceState = {
-      ...initial,
-      conversations: [...initial.conversations, newConversation],
-    };
     api.createConversation = (async () => created) as unknown as AinOneApi["createConversation"];
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockResolvedValueOnce(refreshed);
+    api.loadWorkspace = vi.fn().mockResolvedValue(initial);
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "Create Conversation" }));
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "start");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(await screen.findByRole("button", { name: "New Conversation" })).toHaveAttribute(
+    const sidebar = await screen.findByRole("navigation", { name: "Projects and conversations" });
+    expect(within(sidebar).getByText("New Conversation").closest("button")).toHaveAttribute(
       "data-active",
       "true",
     );
+    expect(api.loadWorkspace).toHaveBeenCalledOnce();
   });
 
   it("keeps a newly created Conversation selected across a background terminal refresh", async () => {
@@ -433,6 +844,7 @@ describe("web app", () => {
     const created: Conversation = {
       id: "conv-new",
       projectId: "project-1",
+      title: "New Conversation",
       agentProductId: "codex",
       modelId: "gpt-5",
       permissionMode: "request_approval",
@@ -440,33 +852,21 @@ describe("web app", () => {
       createdAt: "2026-08-24T00:00:00.000Z",
       updatedAt: "2026-08-24T00:00:00.000Z",
     };
-    const newConversation: ConversationView = {
-      ...initial.conversation!,
-      id: created.id,
-      title: "New Conversation",
-      events: [],
-      queuedMessages: [],
-    };
-    const refreshed: WorkspaceState = {
-      ...initial,
-      conversations: [...initial.conversations, newConversation],
-    };
-    const targetedRefresh = deferred<WorkspaceState>();
-    const terminalRefresh = deferred<WorkspaceState>();
+    const terminalRefresh = deferred<ConversationView>();
     let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
     api.createConversation = async () => created;
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockImplementationOnce(async () => targetedRefresh.promise)
-      .mockImplementationOnce(async () => terminalRefresh.promise);
+    api.loadWorkspace = vi.fn().mockResolvedValue(initial);
+    api.loadConversation = vi.fn(async () => terminalRefresh.promise);
     api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
       onEvent = callback;
       return () => undefined;
     };
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "Create Conversation" }));
-    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "start");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+    expect(api.loadWorkspace).toHaveBeenCalledOnce();
     onEvent({
       id: "event-background-terminal",
       conversationId: "conv-1",
@@ -475,81 +875,15 @@ describe("web app", () => {
       payload: { turnId: "turn-background", status: "completed" },
       createdAt: "2026-08-24T00:00:00.000Z",
     });
-    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(3));
+    await vi.waitFor(() => expect(api.loadConversation).toHaveBeenCalledWith("conv-1"));
 
-    await act(async () => terminalRefresh.resolve(refreshed));
+    await act(async () => terminalRefresh.resolve({
+      ...initial.conversation!,
+      activeTurnStatus: null,
+      latestTurnStatus: "completed",
+      hydrated: true,
+    }));
     expect(await screen.findByRole("button", { name: "New Conversation" })).toHaveAttribute(
-      "data-active",
-      "true",
-    );
-    await act(async () => targetedRefresh.resolve(refreshed));
-    expect(screen.getByRole("button", { name: "New Conversation" })).toHaveAttribute(
-      "data-active",
-      "true",
-    );
-  });
-
-  it("does not restore a pending target after the user selects another Conversation", async () => {
-    const user = userEvent.setup();
-    const api = fakeApi({ twoProjects: true });
-    const initial = await api.loadWorkspace();
-    const created: Conversation = {
-      id: "conv-new",
-      projectId: "project-1",
-      agentProductId: "codex",
-      modelId: "gpt-5",
-      permissionMode: "request_approval",
-      queuePaused: false,
-      createdAt: "2026-08-24T00:00:00.000Z",
-      updatedAt: "2026-08-24T00:00:00.000Z",
-    };
-    const refreshed: WorkspaceState = {
-      ...initial,
-      conversations: [
-        ...initial.conversations,
-        {
-          ...initial.conversation!,
-          id: created.id,
-          title: "New Conversation",
-          events: [],
-          queuedMessages: [],
-        },
-      ],
-    };
-    const targetedRefresh = deferred<WorkspaceState>();
-    const terminalRefresh = deferred<WorkspaceState>();
-    let onEvent: (event: ConversationView["events"][number]) => void = () => undefined;
-    api.createConversation = async () => created;
-    api.loadWorkspace = vi.fn()
-      .mockResolvedValueOnce(initial)
-      .mockImplementationOnce(async () => targetedRefresh.promise)
-      .mockImplementationOnce(async () => terminalRefresh.promise);
-    api.subscribeConversationEvents = (_conversationId, _afterSequence, callback) => {
-      onEvent = callback;
-      return () => undefined;
-    };
-    render(<App api={api} />);
-
-    await user.click(await screen.findByRole("button", { name: "Create Conversation" }));
-    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
-    await user.click(screen.getByRole("button", { name: "Conversation Two" }));
-    onEvent({
-      id: "event-background-terminal-after-navigation",
-      conversationId: "conv-1",
-      sequence: 1,
-      type: "turn_status",
-      payload: { turnId: "turn-background", status: "completed" },
-      createdAt: "2026-08-24T00:00:00.000Z",
-    });
-    await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(3));
-
-    await act(async () => terminalRefresh.resolve(refreshed));
-    expect(screen.getByRole("button", { name: "Conversation Two" })).toHaveAttribute(
-      "data-active",
-      "true",
-    );
-    await act(async () => targetedRefresh.resolve(refreshed));
-    expect(screen.getByRole("button", { name: "Conversation Two" })).toHaveAttribute(
       "data-active",
       "true",
     );
@@ -561,12 +895,14 @@ describe("web app", () => {
     const createConversation = vi.fn(async () => created.promise);
     render(<App api={fakeApi({ createConversation })} />);
 
-    const createButton = await screen.findByRole("button", { name: "Create Conversation" });
-    await user.click(createButton);
-    await user.click(createButton);
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "start");
+    const sendButton = screen.getByRole("button", { name: "Send message" });
+    await user.click(sendButton);
+    await user.click(sendButton);
 
     expect(createConversation).toHaveBeenCalledOnce();
-    expect(createButton).toBeDisabled();
+    expect(sendButton).toBeDisabled();
   });
 
   it("shows Conversation creation failures without an unhandled rejection", async () => {
@@ -576,13 +912,100 @@ describe("web app", () => {
     });
     render(<App api={fakeApi({ createConversation })} />);
 
-    const createButton = await screen.findByRole("button", { name: "Create Conversation" });
-    await user.click(createButton);
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "start");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not create Conversation: creation unavailable",
     );
-    expect(createButton).toBeEnabled();
+    expect(screen.getByRole("button", { name: "Send message" })).toBeEnabled();
+  });
+
+  it("surfaces Project rename failures from the sidebar", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({ renameProject: async () => {
+      throw new Error("rename unavailable");
+    } })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Manage project Ain One" }));
+    await user.click(screen.getByRole("button", { name: "Rename project" }));
+    const dialog = screen.getByRole("dialog", { name: "Rename project" });
+    const input = within(dialog).getByRole("textbox");
+    await user.clear(input);
+    await user.type(input, "Renamed project");
+    await user.click(within(dialog).getByRole("button", { name: "Save" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("rename unavailable");
+    expect(screen.getByRole("button", { name: "Ain One" })).toBeVisible();
+  });
+
+  it("surfaces Conversation branch failures from the message actions", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({
+      includeAllEventTypes: true,
+      forkConversation: async () => { throw new Error("branch unavailable"); },
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Branch conversation" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("branch unavailable");
+  });
+
+  it("adds and selects a branched Conversation without reloading the workspace", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi({ includeAllEventTypes: true, forkConversation: async () => ({ ...conversationDto("conv-branch", null), title: "Main Conversation (branch)" }) });
+    const loadWorkspace = vi.spyOn(api, "loadWorkspace");
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Branch conversation" }));
+
+    expect(await screen.findByRole("button", { name: "Main Conversation (branch)" })).toHaveAttribute("data-active", "true");
+    expect(screen.getByRole("heading", { name: "Main Conversation (branch)" })).toBeVisible();
+    expect(loadWorkspace).toHaveBeenCalledOnce();
+  });
+
+  it("surfaces archived Conversation restore failures", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({
+      archiveConversation: async () => { throw new Error("restore unavailable"); },
+      loadArchived: async () => ({
+        projects: [],
+        conversations: [{
+          id: "archived-conversation",
+          projectId: "project-1",
+          title: "Archived conversation",
+          agentProductId: "codex",
+          modelId: null,
+          permissionMode: "request_approval",
+          queuePaused: false,
+          archivedAt: "2026-08-24T00:00:00.000Z",
+          createdAt: "2026-08-23T00:00:00.000Z",
+          updatedAt: "2026-08-24T00:00:00.000Z",
+        }],
+      }),
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Archived" }));
+    await user.click(await screen.findByRole("button", { name: "Restore" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("restore unavailable");
+  });
+
+  it("keeps the workspace refresh error after a successful archive", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    const initial = await api.loadWorkspace();
+    api.loadWorkspace = vi.fn()
+      .mockResolvedValueOnce(initial)
+      .mockRejectedValueOnce(new Error("refresh unavailable"));
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Manage conversation Main Conversation" }));
+    await user.click(screen.getByRole("button", { name: "Archive conversation" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent("refresh unavailable");
   });
 
   it("ignores an older workspace refresh that finishes after a newer one", async () => {
@@ -609,11 +1032,13 @@ describe("web app", () => {
       .mockImplementationOnce(async () => first.promise)
       .mockImplementationOnce(async () => second.promise);
     api.updateAgentExecutablePath = async () => undefined;
+    api.pickAgentExecutable = async (agentId) => `/tmp/${agentId}`;
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
-    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
-    await user.click(screen.getByRole("button", { name: "Save Claude Code path" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
+    await user.click(screen.getByRole("button", { name: "Import another Codex path" }));
+    await user.click(screen.getByRole("button", { name: "Import another Claude Code path" }));
     await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(3));
 
     second.resolve(newer);
@@ -631,27 +1056,62 @@ describe("web app", () => {
         await firstSave.promise;
       }
     });
+    const api = fakeApi({
+      agents: [agent("codex", "Codex", "available")],
+      updateAgentExecutablePath,
+    });
+    api.pickAgentExecutable = vi.fn()
+      .mockResolvedValueOnce("/old/codex")
+      .mockResolvedValueOnce("/new/codex");
     render(
       <App
-        api={fakeApi({
-          agents: [agent("codex", "Codex", "available")],
-          updateAgentExecutablePath,
-        })}
+        api={api}
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
-    const input = screen.getByLabelText("Codex executable path override");
-    await user.type(input, "/old/codex");
-    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
-    await user.clear(input);
-    await user.type(input, "/new/codex");
-    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
+    await user.click(screen.getByRole("button", { name: "Import another Codex path" }));
+    await user.click(screen.getByRole("button", { name: "Import another Codex path" }));
 
     expect(updateAgentExecutablePath).toHaveBeenCalledOnce();
     firstSave.resolve();
     await vi.waitFor(() => expect(updateAgentExecutablePath).toHaveBeenCalledTimes(2));
     expect(updateAgentExecutablePath).toHaveBeenNthCalledWith(2, "codex", "/new/codex");
+  });
+
+  it("reports an Agent executable picker failure", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    api.pickAgentExecutable = async () => {
+      throw new Error("picker unavailable");
+    };
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
+    await user.click(screen.getByRole("button", { name: "Import another Codex path" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not select Agent executable: picker unavailable",
+    );
+  });
+
+  it("reports a plugin path picker failure", async () => {
+    const user = userEvent.setup();
+    const api = fakeApi();
+    api.pickLocalPath = async () => {
+      throw new Error("picker unavailable");
+    };
+    render(<App api={api} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Plugins" }));
+    await user.click(screen.getByRole("button", { name: "Add Skill" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not select plugin path: picker unavailable",
+    );
   });
 
   it("does not let an in-flight workspace refresh overwrite newer local Conversation state", async () => {
@@ -670,13 +1130,15 @@ describe("web app", () => {
       onEvent = callback;
       return () => undefined;
     };
+    api.pickAgentExecutable = async () => "/tmp/codex";
     render(<App api={api} />);
 
-    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
-    await user.click(screen.getByRole("button", { name: "Save Codex path" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
+    await user.click(screen.getByRole("button", { name: "Import another Codex path" }));
     await vi.waitFor(() => expect(api.loadWorkspace).toHaveBeenCalledTimes(2));
-    await user.click(screen.getByRole("button", { name: "Workspace" }));
-    await user.selectOptions(screen.getByLabelText("Model"), "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Close Settings" }));
+    await chooseModel(user, "gpt-5-mini");
     await user.click(
       screen.getByRole("button", { name: "Delete pending message 1: keep deleted" }),
     );
@@ -692,77 +1154,9 @@ describe("web app", () => {
 
     await act(async () => staleRefresh.resolve(initial));
 
-    expect(screen.getByLabelText("Model")).toHaveValue("gpt-5-mini");
+    expect(screen.getByLabelText("Model")).toHaveTextContent("gpt-5-mini");
     expect(screen.queryByText("keep deleted")).toBeNull();
     expect(screen.getByRole("button", { name: "Stop" })).toBeVisible();
-  });
-
-  it("surfaces inspector failures and preserves the selected project", async () => {
-    const user = userEvent.setup();
-    render(
-      <App
-        api={fakeApi({
-          twoProjects: true,
-          inspectorError: new Error("inspector unavailable"),
-        })}
-      />,
-    );
-
-    await user.click(await screen.findByRole("button", { name: "Project Two" }));
-
-    expect(await screen.findByRole("alert")).toHaveTextContent("Could not load inspector");
-    expect(screen.getByRole("button", { name: "Project Two" })).toHaveAttribute(
-      "data-active",
-      "true",
-    );
-    expect(screen.getByRole("button", { name: "Project Two" })).toHaveAttribute(
-      "aria-pressed",
-      "true",
-    );
-  });
-
-  it("refreshes inspector across projects and ignores stale responses", async () => {
-    const user = userEvent.setup();
-    const projectTwoInspector = deferred<InspectorState>();
-    const api = fakeApi({
-      twoProjects: true,
-      inspectorByProject: {
-        "project-1": createInspector("one.ts", "."),
-        "project-2": projectTwoInspector.promise,
-      },
-    });
-    render(<App api={api} />);
-
-    await user.click(await screen.findByRole("button", { name: "Conversation Two" }));
-    await user.click(screen.getByRole("button", { name: "Main Conversation" }));
-    projectTwoInspector.resolve(createInspector("two.ts", "."));
-
-    expect(await screen.findByRole("button", { name: "one.ts" })).toBeVisible();
-    expect(screen.queryByText("two.ts")).toBeNull();
-  });
-
-  it("navigates into directories and back to the parent", async () => {
-    const user = userEvent.setup();
-    const calls: Array<{ projectId: string; selection?: { path: string; type: string } | null }> = [];
-    const rootInspector = createInspector("src", ".", "directory");
-    const srcInspector = createInspector("src/web", "src", "directory");
-    const api = fakeApi({
-      initialInspector: rootInspector,
-      listProjectFiles: async (projectId, selection) => {
-        calls.push({ projectId, selection });
-        return selection?.path === "src" ? srcInspector : rootInspector;
-      },
-    });
-    render(<App api={api} />);
-
-    await user.click(await screen.findByRole("button", { name: "src" }));
-    expect(await screen.findByText("Directory: src")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: "Up" }));
-
-    expect(calls).toEqual([
-      { projectId: "project-1", selection: { path: "src", type: "directory" } },
-      { projectId: "project-1", selection: { path: ".", type: "directory" } },
-    ]);
   });
 
   it("makes closed mobile drawers inert and aria-hidden", async () => {
@@ -776,36 +1170,48 @@ describe("web app", () => {
     const projectDrawer = (await screen.findByLabelText("Projects and conversations")).closest(
       ".workspace__left",
     );
-    const inspectorDrawer = screen.getByLabelText("Project inspector").closest(
-      ".workspace__right",
-    );
     expect(projectDrawer).toHaveAttribute("inert");
     expect(projectDrawer).toHaveAttribute("aria-hidden", "true");
-    expect(inspectorDrawer).toHaveAttribute("inert");
-    expect(inspectorDrawer).toHaveAttribute("aria-hidden", "true");
   });
 
   it("uses shrinkable columns between 961px and 1139px", () => {
     const css = readFileSync("src/web/styles.css", "utf8");
 
     expect(css).toContain("@media (min-width: 961px) and (max-width: 1139px)");
-    expect(css).toContain("grid-template-columns: 260px minmax(0, 1fr) 300px;");
+    expect(css).toContain("grid-template-columns: 224px minmax(0, 1fr);");
     expect(css).toMatch(/\.workspace__center\s*\{[^}]*min-width:\s*0;/s);
+  });
+
+  it("uses the approved DSH visual tokens and settings geometry", () => {
+    const css = readFileSync("src/web/styles.css", "utf8");
+
+    expect(css).toContain("--accent: #4d6bfe;");
+    expect(css).toContain("-apple-system, BlinkMacSystemFont, \"Segoe UI\", \"PingFang SC\"");
+    expect(css).toContain("--background: #f4f8fc;");
+    expect(css).toContain("grid-template-columns: 280px minmax(480px, 1fr);");
+    expect(css).toMatch(/\.app-settings__dialog\s*\{[^}]*width:\s*min\(960px,/s);
+    expect(css).toMatch(/\.app-settings__dialog\s*\{[^}]*height:\s*min\(720px,/s);
+    expect(css).toMatch(/\.app-settings__dialog\s*\{[^}]*border-radius:\s*20px;/s);
+    expect(css).toMatch(/\.app-settings__nav\s*\{[^}]*width:\s*188px;/s);
+    expect(css).not.toMatch(/background:\s*#fafdff|background:\s*#edf4fb|background:\s*#f8fbfe/);
   });
 
   it("renders all normalized event types in timeline", async () => {
     render(<App api={fakeApi({ includeAllEventTypes: true })} />);
 
-    expect(await screen.findByText("Assistant says hi")).toBeVisible();
-    expect(screen.getByText("User sent hello")).toBeVisible();
-    expect(screen.getByText("Thought summary")).toBeVisible();
-    expect(screen.getByText("list_files")).toBeVisible();
-    expect(screen.getByText("pnpm test")).toBeVisible();
-    expect(screen.getByText("src/web/app.tsx")).toBeVisible();
-    expect(screen.getByText("Write outside workspace")).toBeVisible();
-    expect(screen.getByText("33 tokens")).toBeVisible();
-    expect(screen.getByText("Rate limit near cap")).toBeVisible();
-    expect(screen.getByText("failed: Spawn failed")).toBeVisible();
+    const conversationCanvas = await screen.findByTestId("conversation-canvas");
+    expect(await within(conversationCanvas).findByText("Assistant says hi")).toBeVisible();
+    expect(within(conversationCanvas).getByText("User sent hello")).toBeVisible();
+    await userEvent.setup().click(screen.getByRole("button", { name: "Expand activity" }));
+    expect(within(conversationCanvas).getByText("Thought summary")).toBeVisible();
+    expect(within(conversationCanvas).getByText("list_files")).toBeVisible();
+    expect(within(conversationCanvas).getByText("pnpm test")).toBeVisible();
+    expect(within(conversationCanvas).getByText("src/web/app.tsx")).toBeVisible();
+    expect(within(conversationCanvas).getByText("Write outside workspace")).toBeVisible();
+    expect(within(conversationCanvas).getByText("33 tokens")).toBeVisible();
+    expect(within(conversationCanvas).getByText("Rate limit near cap")).toBeVisible();
+    expect(within(conversationCanvas).getByText("Ended: failed")).toBeVisible();
+    expect(within(conversationCanvas).getByText("Spawn failed")).toBeVisible();
   });
 
   it("deletes a pending message", async () => {
@@ -833,11 +1239,11 @@ describe("web app", () => {
     await user.click(
       await screen.findByRole("button", { name: "Delete pending message 1: shared pending" }),
     );
-    await user.click(screen.getByRole("button", { name: /Conversation Two/ }));
+    await user.click(screen.getByText("Conversation Two").closest("button")!);
     await act(async () => deletion.resolve());
 
     expect(screen.getByText("shared pending")).toBeVisible();
-    await user.click(screen.getByRole("button", { name: /Main Conversation/ }));
+    await user.click(screen.getByText("Main Conversation").closest("button")!);
     expect(screen.queryByText("shared pending")).toBeNull();
   });
 
@@ -862,13 +1268,13 @@ describe("web app", () => {
       />,
     );
 
-    expect(await screen.findByText("Agent product: Codex")).toBeVisible();
+    expect((await screen.findByRole("heading", { name: "Main Conversation" })).parentElement?.querySelector(".agent-badge")).toHaveTextContent("Codex");
     expect(screen.queryByLabelText("Agent product")).toBeNull();
 
     await user.click(screen.getByRole("button", { name: "Permission mode" }));
-    expect(screen.getByRole("menuitemradio", { name: "Request approval" })).toBeVisible();
+    expect(screen.getByRole("menuitemradio", { name: "Ask for approval" })).toBeVisible();
     expect(screen.getByRole("menuitemradio", { name: "Full access" })).toBeVisible();
-    expect(screen.queryByRole("menuitemradio", { name: "Help me approve" })).toBeNull();
+    expect(screen.queryByRole("menuitemradio", { name: "Auto approve" })).toBeNull();
   });
 
   it("closes an open permission menu when a Turn becomes active", async () => {
@@ -900,56 +1306,9 @@ describe("web app", () => {
     );
   });
 
-  it("renders read-only inspector preview, git status, and diff", async () => {
-    render(<App api={fakeApi()} />);
-
-    expect(await screen.findByLabelText("Read-only file preview")).toBeVisible();
-    expect(screen.getByLabelText("Git status")).toBeVisible();
-    const gitDiff = screen.getByLabelText("Git diff");
-    expect(gitDiff).toBeVisible();
-    expect(screen.getByText("Branch: feature/ain-one-phase1")).toBeVisible();
-    expect(gitDiff).toHaveTextContent(/@@ -1 \+1 @@/);
-  });
-
-  it("opens a Project and creates a Conversation with one immutable Agent Product", async () => {
+  it("chooses an Agent only while composing a new Conversation", async () => {
     const user = userEvent.setup();
-    const pickProject = vi.fn(async (): Promise<Project> => ({
-      id: "project-2",
-      path: "/tmp/new-project",
-      name: "new-project",
-      createdAt: "2026-08-23T00:00:00.000Z",
-      updatedAt: "2026-08-23T00:00:00.000Z",
-    }));
-    const createConversation = vi.fn(async (): Promise<Conversation> => ({
-      id: "conv-2",
-      projectId: "project-1",
-      agentProductId: "claude",
-      modelId: "sonnet",
-      permissionMode: "request_approval",
-      queuePaused: false,
-      createdAt: "2026-08-23T00:00:00.000Z",
-      updatedAt: "2026-08-23T00:00:00.000Z",
-    }));
-    render(<App api={fakeApi({ pickProject, createConversation })} />);
-
-    const openButton = await screen.findByRole("button", { name: "Open Project Folder" });
-    expect(screen.queryByLabelText("Project path")).not.toBeInTheDocument();
-    await user.click(openButton);
-    expect(pickProject).toHaveBeenCalledOnce();
-
-    await user.selectOptions(screen.getByLabelText("New conversation Agent Product"), "claude");
-    await user.selectOptions(screen.getByLabelText("New conversation model"), "sonnet");
-    await user.click(screen.getByRole("button", { name: "Create Conversation" }));
-    expect(createConversation).toHaveBeenCalledWith({
-      projectId: "project-1",
-      agentProductId: "claude",
-      modelId: "sonnet",
-      permissionMode: "request_approval",
-    });
-  });
-
-  it("only allows Conversations for runnable Agent Products", async () => {
-    const user = userEvent.setup();
+    const queueMessage = vi.fn(async () => undefined);
     const createConversation = vi.fn(async (): Promise<Conversation> => ({
       id: "conv-2",
       projectId: "project-1",
@@ -964,67 +1323,59 @@ describe("web app", () => {
       <App
         api={fakeApi({
           createConversation,
+          queueMessage,
           agents: [
             agent("codex", "Codex", "authentication_required"),
             agent("claude", "Claude Code", "capability_limited", ["sonnet"]),
             agent("trae", "Trae", "runtime_error"),
-            agent("opencode", "OpenCode", "not_installed"),
           ],
         })}
       />,
     );
 
-    expect(await screen.findByRole("option", { name: "Codex" })).toBeDisabled();
-    expect(screen.getByRole("option", { name: "Trae" })).toBeDisabled();
-    expect(screen.queryByRole("option", { name: "OpenCode" })).toBeNull();
-    expect(screen.getByLabelText("New conversation Agent Product")).toHaveValue("claude");
-
-    await user.click(screen.getByRole("button", { name: "Create Conversation" }));
+    await user.click(await screen.findByRole("button", { name: /New chat/ }));
+    expect(createConversation).not.toHaveBeenCalled();
+    await user.click(screen.getByRole("button", { name: "Agent" }));
+    expect(screen.getByRole("menuitemradio", { name: "Codex" })).toBeVisible();
+    await user.click(screen.getByRole("menuitemradio", { name: "Claude Code" }));
+    expect(screen.getByRole("button", { name: "Model" })).toHaveTextContent("sonnet");
+    await user.type(screen.getByLabelText("Message"), "start with Claude");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
     expect(createConversation).toHaveBeenCalledWith(
-      expect.objectContaining({ agentProductId: "claude" }),
+      expect.objectContaining({ agentProductId: "claude", modelId: "sonnet" }),
     );
+    expect(queueMessage).toHaveBeenCalledWith("conv-2", "start with Claude");
+    expect(screen.getByRole("button", { name: "Agent" })).toBeDisabled();
   });
 
-  it("persists model and plugin version changes through separate scopes", async () => {
+  it("persists model changes from the composer", async () => {
     const user = userEvent.setup();
     const updateConversationSettings = vi.fn(async () => undefined);
-    const setPluginEnablements = vi.fn(async () => undefined);
-    render(<App api={fakeApi({ updateConversationSettings, setPluginEnablements })} />);
+    render(<App api={fakeApi({ updateConversationSettings })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
-    await user.selectOptions(screen.getByLabelText("Plugins"), "formatter@v2");
+    await chooseModel(user, "gpt-5-mini");
 
     expect(updateConversationSettings).toHaveBeenCalledWith("conv-1", {
       modelId: "gpt-5-mini",
       permissionMode: "request_approval",
     });
-    expect(setPluginEnablements).toHaveBeenCalledWith(
-      { type: "conversation", id: "conv-1" },
-      [{ pluginId: "formatter", versionId: "v2" }],
-    );
   });
 
-  it("serializes model, permission, and Conversation plugin writes through one queue", async () => {
+  it("serializes model and permission writes through one queue", async () => {
     const user = userEvent.setup();
     const first = deferred<void>();
     const second = deferred<void>();
-    const third = deferred<void>();
     const updateConversationSettings = vi
       .fn<AinOneApi["updateConversationSettings"]>()
       .mockImplementationOnce(async () => first.promise)
       .mockImplementationOnce(async () => second.promise);
-    const setPluginEnablements = vi
-      .fn<AinOneApi["setPluginEnablements"]>()
-      .mockImplementationOnce(async () => third.promise);
-    render(<App api={fakeApi({ updateConversationSettings, setPluginEnablements })} />);
+    render(<App api={fakeApi({ updateConversationSettings })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
+    await chooseModel(user, "gpt-5-mini");
     await user.click(screen.getByRole("button", { name: "Permission mode" }));
     await user.click(screen.getByRole("menuitemradio", { name: "Full access" }));
-    await user.selectOptions(screen.getByLabelText("Plugins"), "formatter@v2");
 
     expect(updateConversationSettings).toHaveBeenCalledTimes(1);
-    expect(setPluginEnablements).not.toHaveBeenCalled();
     expect(updateConversationSettings).toHaveBeenNthCalledWith(1, "conv-1", {
       modelId: "gpt-5-mini",
       permissionMode: "request_approval",
@@ -1036,41 +1387,23 @@ describe("web app", () => {
       modelId: "gpt-5-mini",
       permissionMode: "full_access",
     });
-    expect(setPluginEnablements).not.toHaveBeenCalled();
-
     second.resolve();
-    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(1));
-    expect(setPluginEnablements).toHaveBeenCalledWith(
-      { type: "conversation", id: "conv-1" },
-      [{ pluginId: "formatter", versionId: "v2" }],
-    );
-    third.resolve();
+    await second.promise;
   });
 
   it("waits for every queued configuration write before sending a message", async () => {
     const user = userEvent.setup();
     const settingsWrite = deferred<void>();
-    const pluginWrite = deferred<void>();
     const updateConversationSettings = vi.fn(async () => settingsWrite.promise);
-    const setPluginEnablements = vi.fn(async () => pluginWrite.promise);
     const queueMessage = vi.fn(async () => undefined);
-    render(
-      <App
-        api={fakeApi({ updateConversationSettings, setPluginEnablements, queueMessage })}
-      />,
-    );
+    render(<App api={fakeApi({ updateConversationSettings, queueMessage })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
-    await user.selectOptions(screen.getByLabelText("Plugins"), "formatter@v2");
+    await chooseModel(user, "gpt-5-mini");
     await user.type(screen.getByLabelText("Message"), "use current settings");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
     expect(queueMessage).not.toHaveBeenCalled();
     settingsWrite.resolve();
-    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(1));
-    expect(queueMessage).not.toHaveBeenCalled();
-
-    pluginWrite.resolve();
     await vi.waitFor(() =>
       expect(queueMessage).toHaveBeenCalledWith("conv-1", "use current settings"),
     );
@@ -1083,7 +1416,7 @@ describe("web app", () => {
     const queueMessage = vi.fn(async () => undefined);
     render(<App api={fakeApi({ updateConversationSettings, queueMessage })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
+    await chooseModel(user, "gpt-5-mini");
     const message = screen.getByLabelText("Message");
     await user.type(message, "keep after settings failure");
     await user.click(screen.getByRole("button", { name: "Send message" }));
@@ -1096,31 +1429,30 @@ describe("web app", () => {
     expect(message).toHaveValue("keep after settings failure");
   });
 
-  it("does not let a successful plugin write hide a failed conversation settings write", async () => {
+  it("keeps the draft and does not send when a global Plugin write fails", async () => {
     const user = userEvent.setup();
-    const updateConversationSettings = vi.fn(async () => {
-      throw new Error("settings unavailable");
+    const setPluginEnablements = vi.fn(async () => {
+      throw new Error("plugin settings unavailable");
     });
-    const setPluginEnablements = vi.fn(async () => undefined);
     const queueMessage = vi.fn(async () => undefined);
-    render(
-      <App
-        api={fakeApi({ updateConversationSettings, setPluginEnablements, queueMessage })}
-      />,
-    );
+    render(<App api={fakeApi({
+      setPluginEnablements,
+      queueMessage,
+      installedPlugins: [plugin("formatter@v2", "formatter", "v2")],
+    })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
-    await user.selectOptions(screen.getByLabelText("Plugins"), "formatter@v2");
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable formatter" }));
+    expect(await screen.findByRole("alert")).toHaveTextContent("plugin settings unavailable");
+    await user.click(screen.getByRole("button", { name: "Close Settings" }));
+
     const message = screen.getByLabelText("Message");
-    await user.type(message, "do not send stale settings");
+    await user.type(message, "keep after plugin failure");
     await user.click(screen.getByRole("button", { name: "Send message" }));
 
-    expect(await screen.findByRole("alert")).toHaveTextContent(
-      "Could not update conversation settings",
-    );
-    expect(setPluginEnablements).toHaveBeenCalledOnce();
     expect(queueMessage).not.toHaveBeenCalled();
-    expect(message).toHaveValue("do not send stale settings");
+    expect(message).toHaveValue("keep after plugin failure");
   });
 
   it("does not let one Conversation's failed settings write block another Conversation", async () => {
@@ -1137,7 +1469,7 @@ describe("web app", () => {
       />,
     );
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
+    await chooseModel(user, "gpt-5-mini");
     expect(await screen.findByRole("alert")).toHaveTextContent(
       "Could not update conversation settings",
     );
@@ -1149,6 +1481,32 @@ describe("web app", () => {
     await vi.waitFor(() =>
       expect(queueMessage).toHaveBeenCalledWith("conv-2", "send from two"),
     );
+  });
+
+  it("does not let one Conversation's pending settings write block another Conversation", async () => {
+    const user = userEvent.setup();
+    const firstConversationWrite = deferred<void>();
+    const updateConversationSettings = vi.fn(async (conversationId: string) => {
+      if (conversationId === "conv-1") {
+        await firstConversationWrite.promise;
+      }
+    });
+    const queueMessage = vi.fn(async () => undefined);
+    render(
+      <App
+        api={fakeApi({ twoProjects: true, updateConversationSettings, queueMessage })}
+      />,
+    );
+
+    await chooseModel(user, "gpt-5-mini");
+    await user.click(screen.getByRole("button", { name: "Conversation Two" }));
+    await user.type(screen.getByLabelText("Message"), "send while one is pending");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    await vi.waitFor(() =>
+      expect(queueMessage).toHaveBeenCalledWith("conv-2", "send while one is pending"),
+    );
+    firstConversationWrite.resolve();
   });
 
   it("restores a Conversation's configuration error when Send remains blocked", async () => {
@@ -1165,7 +1523,7 @@ describe("web app", () => {
       />,
     );
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
+    await chooseModel(user, "gpt-5-mini");
     expect(await screen.findByRole("alert")).toHaveTextContent("settings unavailable");
     await user.click(screen.getByRole("button", { name: "Conversation Two" }));
     await user.click(screen.getByRole("button", { name: "Main Conversation" }));
@@ -1189,7 +1547,7 @@ describe("web app", () => {
     const queueMessage = vi.fn(async () => undefined);
     render(<App api={fakeApi({ updateConversationSettings, queueMessage })} />);
 
-    await user.selectOptions(await screen.findByLabelText("Model"), "gpt-5-mini");
+    await chooseModel(user, "gpt-5-mini");
     await user.type(screen.getByLabelText("Message"), "wait for both writes");
     await user.click(screen.getByRole("button", { name: "Send message" }));
     await user.click(screen.getByRole("button", { name: "Permission mode" }));
@@ -1200,52 +1558,6 @@ describe("web app", () => {
     expect(queueMessage).not.toHaveBeenCalled();
     second.resolve();
     await vi.waitFor(() => expect(queueMessage).toHaveBeenCalledOnce());
-  });
-
-  it("serializes Conversation replace-all plugin writes so the latest complete set wins", async () => {
-    const first = deferred<void>();
-    const second = deferred<void>();
-    const setPluginEnablements = vi
-      .fn<AinOneApi["setPluginEnablements"]>()
-      .mockImplementationOnce(async () => first.promise)
-      .mockImplementationOnce(async () => second.promise);
-    render(
-      <App
-        api={fakeApi({
-          setPluginEnablements,
-          pluginState: {
-            enabledPluginIds: ["formatter@v2"],
-            availablePlugins: [
-              plugin("formatter@v2", "formatter", "v2"),
-              plugin("reviewer@v1", "reviewer", "v1"),
-            ],
-          },
-        })}
-      />,
-    );
-
-    const select = await screen.findByLabelText<HTMLSelectElement>("Plugins");
-    selectOptions(select, ["reviewer@v1"]);
-    selectOptions(select, ["formatter@v2", "reviewer@v1"]);
-
-    expect(setPluginEnablements).toHaveBeenCalledTimes(1);
-    expect(setPluginEnablements).toHaveBeenNthCalledWith(
-      1,
-      { type: "conversation", id: "conv-1" },
-      [{ pluginId: "reviewer", versionId: "v1" }],
-    );
-
-    first.resolve();
-    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(2));
-    expect(setPluginEnablements).toHaveBeenNthCalledWith(
-      2,
-      { type: "conversation", id: "conv-1" },
-      [
-        { pluginId: "formatter", versionId: "v2" },
-        { pluginId: "reviewer", versionId: "v1" },
-      ],
-    );
-    second.resolve();
   });
 
   it("serializes rapid Plugin Settings changes and sends the latest complete set", async () => {
@@ -1268,9 +1580,10 @@ describe("web app", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Plugin Settings" }));
-    await user.click(screen.getByRole("checkbox", { name: "Enable formatter v2" }));
-    await user.click(screen.getByRole("checkbox", { name: "Enable reviewer v1" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable formatter" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable reviewer" }));
 
     await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(1));
     expect(setPluginEnablements).toHaveBeenNthCalledWith(
@@ -1292,6 +1605,61 @@ describe("web app", () => {
     second.resolve();
   });
 
+  it("changes future Plugin enablements while a Turn is active", async () => {
+    const user = userEvent.setup();
+    const setPluginEnablements = vi.fn(async () => undefined);
+    render(<App api={fakeApi({
+      activeTurn: true,
+      setPluginEnablements,
+      installedPlugins: [plugin("formatter@v2", "formatter", "v2")],
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    const toggle = screen.getByRole("checkbox", { name: "Enable formatter" });
+    expect(toggle).toBeEnabled();
+    await user.click(toggle);
+    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledWith(
+      { type: "global" },
+      [{ pluginId: "formatter", versionId: "v2" }],
+    ));
+  });
+
+  it("reconciles the latest same-scope Plugin state after an earlier write fails", async () => {
+    const user = userEvent.setup();
+    const first = deferred<void>();
+    const second = deferred<void>();
+    let persisted: Array<{ pluginId: string; versionId: string }> = [];
+    const setPluginEnablements = vi
+      .fn<AinOneApi["setPluginEnablements"]>()
+      .mockImplementationOnce(async () => first.promise)
+      .mockImplementationOnce(async (_scope, versions) => {
+        await second.promise;
+        persisted = versions;
+      });
+    render(<App api={fakeApi({
+      installedPlugins: [
+        plugin("formatter@v2", "formatter", "v2"),
+        plugin("reviewer@v1", "reviewer", "v1"),
+      ],
+      getPluginEnablements: async () => persisted,
+      setPluginEnablements,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable formatter" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable reviewer" }));
+    first.reject(new Error("first write failed"));
+    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(2));
+    second.resolve();
+
+    await vi.waitFor(() => {
+      expect(screen.getByRole("checkbox", { name: "Enable formatter" })).toBeChecked();
+      expect(screen.getByRole("checkbox", { name: "Enable reviewer" })).toBeChecked();
+    });
+  });
+
   it("clears and disables Plugin Settings while a new scope is loading", async () => {
     const user = userEvent.setup();
     const projectEnablements = deferred<Array<{ pluginId: string; versionId: string }>>();
@@ -1307,15 +1675,16 @@ describe("web app", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Plugin Settings" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
     await user.selectOptions(screen.getByLabelText("Plugin scope"), "project");
 
-    expect(screen.getByRole("checkbox", { name: "Enable formatter v2" })).toBeDisabled();
+    expect(screen.getByRole("checkbox", { name: "Enable formatter" })).toBeDisabled();
     expect(setPluginEnablements).not.toHaveBeenCalled();
 
     projectEnablements.resolve([{ pluginId: "formatter", versionId: "v2" }]);
     await vi.waitFor(() =>
-      expect(screen.getByRole("checkbox", { name: "Enable formatter v2" })).toBeChecked(),
+      expect(screen.getByRole("checkbox", { name: "Enable formatter" })).toBeChecked(),
     );
   });
 
@@ -1334,10 +1703,11 @@ describe("web app", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Plugin Settings" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
     expect(await screen.findByRole("alert")).toHaveTextContent("enablements unavailable");
 
-    const checkbox = screen.getByRole("checkbox", { name: "Enable formatter v2" });
+    const checkbox = screen.getByRole("checkbox", { name: "Enable formatter" });
     expect(checkbox).toBeDisabled();
     await user.click(checkbox);
     expect(setPluginEnablements).not.toHaveBeenCalled();
@@ -1364,16 +1734,17 @@ describe("web app", () => {
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Plugin Settings" }));
-    await user.click(screen.getByRole("checkbox", { name: "Enable formatter v2" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    await user.click(screen.getByRole("checkbox", { name: "Enable formatter" }));
     await user.selectOptions(screen.getByLabelText("Plugin scope"), "project");
     await vi.waitFor(() =>
-      expect(screen.getByRole("checkbox", { name: "Enable reviewer v1" })).toBeChecked(),
+      expect(screen.getByRole("checkbox", { name: "Enable reviewer" })).toBeChecked(),
     );
 
     globalWrite.reject(new Error("global write failed"));
     await vi.waitFor(() => expect(screen.getByRole("alert")).toBeVisible());
-    expect(screen.getByRole("checkbox", { name: "Enable reviewer v1" })).toBeChecked();
+    expect(screen.getByRole("checkbox", { name: "Enable reviewer" })).toBeChecked();
   });
 
   it("keeps only one enabled version of a plugin", async () => {
@@ -1384,18 +1755,22 @@ describe("web app", () => {
         api={fakeApi({
           setPluginEnablements,
           installedPlugins: [
-            plugin("formatter@v1", "formatter", "v1"),
-            plugin("formatter@v2", "formatter", "v2"),
+            plugin("formatter@v1", "formatter", "v1", "skill", "1.0.0"),
+            plugin("formatter@v2", "formatter", "v2", "skill", "2.0.0"),
           ],
         })}
       />,
     );
 
-    await user.click(await screen.findByRole("button", { name: "Plugin Settings" }));
-    await user.click(screen.getByRole("checkbox", { name: "Enable formatter v1" }));
-    await user.click(screen.getByRole("checkbox", { name: "Enable formatter v2" }));
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    expect(screen.getAllByText("formatter")).toHaveLength(1);
+    expect(screen.getByText("2.0.0")).toBeVisible();
+    expect(screen.queryByText("1.0.0")).toBeNull();
+    expect(screen.queryByRole("combobox", { name: /Version for formatter/ })).toBeNull();
+    await user.click(screen.getByRole("checkbox", { name: "Enable formatter" }));
 
-    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(2));
+    await vi.waitFor(() => expect(setPluginEnablements).toHaveBeenCalledTimes(1));
     expect(setPluginEnablements).toHaveBeenLastCalledWith(
       { type: "global" },
       [{ pluginId: "formatter", versionId: "v2" }],
@@ -1435,17 +1810,250 @@ describe("web app", () => {
     expect(message).toHaveValue("next message");
   });
 
-  it("opens Agent and Plugin settings without unmounting either Canvas", async () => {
+  it("opens Agent and Plugin settings from the single bottom Settings entry", async () => {
     const user = userEvent.setup();
     render(<App api={fakeApi()} />);
 
-    await user.click(await screen.findByRole("button", { name: "Agent Settings" }));
+    const settingsButtons = await screen.findAllByRole("button", { name: "Settings" });
+    expect(settingsButtons).toHaveLength(1);
+    expect(screen.queryByRole("button", { name: "Agent Settings" })).toBeNull();
+    expect(screen.queryByRole("button", { name: "Plugin Settings" })).toBeNull();
+
+    await user.click(settingsButtons[0]!);
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "General settings" })).toBeVisible();
+
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
     expect(screen.getByRole("heading", { name: "Agent Products" })).toBeVisible();
     expect(screen.getByTestId("conversation-canvas")).toBeInTheDocument();
-    expect(screen.getByTestId("graph-canvas")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-canvas")).not.toBeInTheDocument();
 
-    await user.click(screen.getByRole("button", { name: "Plugin Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
     expect(screen.getByRole("heading", { name: "Plugins" })).toBeVisible();
+  });
+
+  it("uses readable icons for workspace search and project creation", async () => {
+    render(<App api={fakeApi()} />);
+
+    expect((await screen.findByRole("button", { name: "Search projects" })).querySelector("svg")).not.toBeNull();
+    expect(screen.getByRole("button", { name: "Open Project Folder" }).querySelector("svg")).not.toBeNull();
+  });
+
+  it("closes Settings when clicking its backdrop", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    expect(screen.getByRole("dialog", { name: "Settings" })).toBeVisible();
+    await user.pointer({ keys: "[MouseLeft]", target: screen.getByRole("button", { name: "Dismiss Settings" }) });
+    expect(screen.queryByRole("dialog", { name: "Settings" })).toBeNull();
+  });
+
+  it("switches the workspace language and persists the preference", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByLabelText("Language"), "zh");
+
+    expect(globalThis.localStorage.getItem("ain-one:language")).toBe("zh");
+    expect(document.documentElement.lang).toBe("zh-CN");
+    expect(screen.getByRole("dialog", { name: "设置" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "通用设置" })).toBeVisible();
+    expect(screen.getByRole("button", { name: /新对话/ })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "项目" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "对话" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Main Conversation" }).parentElement?.querySelector(".agent-badge")).toHaveTextContent("Codex");
+
+    await user.click(within(screen.getByRole("navigation", { name: "设置分类" })).getByRole("button", { name: "Agent" }));
+    expect(screen.getByRole("heading", { name: "Agent 设置" })).toBeVisible();
+    await user.click(screen.getByRole("button", { name: "插件" }));
+    expect(screen.getByRole("heading", { name: "插件" })).toBeVisible();
+  });
+
+  it("uses the preferred default permission for new conversations when supported", async () => {
+    const user = userEvent.setup();
+    const createConversation = vi.fn(async () => ({
+      id: "created",
+      projectId: "project-1",
+      agentProductId: "codex" as const,
+      modelId: null,
+      permissionMode: "full_access" as const,
+      queuePaused: false,
+      createdAt: "2026-08-24T00:00:00.000Z",
+      updatedAt: "2026-08-24T00:00:00.000Z",
+    }));
+    render(<App api={fakeApi({ createConversation })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.selectOptions(screen.getByLabelText("Default permission mode"), "full_access");
+    await user.click(screen.getByRole("button", { name: "Close Settings" }));
+    await user.click(screen.getByRole("button", { name: /New chat/ }));
+    await user.type(screen.getByLabelText("Message"), "start");
+    await user.click(screen.getByRole("button", { name: "Send message" }));
+
+    expect(createConversation).toHaveBeenCalledWith(
+      expect.objectContaining({ permissionMode: "full_access" }),
+    );
+  });
+
+  it("applies appearance and blocks busy Enter while analyzing", async () => {
+    const user = userEvent.setup();
+    const queueMessage = vi.fn(async () => undefined);
+    render(<App api={fakeApi({ activeTurn: true, queueMessage })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("radio", { name: "Dark" }));
+    expect(document.documentElement.dataset.theme).toBe("dark");
+    expect(globalThis.localStorage.getItem("ain-one:appearance")).toBe("dark");
+    await user.click(screen.getByRole("button", { name: "Close Settings" }));
+
+    const message = screen.getByLabelText("Message");
+    await user.type(message, "next task{enter}");
+    expect(queueMessage).not.toHaveBeenCalled();
+  });
+
+  it("keeps Graph parallel to Chat instead of exposing it as a Chat canvas tab", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    expect(await screen.findByRole("button", { name: "Conversation" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Trajectory" })).toBeVisible();
+    expect(screen.queryByRole("button", { name: "Graph" })).not.toBeInTheDocument();
+    expect(screen.getByTestId("conversation-canvas")).toBeInTheDocument();
+    expect(screen.getByTestId("trajectory-canvas")).toBeInTheDocument();
+    expect(screen.queryByTestId("graph-canvas")).not.toBeInTheDocument();
+
+    await user.click(screen.getByRole("button", { name: "Trajectory" }));
+    expect(within(screen.getByTestId("trajectory-canvas")).getByRole("region", { name: "Trajectory timeline" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "New graph" })).toBeVisible();
+  });
+
+  it("creates one Graph per click sequence and does not override a later Chat selection", async () => {
+    const user = userEvent.setup();
+    const created = deferred<Awaited<ReturnType<AinOneApi["createGraph"]>>>();
+    const api = fakeApi();
+    api.createGraph = vi.fn(async () => created.promise);
+    render(<App api={api} />);
+
+    const create = await screen.findByRole("button", { name: "New graph" });
+    await user.dblClick(create);
+    expect(api.createGraph).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Main Conversation" }));
+    created.resolve({
+      id: "graph-late", projectId: "project-1", name: "Late graph", description: "",
+      definition: { nodes: [], edges: [], start: [], end: [] }, viewport: { x: 0, y: 0, zoom: 1 }, positions: {},
+      createdAt: "2026-08-27T00:00:00.000Z", updatedAt: "2026-08-27T00:00:00.000Z",
+    });
+
+    expect(await screen.findByRole("button", { name: "Late graph" })).toBeVisible();
+    expect(screen.getByRole("heading", { name: "Main Conversation" })).toBeVisible();
+  });
+
+  it("collapses and restores the desktop sidebar", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    const sidebar = (await screen.findByLabelText("Projects and conversations")).closest(
+      ".workspace__left",
+    );
+    await user.click(screen.getByRole("button", { name: "Collapse sidebar" }));
+    expect(sidebar).toHaveAttribute("data-collapsed", "true");
+    expect(screen.getByRole("button", { name: "New chat" })).toHaveTextContent(/^＋$/);
+    await user.click(screen.getByRole("button", { name: "Expand sidebar" }));
+    expect(sidebar).toHaveAttribute("data-collapsed", "false");
+  });
+
+  it("collapses and expands a Project's Conversation list from its name", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    const project = await screen.findByRole("button", { name: "Ain One" });
+    expect(project).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Main Conversation" })).toBeVisible();
+
+    await user.click(project);
+    expect(project).toHaveAttribute("aria-expanded", "false");
+    expect(screen.queryByRole("button", { name: "Main Conversation" })).toBeNull();
+
+    await user.click(project);
+    expect(project).toHaveAttribute("aria-expanded", "true");
+    expect(screen.getByRole("button", { name: "Main Conversation" })).toBeVisible();
+  });
+
+  it("places Archived after Plugins in settings navigation", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    const nav = screen.getByRole("navigation", { name: "Settings sections" });
+    expect(within(nav).getAllByRole("button").map((button) => button.textContent)).toEqual([
+      "General", "Agent", "Plugins", "Archived",
+    ]);
+    expect(within(nav).getByRole("button", { name: "Archived" })).toHaveClass(
+      "app-settings__nav-item",
+    );
+  });
+
+  it("closes project and conversation menus when clicking outside them", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi()} />);
+
+    await user.click(await screen.findByRole("button", { name: "Manage project Ain One" }));
+    expect(screen.getByRole("button", { name: "Archive project" })).toBeVisible();
+    await user.click(screen.getByRole("heading", { name: "Projects" }));
+    expect(screen.queryByRole("button", { name: "Archive project" })).toBeNull();
+
+    await user.click(screen.getByRole("button", { name: "Manage conversation Main Conversation" }));
+    expect(screen.getByRole("button", { name: "Archive conversation" })).toBeVisible();
+    await user.click(screen.getByTestId("conversation-canvas"));
+    expect(screen.queryByRole("button", { name: "Archive conversation" })).toBeNull();
+  });
+
+  it("removes an archived Conversation immediately after a successful action", async () => {
+    const user = userEvent.setup();
+    const archiveConversation = vi.fn(async (id: string, archived: boolean) => conversationDto(id, archived ? new Date().toISOString() : null));
+    render(<App api={fakeApi({ archiveConversation })} />);
+    await user.click(await screen.findByRole("button", { name: /Manage conversation Main Conversation/ }));
+    await user.click(screen.getByRole("button", { name: "Archive conversation" }));
+    expect(archiveConversation).toHaveBeenCalledWith("conv-1", true);
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Main Conversation" })).toBeNull());
+  });
+
+  it("permanently deletes an archived Conversation from Archived settings", async () => {
+    const user = userEvent.setup();
+    const deleteArchivedConversation = vi.fn(async () => undefined);
+    render(<App api={fakeApi({
+      loadArchived: async () => ({
+        projects: [],
+        conversations: [conversationDto("archived-conversation", "2026-08-24T00:00:00.000Z")],
+      }),
+      deleteArchivedConversation,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Archived" }));
+    await user.click(await screen.findByRole("button", { name: "Delete Main Conversation permanently" }));
+    await user.click(screen.getByRole("button", { name: "Confirm permanent deletion" }));
+    expect(deleteArchivedConversation).toHaveBeenCalledWith("archived-conversation");
+    await vi.waitFor(() => expect(screen.queryByRole("button", { name: "Delete Main Conversation permanently" })).toBeNull());
+  });
+
+  it("separates Skills and MCP inside Plugin settings", async () => {
+    const user = userEvent.setup();
+    render(<App api={fakeApi({
+      installedPlugins: [
+        plugin("reviewer@v1", "reviewer", "v1", "skill"),
+        plugin("filesystem@v1", "filesystem", "v1", "mcp"),
+      ],
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Settings" }));
+    await user.click(screen.getByRole("button", { name: "Plugins" }));
+    expect(screen.getByText("reviewer")).toBeVisible();
+    expect(screen.queryByText("filesystem")).toBeNull();
+    await user.click(screen.getByRole("button", { name: "MCP" }));
+    expect(screen.getByText("filesystem")).toBeVisible();
+    expect(screen.queryByText("reviewer")).toBeNull();
   });
 
   it("shows Agent Settings catalog for the selected Project", async () => {
@@ -1458,15 +2066,148 @@ describe("web app", () => {
     render(<App api={fakeApi({ twoProjects: true, agents: [codex] })} />);
 
     await user.click(await screen.findByRole("button", { name: "Project Two" }));
-    await user.click(screen.getByRole("button", { name: "Agent Settings" }));
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
 
     expect(
       within(screen.getByRole("region", { name: "Codex catalog models" })).getByText(
         "second-model",
       ),
     ).toBeVisible();
-    expect(screen.getByText("Full access")).toBeVisible();
     expect(screen.queryByText("first-model")).toBeNull();
+  });
+
+  it("loads the selected Project catalog before composing a new Conversation", async () => {
+    const user = userEvent.setup();
+    const loadAgentCatalog = vi.fn(async () => ({
+      models: ["second-model"],
+      permissionModes: ["full_access" as const],
+    }));
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    render(<App api={fakeApi({ twoProjects: true, agents: [codex], loadAgentCatalog })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Project Two" }));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+
+    expect(loadAgentCatalog).toHaveBeenCalledWith("codex", "project-2");
+    await user.click(await screen.findByRole("button", { name: "Model" }));
+    expect(screen.getByRole("menuitemradio", { name: "second-model" })).toBeVisible();
+    expect(screen.queryByRole("menuitemradio", { name: "first-model" })).toBeNull();
+  });
+
+  it("reloads the selected Project catalog after a workspace refresh replaces Agent summaries", async () => {
+    const user = userEvent.setup();
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    codex.projectCatalogs = { "project-1": codex.catalog };
+    const loadAgentCatalog = vi.fn(async () => ({
+      models: ["second-model"],
+      permissionModes: ["full_access" as const],
+    }));
+    render(<App api={fakeApi({
+      twoProjects: true,
+      agents: [codex],
+      loadAgentCatalog,
+      restartWorkspace: async () => undefined,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Project Two" }));
+    await vi.waitFor(() => expect(loadAgentCatalog).toHaveBeenCalledTimes(1));
+    await user.click(screen.getByRole("button", { name: "Restart project" }));
+
+    await vi.waitFor(() => expect(loadAgentCatalog).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    await user.click(screen.getByRole("button", { name: "Model" }));
+    expect(screen.getByRole("menuitemradio", { name: "second-model" })).toBeVisible();
+    expect(screen.queryByRole("menuitemradio", { name: "first-model" })).toBeNull();
+  });
+
+  it("does not let a pending new Conversation selection replace a newer Project selection", async () => {
+    const user = userEvent.setup();
+    const catalog = deferred<{
+      models: string[];
+      permissionModes: PermissionMode[];
+    }>();
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    codex.projectCatalogs = { "project-1": codex.catalog };
+    render(<App api={fakeApi({
+      twoProjects: true,
+      agents: [codex],
+      loadAgentCatalog: async () => catalog.promise,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Project Two" }));
+    await user.click(screen.getByRole("button", { name: "New chat" }));
+    await user.click(screen.getByRole("button", { name: "Project One" }));
+    await act(async () => catalog.resolve({
+      models: ["second-model"],
+      permissionModes: ["request_approval"],
+    }));
+
+    expect(screen.getByRole("heading", { name: "Main Conversation" })).toBeVisible();
+    expect(screen.getByRole("button", { name: "Main Conversation" })).toHaveAttribute("data-active", "true");
+  });
+
+  it("reports a selected Project catalog failure without an unhandled rejection", async () => {
+    const user = userEvent.setup();
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    codex.projectCatalogs = {
+      "project-1": codex.catalog,
+    };
+    render(<App api={fakeApi({
+      twoProjects: true,
+      agents: [codex],
+      loadAgentCatalog: async () => {
+        throw new Error("catalog unavailable");
+      },
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Project Two" }));
+
+    expect(await screen.findByRole("alert")).toHaveTextContent(
+      "Could not load Agent catalog: catalog unavailable",
+    );
+    expect(screen.getByRole("button", { name: "New chat" })).toBeVisible();
+  });
+
+  it("retries a catalog response that reports a transient error", async () => {
+    const user = userEvent.setup();
+    const codex = agent("codex", "Codex", "available", ["first-model"]);
+    codex.projectCatalogs = { "project-1": codex.catalog };
+    const failedCatalog = deferred<{
+      models: string[];
+      permissionModes: PermissionMode[];
+      error: string;
+    }>();
+    const loadAgentCatalog = vi.fn()
+      .mockImplementationOnce(async () => failedCatalog.promise)
+      .mockResolvedValueOnce({
+        models: ["recovered-model"],
+        permissionModes: ["request_approval" as const],
+      });
+    render(<App api={fakeApi({
+      twoProjects: true,
+      agents: [codex],
+      loadAgentCatalog,
+    })} />);
+
+    await user.click(await screen.findByRole("button", { name: "Project Two" }));
+    await vi.waitFor(() => expect(loadAgentCatalog).toHaveBeenCalledOnce());
+    await act(async () => failedCatalog.resolve({
+      models: [],
+      permissionModes: [],
+      error: "Could not load Agent catalog",
+    }));
+    await act(async () => {
+      await new Promise((resolve) => setTimeout(resolve, 20));
+    });
+    expect(loadAgentCatalog).toHaveBeenCalledOnce();
+    await user.click(screen.getByRole("button", { name: "Project One" }));
+    await user.click(screen.getByRole("button", { name: "Project Two" }));
+
+    await vi.waitFor(() => expect(loadAgentCatalog).toHaveBeenCalledTimes(2));
+    await user.click(screen.getByRole("button", { name: "Settings" }));
+    await user.click(within(screen.getByRole("navigation", { name: "Settings sections" })).getByRole("button", { name: "Agent" }));
+    expect(within(screen.getByRole("region", { name: "Codex catalog models" })).getByText("recovered-model")).toBeVisible();
   });
 });
 
@@ -1480,14 +2221,18 @@ function fakeApi(
     cancelActiveTurn?: (conversationId: string) => Promise<void>;
     continueConversation?: (conversationId: string) => Promise<void>;
     retryInterruptedTurn?: (conversationId: string, turnId: string) => Promise<void>;
+    restartWorkspace?: () => Promise<void>;
     queueError?: Error;
-    inspectorError?: Error;
     twoProjects?: boolean;
-    initialInspector?: InspectorState;
-    inspectorByProject?: Record<string, InspectorState | Promise<InspectorState>>;
-    listProjectFiles?: AinOneApi["listProjectFiles"];
     pickProject?: AinOneApi["pickProject"];
     createConversation?: AinOneApi["createConversation"];
+    renameProject?: NonNullable<AinOneApi["renameProject"]>;
+    archiveProject?: NonNullable<AinOneApi["archiveProject"]>;
+    archiveConversation?: NonNullable<AinOneApi["archiveConversation"]>;
+    deleteArchivedConversation?: NonNullable<AinOneApi["deleteArchivedConversation"]>;
+    forkConversation?: NonNullable<AinOneApi["forkConversation"]>;
+    loadArchived?: NonNullable<AinOneApi["loadArchived"]>;
+    loadAgentCatalog?: NonNullable<AinOneApi["loadAgentCatalog"]>;
     queueMessage?: AinOneApi["queueMessage"];
     deletePendingMessage?: AinOneApi["deletePendingMessage"];
     updateConversationSettings?: AinOneApi["updateConversationSettings"];
@@ -1506,7 +2251,6 @@ function fakeApi(
     initialQueuedMessages: input.initialQueuedMessages ?? [],
     permissionModes: input.permissionModes,
     twoProjects: input.twoProjects ?? false,
-    initialInspector: input.initialInspector,
     pluginState: input.pluginState,
     installedPlugins: input.installedPlugins,
     agents: input.agents,
@@ -1531,6 +2275,7 @@ function fakeApi(
         ),
       };
     },
+    loadAgentCatalog: input.loadAgentCatalog,
     async queueMessage(conversationId, content) {
       await input.queueMessage?.(conversationId, content);
       if (input.queueError) {
@@ -1549,6 +2294,12 @@ function fakeApi(
         queued.splice(index, 1);
       }
     },
+    async resolveUncertainMessage() {
+      return undefined;
+    },
+    async respondToPermission() {
+      return undefined;
+    },
     subscribeConversationEvents() {
       return () => undefined;
     },
@@ -1560,6 +2311,9 @@ function fakeApi(
     },
     async retryInterruptedTurn(conversationId, turnId) {
       await input.retryInterruptedTurn?.(conversationId, turnId);
+    },
+    async restartWorkspace() {
+      await input.restartWorkspace?.();
     },
     async openProject(path) {
       return {
@@ -1588,6 +2342,44 @@ function fakeApi(
         updatedAt: "2026-08-23T00:00:00.000Z",
       };
     },
+    async renameProject(projectId, name) {
+      if (input.renameProject) return input.renameProject(projectId, name);
+      return {
+        id: projectId,
+        path: "/tmp/ain-one",
+        name,
+        createdAt: "2026-08-23T00:00:00.000Z",
+        updatedAt: "2026-08-23T00:00:00.000Z",
+      };
+    },
+    async archiveProject(projectId, archived) {
+      if (input.archiveProject) return input.archiveProject(projectId, archived);
+      return {
+        id: projectId,
+        path: "/tmp/ain-one",
+        name: "Ain One",
+        archivedAt: archived ? new Date().toISOString() : null,
+        createdAt: "2026-08-23T00:00:00.000Z",
+        updatedAt: "2026-08-24T00:00:00.000Z",
+      };
+    },
+    async archiveConversation(conversationId, archived) {
+      if (input.archiveConversation) return input.archiveConversation(conversationId, archived);
+      return conversationDto(conversationId, archived ? new Date().toISOString() : null);
+    },
+    async deleteArchivedConversation(conversationId) {
+      await input.deleteArchivedConversation?.(conversationId);
+    },
+    async forkConversation(conversationId) {
+      if (input.forkConversation) return input.forkConversation(conversationId);
+      return {
+        ...conversationDto(`${conversationId}-branch`, null),
+        title: `${conversation.title} (branch)`,
+      };
+    },
+    async loadArchived() {
+      return await input.loadArchived?.() ?? { projects: [], conversations: [] };
+    },
     async updateConversationSettings(conversationId, settings) {
       await input.updateConversationSettings?.(conversationId, settings);
     },
@@ -1600,9 +2392,6 @@ function fakeApi(
     async refreshPluginImports() {
       return undefined;
     },
-    async acceptPluginCandidate() {
-      return undefined;
-    },
     async repairPluginMaterialization() {
       return undefined;
     },
@@ -1612,15 +2401,29 @@ function fakeApi(
     async setPluginEnablements(scope, versions) {
       await input.setPluginEnablements?.(scope, versions);
     },
-    async listProjectFiles(projectId, selection) {
-      if (input.listProjectFiles) {
-        return input.listProjectFiles(projectId, selection);
-      }
-      if (input.inspectorError) {
-        throw input.inspectorError;
-      }
-      return await input.inspectorByProject?.[projectId] ?? state.inspector;
-    },
+    async listGraphs() { return []; },
+    async createGraph() { throw new Error("not used"); },
+    async getGraph() { throw new Error("not used"); },
+    async saveGraph() { throw new Error("not used"); },
+    async deleteGraph() { return undefined; },
+    async runGraph() { throw new Error("not used"); },
+    async getGraphRun() { throw new Error("not used"); },
+    async cancelGraphRun() { return false; },
+  };
+}
+
+function conversationDto(id: string, archivedAt: string | null): Conversation {
+  return {
+    id,
+    projectId: "project-1",
+    title: "Main Conversation",
+    agentProductId: "codex",
+    modelId: "gpt-5",
+    permissionMode: "request_approval",
+    queuePaused: false,
+    archivedAt,
+    createdAt: "2026-08-23T00:00:00.000Z",
+    updatedAt: "2026-08-24T00:00:00.000Z",
   };
 }
 
@@ -1631,7 +2434,6 @@ function createWorkspaceState(input: {
   initialQueuedMessages: string[];
   permissionModes?: PermissionMode[];
   twoProjects: boolean;
-  initialInspector?: InspectorState;
   pluginState?: Pick<ConversationView, "enabledPluginIds" | "availablePlugins">;
   installedPlugins?: WorkspaceState["installedPlugins"];
   agents?: WorkspaceState["agents"];
@@ -1668,8 +2470,6 @@ function createWorkspaceState(input: {
     events: input.includeAllEventTypes ? allEventTypes() : [],
   };
 
-  const inspector = input.initialInspector ?? createInspector("src/index.ts", ".");
-
   const conversations = input.twoProjects
     ? [
         conversation,
@@ -1693,7 +2493,6 @@ function createWorkspaceState(input: {
     conversations,
     selectedConversationId: conversation.id,
     conversation,
-    inspector,
     agents: input.agents ?? [
       {
         id: "codex",
@@ -1717,7 +2516,6 @@ function createWorkspaceState(input: {
       },
     ],
     installedPlugins: input.installedPlugins ?? [],
-    pluginCandidates: [],
     pluginError: null,
   };
 }
@@ -1737,31 +2535,6 @@ function agent(
   };
 }
 
-function createInspector(
-  path: string,
-  currentPath: string,
-  type: "file" | "directory" = "file",
-): InspectorState {
-  return {
-    currentPath,
-    selectedPath: type === "file" ? path : null,
-    files: [{ path, type }],
-    preview: {
-      path: type === "file" ? path : null,
-      language: "ts",
-      content: "console.log('hello');",
-    },
-    gitStatus: {
-      branch: "feature/ain-one-phase1",
-      entries: [{ path: "src/index.ts", status: "M" }],
-    },
-    gitDiff: {
-      path: type === "file" ? path : null,
-      content: "@@ -1 +1 @@\n-console.log('old')\n+console.log('hello')",
-    },
-  };
-}
-
 function deferred<T>() {
   let resolve!: (value: T) => void;
   let reject!: (reason?: unknown) => void;
@@ -1772,24 +2545,25 @@ function deferred<T>() {
   return { promise, resolve, reject };
 }
 
-function selectOptions(select: HTMLSelectElement, values: string[]): void {
-  for (const option of select.options) {
-    option.selected = values.includes(option.value);
-  }
-  fireEvent.change(select);
+async function chooseModel(user: ReturnType<typeof userEvent.setup>, model: string): Promise<void> {
+  await user.click(await screen.findByRole("button", { name: "Model" }));
+  await user.click(screen.getByRole("menuitemradio", { name: model }));
 }
 
 function plugin(
   id: string,
   pluginId: string,
   versionId: string,
+  type: "skill" | "mcp" = "skill",
+  version?: string,
 ): ConversationView["availablePlugins"][number] {
   return {
     id,
     pluginId,
     versionId,
+    version,
     name: `${pluginId} ${versionId}`,
-    type: "skill",
+    type,
     compatibleAgents: ["codex"],
     materializations: [],
   };

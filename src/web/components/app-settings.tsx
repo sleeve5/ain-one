@@ -52,7 +52,7 @@ export function AppSettings(props: AppSettingsProps) {
             data-active={props.section === "agents"}
             onClick={() => props.onSectionChange("agents")}
           >
-            Agents
+            Agent
           </button>
           <button
             type="button"

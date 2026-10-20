@@ -1,6 +1,7 @@
 import { spawn } from "node:child_process";
 import {
   cpSync,
+  chmodSync,
   existsSync,
   mkdtempSync,
   mkdirSync,
@@ -53,6 +54,76 @@ function createSkillFixtureWithContent(
 }
 
 describe("plugin hub", () => {
+  it("reports a real plugin manifest version separately from its content identity", async () => {
+    const root = makeTempDir("ain-one-versioned-skill-");
+    const pluginRoot = join(root, "market", "formatter", "1.10.0");
+    const skillDir = createSkillFixture(join(pluginRoot, "skills"), "formatter");
+    mkdirSync(join(pluginRoot, ".codex-plugin"), { recursive: true });
+    writeFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "formatter", version: "1.10.0+reinstall.42" }));
+    const hub = createPluginHub({ dataDir: join(root, "data"), skillRoots: {} });
+
+    const installed = await hub.installLocal({
+      path: skillDir,
+      compatibility: { codex: { kind: "skill" } },
+    });
+
+    expect(installed.version).toBe("1.10.0");
+    expect(installed.versionId).not.toBe(installed.version);
+  });
+
+  it("backfills a manifest version when an existing content version is rediscovered", async () => {
+    const root = makeTempDir("ain-one-version-backfill-");
+    const pluginRoot = join(root, "market", "formatter", "1.10.0");
+    const skillDir = createSkillFixture(join(pluginRoot, "skills"), "formatter");
+    const hub = createPluginHub({ dataDir: join(root, "data"), skillRoots: {} });
+    await hub.installLocal({ path: skillDir, compatibility: { codex: { kind: "skill" } } });
+    mkdirSync(join(pluginRoot, ".codex-plugin"), { recursive: true });
+    writeFileSync(join(pluginRoot, ".codex-plugin", "plugin.json"), JSON.stringify({ name: "formatter", version: "1.10.0" }));
+
+    const importingHub = createPluginHub({
+      dataDir: join(root, "data"),
+      skillRoots: {},
+      discoverSkillRoots: async () => [{ agentProductId: "codex", path: join(pluginRoot, "skills") }],
+    });
+    await importingHub.importConfiguredRoots();
+
+    expect(importingHub.listInstalled()[0]?.version).toBe("1.10.0");
+  });
+
+  it("does not borrow a version from an unrelated ancestor manifest", async () => {
+    const root = makeTempDir("ain-one-unversioned-skill-");
+    mkdirSync(join(root, ".codex-plugin"), { recursive: true });
+    writeFileSync(join(root, ".codex-plugin", "plugin.json"), JSON.stringify({ version: "9.9.9" }));
+    const skillDir = createSkillFixture(join(root, "unrelated"), "formatter");
+    const hub = createPluginHub({ dataDir: join(root, "data"), skillRoots: {} });
+
+    const installed = await hub.installLocal({ path: skillDir });
+
+    expect(installed.version).toBeUndefined();
+  });
+
+  it("treats an identical Agent-native Skill as ready without taking ownership of it", async () => {
+    const root = makeTempDir("ain-one-native-skill-");
+    const dataDir = join(root, "data");
+    const codexSkillRoot = join(root, "codex-skills");
+    mkdirSync(codexSkillRoot, { recursive: true });
+    const nativeSkill = createSkillFixture(codexSkillRoot, "native-skill");
+    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
+
+    const [installed] = await hub.importConfiguredRoots();
+
+    expect(hub.listInstalled()[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "materialized", repairable: false },
+    ]);
+    await expect(hub.materialize("codex", [{
+      pluginId: installed!.pluginId,
+      versionId: installed!.versionId,
+    }])).resolves.toMatchObject({
+      applied: [{ pluginId: installed!.pluginId, versionId: installed!.versionId }],
+    });
+    expect(realpathSync(join(codexSkillRoot, "native-skill"))).toBe(realpathSync(nativeSkill));
+  });
+
   it("reports truthful per-Agent materialization status without repairing conflicts", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
@@ -210,6 +281,19 @@ describe("plugin hub", () => {
     expect(existsSync(join(second.canonicalPath, "SKILL.md"))).toBe(true);
   });
 
+  it("preserves executable bits in the canonical Skill copy", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const skillDir = createSkillFixture(root, "executable-skill");
+    const executable = join(skillDir, "run.sh");
+    writeFileSync(executable, "#!/bin/sh\nexit 0\n", "utf8");
+    chmodSync(executable, 0o755);
+
+    const hub = createPluginHub({ dataDir: join(root, "data"), skillRoots: {} });
+    const installed = await hub.installLocal({ path: skillDir });
+
+    expect(statSync(join(installed.canonicalPath, "run.sh")).mode & 0o111).toBe(0o111);
+  });
+
   it("rejects reinstalling identical content with different compatibility", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
@@ -356,35 +440,41 @@ describe("plugin hub", () => {
       },
     });
 
-    const first = await hub.scanNative([
-      {
-        agentProductId: "claude",
-        path: claudeSkill,
-        compatibility: {
-          claude: { kind: "skill" },
-          codex: { kind: "skill" },
-        },
+    const installed = await hub.installLocal({
+      path: claudeSkill,
+      compatibility: {
+        claude: { kind: "skill" },
+        codex: { kind: "skill" },
       },
-    ]);
-    expect(first).toEqual([
-      expect.objectContaining({
-        type: "skill",
-        compatibleAgents: ["claude", "codex"],
-      }),
-    ]);
-
-    await hub.acceptCandidate(first[0]!.id);
+    });
     await hub.materialize("codex", [
       {
-        pluginId: first[0]!.pluginId,
-        versionId: first[0]!.versionId,
+        pluginId: installed.pluginId,
+        versionId: installed.versionId,
       },
     ]);
 
-    const codexTarget = join(codexSkillRoot, first[0]!.pluginId);
+    const codexTarget = join(codexSkillRoot, installed.pluginId);
     expect(readlinkSync(codexTarget).length).toBeGreaterThan(0);
 
-    expect(await hub.scanNative([{ agentProductId: "codex", path: codexTarget }])).toEqual([]);
+    await hub.importConfiguredRoots();
+    expect(hub.listInstalled()).toHaveLength(1);
+  });
+
+  it("accepts a user-managed native Skill symlink by copying its resolved target", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const realSkill = createSkillFixture(root, "real-skill");
+    const linkedSkill = join(root, "linked-skill");
+    symlinkSync(realSkill, linkedSkill, "dir");
+    const hub = createPluginHub({
+      dataDir: join(root, "data"),
+      skillRoots: {},
+      discoverSkillRoots: async () => [{ agentProductId: "codex", path: root }],
+    });
+    const [installed] = await hub.importConfiguredRoots();
+
+    expect(installed!.pluginId).toBe("linked-skill");
+    expect(readFileSync(join(installed!.canonicalPath, "SKILL.md"), "utf8")).toContain("real-skill");
   });
 
   it("scans configured Skill-root direct children only", async () => {
@@ -398,8 +488,51 @@ describe("plugin hub", () => {
 
     const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
 
-    await expect(hub.scanConfiguredRoots()).resolves.toEqual([
-      expect.objectContaining({ pluginId: "native-skill", agentProductId: "codex" }),
+    await expect(hub.importConfiguredRoots()).resolves.toEqual([
+      expect.objectContaining({ pluginId: "native-skill", compatibleAgents: ["codex"] }),
+    ]);
+  });
+
+  it("scans additional read-only Skill roots without using them as materialization targets", async () => {
+    const root = makeTempDir("ain-one-discovered-skill-");
+    const dataDir = join(root, "data");
+    const writableRoot = join(root, "codex-skills");
+    const discoveredRoot = join(root, "shared-skills");
+    mkdirSync(writableRoot, { recursive: true });
+    createSkillFixture(discoveredRoot, "shared-skill");
+
+    const hub = createPluginHub({
+      dataDir,
+      skillRoots: { codex: writableRoot },
+      discoverSkillRoots: async () => [{ agentProductId: "codex", path: discoveredRoot }],
+    });
+
+    const [installed] = await hub.importConfiguredRoots();
+    expect(installed).toMatchObject({
+      pluginId: "shared-skill",
+      compatibleAgents: ["codex"],
+    });
+    expect(existsSync(join(writableRoot, "shared-skill"))).toBe(false);
+  });
+
+  it("includes safely discovered native MCP definitions in configured scans", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    const definition = join(root, "native-mcp.json");
+    writeFileSync(definition, JSON.stringify({
+      format: "ain-one.mcp.v1",
+      pluginId: "native-docs",
+      compatibility: {
+        codex: { kind: "mcp", target: "codex.mcp.v1", server: { command: "node", args: ["server.js"] } },
+      },
+    }));
+    const hub = createPluginHub({
+      dataDir: join(root, "data"),
+      skillRoots: {},
+      discoverMcpDefinitions: async () => [{ agentProductId: "codex", path: definition }],
+    });
+
+    await expect(hub.importConfiguredRoots()).resolves.toEqual([
+      expect.objectContaining({ pluginId: "native-docs", type: "mcp", compatibleAgents: ["codex"] }),
     ]);
   });
 
@@ -409,19 +542,57 @@ describe("plugin hub", () => {
     const nativeRoot = join(root, "native");
     const codexSkillRoot = join(root, "codex-skills");
     mkdirSync(codexSkillRoot, { recursive: true });
-    const claudeSkill = createSkillFixture(nativeRoot, "claude-only-skill");
+    createSkillFixture(nativeRoot, "claude-only-skill");
 
-    const hub = createPluginHub({ dataDir, skillRoots: { codex: codexSkillRoot } });
-    const [candidate] = await hub.scanNative([
-      { agentProductId: "claude", path: claudeSkill },
-    ]);
-    const installed = await hub.acceptCandidate(candidate!.id);
+    const hub = createPluginHub({
+      dataDir,
+      skillRoots: { codex: codexSkillRoot },
+      discoverSkillRoots: async () => [{ agentProductId: "claude", path: nativeRoot }],
+    });
+    const [installed] = await hub.importConfiguredRoots();
 
     await expect(
       hub.materialize("codex", [
-        { pluginId: installed.pluginId, versionId: installed.versionId },
+        { pluginId: installed!.pluginId, versionId: installed!.versionId },
       ]),
     ).rejects.toThrow("not compatible");
+  });
+
+  it("deduplicates identical native Skills while preserving every source Agent", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    createSkillFixture(root, "shared-native");
+    const hub = createPluginHub({
+      dataDir: join(root, "data"),
+      skillRoots: {},
+      discoverSkillRoots: async () => [
+        { agentProductId: "codex", path: root },
+        { agentProductId: "claude", path: root },
+      ],
+    });
+
+    const installed = await hub.importConfiguredRoots();
+    expect(installed).toHaveLength(1);
+    expect(hub.listInstalled()[0]?.compatibleAgents).toEqual(["claude", "codex"]);
+  });
+
+  it("merges compatibility when an installed native version is rediscovered", async () => {
+    const root = makeTempDir("ain-one-task5-plugin-");
+    createSkillFixture(root, "already-installed");
+    const dataDir = join(root, "data");
+    const hub = createPluginHub({
+      dataDir,
+      skillRoots: {},
+      discoverSkillRoots: async () => [{ agentProductId: "codex", path: root }],
+    });
+    await hub.importConfiguredRoots();
+
+    const rediscoveringHub = createPluginHub({
+      dataDir,
+      skillRoots: {},
+      discoverSkillRoots: async () => [{ agentProductId: "claude", path: root }],
+    });
+    await rediscoveringHub.importConfiguredRoots();
+    expect(hub.listInstalled()[0]?.compatibleAgents).toEqual(["claude", "codex"]);
   });
 
   it("keeps canonical immutable when an agent edits the managed materialized copy", async () => {
@@ -458,10 +629,11 @@ describe("plugin hub", () => {
     writeFileSync(join(nativeTarget, "SKILL.md"), "# agent-edited-skill\n\nchanged by agent\n", "utf8");
 
     expect(readFileSync(canonicalSkill, "utf8")).toBe(canonicalBefore);
-    const candidates = await hub.scanNative([{ agentProductId: "codex", path: nativeTarget }]);
-    expect(candidates).toHaveLength(1);
-    expect(candidates[0]?.pluginId).toBe(installed.pluginId);
-    expect(candidates[0]?.versionId).not.toBe(installed.versionId);
+    await hub.importConfiguredRoots();
+    expect(hub.listInstalled()).toHaveLength(1);
+    expect(hub.listInstalled()[0]?.materializations).toEqual([
+      { agentProductId: "codex", status: "conflicted", repairable: false },
+    ]);
   });
 
   it("refuses to overwrite an edited managed materialized copy", async () => {
@@ -516,10 +688,16 @@ describe("plugin hub", () => {
     rmSync(target, { recursive: true, force: true });
     symlinkSync(tamperedSource, target, "dir");
 
-    const candidates = await hub.scanNative([{ agentProductId: "codex", path: target }]);
-    expect(candidates).toHaveLength(1);
-    expect(candidates[0]?.pluginId).toBe(installed.pluginId);
-    expect(candidates[0]?.versionId).not.toBe(installed.versionId);
+    await hub.importConfiguredRoots();
+    const imported = hub.listInstalled();
+    expect(imported).toHaveLength(2);
+    expect(imported.map((plugin) => plugin.compatibleAgents)).toEqual([
+      ["codex"],
+      ["codex"],
+    ]);
+    expect(imported.find((plugin) => plugin.versionId === installed.versionId)?.materializations).toEqual([
+      { agentProductId: "codex", status: "conflicted", repairable: false },
+    ]);
   });
 
   it("fails materialize when managed target is replaced by a regular file", async () => {
@@ -687,7 +865,7 @@ describe("plugin hub", () => {
     );
 
     const hub = createPluginHub({ dataDir, skillRoots: {} });
-    await expect(hub.scanNative([])).rejects.toThrow("invalid materialization journal path");
+    await expect(hub.importConfiguredRoots()).rejects.toThrow("invalid materialization journal path");
     expect(readlinkSync(victimPath)).toBe(victimTarget);
   });
 
@@ -846,6 +1024,11 @@ describe("plugin hub", () => {
     const conflictPath = join(codexSkillRoot, accepted.pluginId);
     writeFileSync(conflictPath, "user-owned", "utf8");
 
+    expect(hub.resolveForTurn({
+      agentProductId: "codex",
+      global: [{ pluginId: accepted.pluginId, versionId: accepted.versionId }],
+    })).toEqual([]);
+
     await expect(
       hub.materialize("codex", [
         {
@@ -909,23 +1092,6 @@ describe("plugin hub", () => {
     ).rejects.toThrow("not compatible");
   });
 
-  it("rejects stale native candidate when source hash changes before acceptance", async () => {
-    const root = makeTempDir("ain-one-task5-plugin-");
-    const dataDir = join(root, "data");
-    const nativeRoot = join(root, "native");
-    mkdirSync(nativeRoot, { recursive: true });
-
-    const nativeSkill = createSkillFixture(nativeRoot, "stale-candidate-skill");
-    const hub = createPluginHub({ dataDir, skillRoots: {} });
-
-    const candidates = await hub.scanNative([{ agentProductId: "claude", path: nativeSkill }]);
-    expect(candidates).toHaveLength(1);
-
-    writeFileSync(join(nativeSkill, "README.md"), "changed after scan\n", "utf8");
-
-    await expect(hub.acceptCandidate(candidates[0]!.id)).rejects.toThrow("stale candidate");
-  });
-
   it("rejects plugin ids that escape their managed directory", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");
     const dataDir = join(root, "data");
@@ -943,6 +1109,22 @@ describe("plugin hub", () => {
     const hub = createPluginHub({ dataDir, skillRoots: {} });
     await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("invalid plugin id");
   });
+
+  it.each(["__proto__", "constructor", "prototype"])(
+    "rejects the reserved plugin id %s",
+    async (pluginId) => {
+      const root = makeTempDir("ain-one-task5-plugin-");
+      const mcpPath = join(root, `${pluginId}.json`);
+      writeFileSync(mcpPath, JSON.stringify({
+        format: "ain-one.mcp.v1",
+        pluginId,
+        compatibility: {},
+      }), "utf8");
+
+      const hub = createPluginHub({ dataDir: join(root, "data"), skillRoots: {} });
+      await expect(hub.installLocal({ path: mcpPath })).rejects.toThrow("invalid plugin id");
+    },
+  );
 
   it("applies global < project < conversation scope precedence", async () => {
     const root = makeTempDir("ain-one-task5-plugin-");

@@ -1,21 +1,22 @@
 import { render, screen } from "@testing-library/react";
 import { userEvent } from "@testing-library/user-event";
-import { describe, expect, it } from "vitest";
+import { describe, expect, it, vi } from "vitest";
 import { App } from "../../src/web/app.js";
 import type {
   AinOneApi,
   ConversationView,
-  InspectorState,
   WorkspaceState,
 } from "../../src/web/api.js";
 
 describe("mounted canvas behavior", () => {
-  it("keeps both canvases mounted and preserves state while switching", async () => {
+  it("keeps the conversation canvas mounted and preserves its draft while opening a graph", async () => {
     const user = userEvent.setup();
-    render(<App api={fakeApi()} />);
+    const api = fakeApi();
+    render(<App api={api} />);
 
     await user.type(await screen.findByLabelText("Message"), "draft text");
-    await user.click(screen.getByRole("button", { name: "Graph" }));
+    await user.click(screen.getByRole("button", { name: "Review workflow" }));
+    await vi.waitFor(() => expect(api.getGraph).toHaveBeenCalledWith("graph-1"));
 
     const conversationCanvas = screen.getByTestId("conversation-canvas");
     const graphCanvas = screen.getByTestId("graph-canvas");
@@ -27,7 +28,7 @@ describe("mounted canvas behavior", () => {
     expect(conversationContainer).toHaveAttribute("inert");
     expect(graphContainer).not.toHaveAttribute("hidden");
 
-    await user.click(screen.getByRole("button", { name: "Conversation" }));
+    await user.click(screen.getByRole("button", { name: "Main Conversation" }));
     expect(screen.getByLabelText("Message")).toHaveValue("draft text");
     expect(graphContainer).toHaveAttribute("hidden");
     expect(graphContainer).toHaveAttribute("inert");
@@ -46,6 +47,9 @@ function fakeApi(): AinOneApi {
     async deletePendingMessage() {
       return undefined;
     },
+    async resolveUncertainMessage() {
+      return undefined;
+    },
     async cancelActiveTurn() {
       return undefined;
     },
@@ -53,6 +57,9 @@ function fakeApi(): AinOneApi {
       return undefined;
     },
     async retryInterruptedTurn() {
+      return undefined;
+    },
+    async respondToPermission() {
       return undefined;
     },
     subscribeConversationEvents() {
@@ -94,9 +101,6 @@ function fakeApi(): AinOneApi {
     async refreshPluginImports() {
       return undefined;
     },
-    async acceptPluginCandidate() {
-      return undefined;
-    },
     async repairPluginMaterialization() {
       return undefined;
     },
@@ -106,9 +110,17 @@ function fakeApi(): AinOneApi {
     async setPluginEnablements() {
       return undefined;
     },
-    async listProjectFiles() {
-      return state.inspector;
-    },
+    listGraphs: vi.fn(async () => []),
+    async createGraph() { throw new Error("not used"); },
+    getGraph: vi.fn(async () => ({
+      graph: createWorkspaceState().graphs![0]!,
+      latestRun: null,
+    })),
+    async saveGraph() { throw new Error("not used"); },
+    async deleteGraph() { return undefined; },
+    async runGraph() { throw new Error("not used"); },
+    async getGraphRun() { throw new Error("not used"); },
+    async cancelGraphRun() { return false; },
   };
 }
 
@@ -133,35 +145,25 @@ function createWorkspaceState(): WorkspaceState {
     events: [],
   };
 
-  const inspector: InspectorState = {
-    currentPath: ".",
-    selectedPath: "src/index.ts",
-    files: [{ path: "src/index.ts", type: "file" }],
-    preview: {
-      path: "src/index.ts",
-      language: "ts",
-      content: "console.log('hi');",
-    },
-    gitStatus: {
-      branch: "feature/ain-one-phase1",
-      entries: [],
-    },
-    gitDiff: {
-      path: "",
-      content: "",
-    },
-  };
-
   return {
     projects: [{ id: "project-1", name: "Ain One", path: "/tmp/ain-one" }],
+    graphs: [{
+      id: "graph-1",
+      projectId: "project-1",
+      name: "Review workflow",
+      description: "",
+      definition: { nodes: [], edges: [], start: [], end: [] },
+      viewport: { x: 0, y: 0, zoom: 1 },
+      positions: {},
+      createdAt: "2026-08-23T00:00:00.000Z",
+      updatedAt: "2026-08-23T00:00:00.000Z",
+    }],
     selectedProjectId: "project-1",
     conversations: [conversation],
     selectedConversationId: "conv-1",
     conversation,
-    inspector,
     agents: [],
     installedPlugins: [],
-    pluginCandidates: [],
     pluginError: null,
   };
 }

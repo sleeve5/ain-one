@@ -4,7 +4,7 @@ import type { AgentProductId, NormalizedEvent, PermissionMode } from "../../shar
 import type { AgentSettingsView, ConversationView } from "../api.js";
 import { Composer } from "./composer.js";
 import { AgentBadge } from "./agent-badge.js";
-import { agentLabel, sortAgents } from "../agent-meta.js";
+import { agentLabel, isSelectableAgent, sortAgents } from "../agent-meta.js";
 
 interface ConversationCanvasProps {
   conversation: ConversationView | null;
@@ -15,7 +15,7 @@ interface ConversationCanvasProps {
   onChangePermissionMode(permissionMode: PermissionMode): void;
   onDeletePendingMessage(messageId: string): Promise<void>;
   onResolveUncertainMessage?(messageId: string, action: "retry" | "accept"): Promise<void>;
-  onQueueMessage(content: string): Promise<void>;
+  onQueueMessage(content: string, onConversationCreated?: (conversationId: string) => void): Promise<void>;
   onCancelTurn(): Promise<void>;
   onContinueConversation?(): Promise<void>;
   onRetryInterruptedTurn?(turnId: string): Promise<void>;
@@ -46,6 +46,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
   const conversation = props.conversation;
   const draft = props.newConversation ?? null;
   const session = conversation ?? draft;
+  const draftKey = conversation?.id ?? (draft ? `new:${draft.projectId}` : "");
   const turnActive = Boolean(conversation?.activeTurnStatus);
   const [submitting, setSubmitting] = useState(false);
   const [branchingEventId, setBranchingEventId] = useState<string | null>(null);
@@ -78,8 +79,8 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     conversation.events.filter((event) => event.type !== "user_message" || !conversation.queuedMessages.some((message) => message.id === event.payload.messageId)),
   ) : [], [conversation]);
   const approvals = useMemo(() => conversation ? pendingPermissions(conversation.events) : [], [conversation]);
-  const sendBlocked = turnActive || submitting;
-  const draftUnavailable = Boolean(draft && !(props.availableAgents ?? []).some(isRunnableAgent));
+  const sendBlocked = turnActive || submitting || conversation?.hydrated === false;
+  const draftUnavailable = Boolean(draft && !(props.availableAgents ?? []).some(isSelectableAgent));
   if (!session) {
     return <section className="conversation-canvas" data-testid="conversation-canvas" aria-label="Conversation Canvas"><div className="workspace-empty">{zh ? "新建一个对话以开始。" : "Create a conversation to start."}</div></section>;
   }
@@ -97,7 +98,7 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
     <div className="composer-selectors composer-selectors--trailing">
       <div className="agent-selector">
         <button type="button" aria-label="Agent" aria-haspopup={draft ? "menu" : undefined} aria-expanded={draft ? openSelector === "agent" : undefined} disabled={!draft || turnActive} onClick={() => setOpenSelector((value) => value === "agent" ? null : "agent")}><span className="selector-value">{agentLabel(session.agentProductId)}</span><SelectorChevron /></button>
-        {openSelector === "agent" ? <div role="menu" className="composer-popover">{sortAgents((props.availableAgents ?? []).filter(isRunnableAgent)).map((agent) => <button key={agent.id} type="button" role="menuitemradio" aria-checked={draft?.agentProductId === agent.id} onClick={() => { props.onChangeAgent?.(agent.id); setOpenSelector(null); }}>{agentLabel(agent.id)}</button>)}</div> : null}
+        {openSelector === "agent" ? <div role="menu" className="composer-popover">{sortAgents((props.availableAgents ?? []).filter(isSelectableAgent)).map((agent) => <button key={agent.id} type="button" role="menuitemradio" aria-checked={draft?.agentProductId === agent.id} onClick={() => { props.onChangeAgent?.(agent.id); setOpenSelector(null); }}>{agentLabel(agent.id)}</button>)}</div> : null}
       </div>
       <div className="composer-selector">
         <button type="button" aria-label="Model" aria-haspopup="menu" aria-expanded={openSelector === "model" && !turnActive} disabled={turnActive} onClick={() => setOpenSelector((value) => value === "model" ? null : "model")}><span className="selector-value">{session.modelId ?? (zh ? "默认模型" : "Default model")}</span><SelectorChevron /></button>
@@ -145,15 +146,14 @@ export function ConversationCanvas(props: ConversationCanvasProps) {
           leadingControls={leadingControls}
           trailingControls={trailingControls}
           stopControl={turnActive ? <button type="button" className="composer__stop" onClick={props.onCancelTurn}>{zh ? "停止" : "Stop"}</button> : null}
-          value={drafts[conversation?.id ?? `new:${draft!.projectId}`] ?? ""}
-          onChange={(value) => { const id = conversation?.id ?? `new:${draft!.projectId}`; setDrafts((current) => ({ ...current, [id]: value })); }}
-          onSubmit={async (content) => { const id = conversation?.id ?? `new:${draft!.projectId}`; const value = drafts[id] ?? ""; setDrafts((current) => ({ ...current, [id]: "" })); setSubmitting(true); try { await props.onQueueMessage(content); } catch (error) { setDrafts((current) => current[id] ? current : { ...current, [id]: value }); throw error; } finally { setSubmitting(false); } }}
+          value={drafts[draftKey] ?? ""}
+          onChange={(value) => setDrafts((current) => ({ ...current, [draftKey]: value }))}
+          onSubmit={async (content) => { const value = drafts[draftKey] ?? ""; let recoveryKey = draftKey; setDrafts((current) => ({ ...current, [draftKey]: "" })); setSubmitting(true); try { await props.onQueueMessage(content, (conversationId) => { recoveryKey = conversationId; }); } catch (error) { setDrafts((current) => current[recoveryKey] ? current : { ...current, [recoveryKey]: value }); throw error; } finally { setSubmitting(false); } }}
         />
       </div>
     </section>
   );
 }
-function isRunnableAgent(agent: AgentSettingsView): boolean { return agent.enabled !== false && (agent.status === "available" || agent.status === "capability_limited"); }
 function SelectorChevron() { return <span className="selector-chevron" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="m4.25 9.5 3.75-4 3.75 4" /></svg></span>; }
 function PermissionIcon() { return <span className="permission-selector__icon" aria-hidden="true"><svg viewBox="0 0 16 16"><path d="M8 2.25 12.5 4v3.45c0 2.75-1.7 4.9-4.5 6.3-2.8-1.4-4.5-3.55-4.5-6.3V4L8 2.25Z"/><path d="m6.1 7.8 1.2 1.2 2.7-2.75"/></svg></span>; }
 
@@ -249,7 +249,7 @@ function turnError(event: NormalizedEvent, zh: boolean): string | null {
   if (!message) return null;
   if (/thread-store conflict:[\s\S]*already has an active writer/i.test(message)) {
     return zh
-      ? "Agent 会话仍被其他进程占用，请重启项目后重试。"
+      ? "Agent 对话仍被其他进程占用，请重启项目后重试。"
       : "This Agent session is still in use. Restart the project and try again.";
   }
   return message;

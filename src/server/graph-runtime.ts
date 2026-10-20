@@ -17,11 +17,16 @@ interface ActiveRun {
   sessions: Map<string, { connector: AgentConnector; session: LiveSession; eventHandler: { current(event: { type: string; payload: Record<string, unknown> }): Promise<void> } }>;
 }
 
+export interface GraphRunStart {
+  run: GraphRun;
+  completion: Promise<GraphRun>;
+}
+
 export class GraphRuntime {
   private readonly active = new Map<string, ActiveRun>();
   constructor(private readonly options: GraphRuntimeOptions) {}
 
-  async run(graphId: string, input: string | GraphValues): Promise<GraphRun> {
+  start(graphId: string, input: string | GraphValues): GraphRunStart {
     const graph = this.options.repository.getGraph(graphId);
     if (!graph) throw new Error("Graph not found");
     const errors = validateGraphDefinition(graph.definition);
@@ -39,65 +44,14 @@ export class GraphRuntime {
     const state: ActiveRun = { cancelled: false, active: null, sessions: new Map(), done: new Promise<void>((resolve) => { resolveDone = resolve; }), resolveDone: () => resolveDone() };
     this.active.set(run.id, state);
     this.options.repository.appendRunEvent(run.id, "run_started", null, { input });
-    if (graph.definition.nodes.some((node) => node.type === "input")) return this.runDataflow(graph, run, typeof input === "string" ? { input } : input, state);
-    const counters = new Map<string, number>();
-    const iterations = new Map<string, number>();
-    const nodes = new Map(graph.definition.nodes.map((node) => [node.id, node]));
-    let nodeId = graph.definition.start[0]!;
-    let value = input as string;
-    try {
-      for (let step = 0; step < (this.options.stepLimit ?? 1_000); step += 1) {
-        if (state.cancelled) return this.cancelled(run.id);
-        const node = nodes.get(nodeId);
-        if (!node) throw new Error(`Node not found: ${nodeId}`);
-        const iteration = (iterations.get(nodeId) ?? 0) + 1;
-        iterations.set(nodeId, iteration);
-        const nodeRun = this.options.repository.startNodeRun(run.id, nodeId, iteration, value);
-        this.options.repository.appendRunEvent(run.id, "node_started", nodeId, { iteration, input: value });
-        try {
-          if (node.type === "agent") {
-            const template = node.config.prompt ?? node.config.instruction ?? "";
-            value = await this.executeAgent(run.id, node, iteration, template.includes("{{input}}") ? template.replaceAll("{{input}}", value) : value, state);
-          }
-          if (node.type === "literal") value = node.config.value;
-          if (node.type === "template") value = node.config.template.replaceAll("{{input}}", value);
-          if (state.cancelled) {
-            this.options.repository.finishNodeRun(nodeRun.id, "cancelled", value);
-            return this.cancelled(run.id);
-          }
-          this.options.repository.finishNodeRun(nodeRun.id, "completed", value);
-          this.options.repository.appendRunEvent(run.id, "node_completed", nodeId, { iteration, output: value });
-        } catch (error) {
-          const normalized = normalizeError(error);
-          this.options.repository.finishNodeRun(nodeRun.id, "failed", null, normalized);
-          throw error;
-        }
+    return {
+      run,
+      completion: this.runDataflow(graph, run, typeof input === "string" ? { input } : input, state),
+    };
+  }
 
-        if (graph.definition.end.includes(nodeId)) {
-          this.options.repository.finishRun(run.id, "completed", value);
-          this.options.repository.appendRunEvent(run.id, "run_completed", nodeId, { output: value });
-          return this.options.repository.getRun(run.id)!;
-        }
-        const branch = node.type === "loop_counter"
-          ? this.loopBranch(node, counters)
-          : null;
-        const edge = graph.definition.edges.find((candidate) =>
-          candidate.source === nodeId && (branch === null || candidate.condition?.branch === branch));
-        if (!edge) throw new Error(`No ${branch ?? "next"} edge from node ${nodeId}`);
-        nodeId = edge.target;
-      }
-      throw new Error("Graph step limit exceeded");
-    } catch (error) {
-      if (state.cancelled) return this.cancelled(run.id);
-      const normalized = normalizeError(error);
-      this.options.repository.finishRun(run.id, "failed", null, normalized);
-      this.options.repository.appendRunEvent(run.id, "run_failed", nodeId, { error: normalized });
-      return this.options.repository.getRun(run.id)!;
-    } finally {
-      this.active.delete(run.id);
-      await Promise.all([...state.sessions.values()].map(({ connector, session }) => connector.closeSession(session).catch(() => undefined)));
-      state.resolveDone();
-    }
+  async run(graphId: string, input: string | GraphValues): Promise<GraphRun> {
+    return this.start(graphId, input).completion;
   }
 
   private async runDataflow(graph: GraphProject, run: GraphRun, input: GraphValues, state: ActiveRun): Promise<GraphRun> {
@@ -119,7 +73,7 @@ export class GraphRuntime {
         const recordedInput = node.type === "input" ? input : nodeInput;
         const nodeRun = this.options.repository.startNodeRun(run.id, nodeId, iteration, recordedInput);
         this.options.repository.appendRunEvent(run.id, "node_started", nodeId, { iteration, input: recordedInput });
-        let output: GraphValues;
+        let output: GraphValues = {};
         try {
           if (node.type === "input") output = Object.fromEntries(node.config.fields.map((field) => [field.id, input[field.id] ?? ""]));
           else if (node.type === "agent") {
@@ -130,7 +84,6 @@ export class GraphRuntime {
           }
           else if (node.type === "loop_counter") { const branch = this.loopBranch(node, counters); output = { [branch]: nodeInput.input ?? Object.values(nodeInput)[0] ?? "" }; }
           else if (node.type === "output") output = Object.fromEntries(node.config.fields.map((field) => [field.id, nodeInput[field.id] ?? ""]));
-          else throw new Error(`Unsupported dataflow node: ${node.type}`);
           if (state.cancelled) { this.options.repository.finishNodeRun(nodeRun.id, "cancelled", output); return this.cancelled(run.id); }
           this.options.repository.finishNodeRun(nodeRun.id, "completed", output);
           this.options.repository.appendRunEvent(run.id, "node_completed", nodeId, { iteration, output });
@@ -145,9 +98,9 @@ export class GraphRuntime {
           return this.options.repository.getRun(run.id)!;
         }
         for (const edge of graph.definition.edges.filter((candidate) => candidate.source === nodeId)) {
-          const sourcePort = edge.sourcePort ?? (node.type === "loop_counter" ? edge.condition?.branch : "output");
-          const targetPort = edge.targetPort ?? "input";
-          if (!sourcePort || output[sourcePort] === undefined) continue;
+          const sourcePort = edge.sourcePort!;
+          const targetPort = edge.targetPort!;
+          if (output[sourcePort] === undefined) continue;
           values.set(edge.target, { ...(values.get(edge.target) ?? {}), [targetPort]: output[sourcePort] });
           if (!queued.has(edge.target)) { pending.push(edge.target); queued.add(edge.target); }
         }
@@ -173,7 +126,10 @@ export class GraphRuntime {
     const active = state.active;
     if (active) {
       active.cancel();
-      await active.connector.cancelTurn(active.session, active.nativeTurnId);
+      await Promise.race([
+        active.connector.cancelTurn(active.session, active.nativeTurnId).catch(() => undefined),
+        state.done,
+      ]);
     }
     await state.done;
     return true;
@@ -221,6 +177,7 @@ export class GraphRuntime {
     } else {
       sessionState.eventHandler.current = onEvent;
     }
+    if (state.cancelled) return output;
     state.active = { ...sessionState, nativeTurnId: null, cancel: () => terminalResolve("cancelled") };
     const starting = connector.startTurn(sessionState.session, {
       content: input,
@@ -276,7 +233,7 @@ function isReady(node: GraphNode, values: GraphValues, edges: GraphProject["defi
   if (node.type === "input") return iteration === 0;
   if (node.type === "agent") {
     const ports = node.config.inputs ?? [{ id: "input", name: "Input", required: true }];
-    const regular = ports.filter((port) => port.kind !== "feedback" && edges.some((edge) => edge.target === node.id && (edge.targetPort ?? "input") === port.id));
+    const regular = ports.filter((port) => port.kind !== "feedback" && edges.some((edge) => edge.target === node.id && edge.targetPort === port.id));
     if (regular.some((port) => values[port.id] === undefined)) return false;
     return iteration === 0 || ports.some((port) => port.kind === "feedback" && values[port.id] !== undefined);
   }

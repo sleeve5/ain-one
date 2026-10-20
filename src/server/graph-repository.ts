@@ -22,6 +22,7 @@ export interface GraphRepository {
   createRun(graphId: string, input: string | GraphValues, snapshot?: GraphProject): GraphRun;
   getRun(runId: string): GraphRun | null;
   getLatestRun(graphId: string): GraphRun | null;
+  hasActiveRunForProject(projectId: string): boolean;
   listRuns(graphId: string): GraphRun[];
   deleteRun(runId: string): "deleted" | "not_found" | "run_active";
   finishRun(runId: string, status: Exclude<GraphRunStatus, "running">, output?: string | GraphValues | null, error?: NormalizedError): void;
@@ -88,6 +89,12 @@ export function createGraphRepository(db: DatabaseSync): GraphRepository {
     getLatestRun(graphId) {
       const row = one<RunRow>("SELECT * FROM graph_runs WHERE graph_id = ? ORDER BY created_at DESC, rowid DESC LIMIT 1", graphId);
       return row ? mapRun(row) : null;
+    },
+    hasActiveRunForProject(projectId) {
+      return Boolean(one(
+        "SELECT 1 FROM graph_runs JOIN graphs ON graphs.id = graph_runs.graph_id WHERE graphs.project_id = ? AND graph_runs.status = 'running' LIMIT 1",
+        projectId,
+      ));
     },
     listRuns(graphId) {
       return many<RunRow>("SELECT * FROM graph_runs WHERE graph_id = ? ORDER BY created_at DESC, rowid DESC", graphId).map(mapRun);

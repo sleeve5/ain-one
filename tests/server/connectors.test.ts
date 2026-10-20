@@ -20,20 +20,8 @@ import type {
 import { UnsupportedCapabilityError } from "../../src/server/connectors/base.js";
 import { ClaudeConnector } from "../../src/server/connectors/claude.js";
 import { CodexConnector } from "../../src/server/connectors/codex.js";
-import { OpenCodeConnector } from "../../src/server/connectors/opencode.js";
-import { createOfficialOpenCodeSdkAdapter } from "../../src/server/connectors/opencode-sdk.js";
 import { createConnectorRegistry } from "../../src/server/connectors/registry.js";
 import { TraeConnector } from "../../src/server/connectors/trae.js";
-
-const opencodeSdk = vi.hoisted(() => ({
-  createOpencode: vi.fn(),
-  createOpencodeClient: vi.fn(),
-}));
-
-vi.mock("@opencode-ai/sdk/v2", () => ({
-  createOpencode: opencodeSdk.createOpencode,
-  createOpencodeClient: opencodeSdk.createOpencodeClient,
-}));
 
 type SpawnCall = {
   command: string;
@@ -64,8 +52,6 @@ type ConnectorFactory = (ctx: FixtureContext, env?: NodeJS.ProcessEnv) => AgentC
 const roots: string[] = [];
 
 afterEach(() => {
-  opencodeSdk.createOpencode.mockReset();
-  opencodeSdk.createOpencodeClient.mockReset();
   while (roots.length > 0) {
     const root = roots.pop();
     if (root) {
@@ -165,8 +151,8 @@ describe("native agent connectors", () => {
         "exec",
         "--json",
         "--skip-git-repo-check",
-        "--permission-mode",
-        "default",
+        "-c",
+        "plugins.trae-queue@local.enabled=false",
       ],
       resumeArgs: [
         "exec",
@@ -174,8 +160,8 @@ describe("native agent connectors", () => {
         "native-session-trae",
         "--json",
         "--skip-git-repo-check",
-        "--permission-mode",
-        "default",
+        "-c",
+        "plugins.trae-queue@local.enabled=false",
       ],
     },
   ];
@@ -358,10 +344,13 @@ describe("native agent connectors", () => {
     expect(terminalCalls).toEqual([
       expect.objectContaining({ status: "completed", nativeTurnId: null }),
     ]);
+    expect(started.events.filter((event) => event.type === "warning").map((event) => event.payload.event)).not.toEqual(
+      expect.arrayContaining([expect.stringContaining('\"type\":\"item.started\"')]),
+    );
     expect(JSON.stringify(started.events)).not.toContain("sk-secret-value");
   });
 
-  it("normalizes current Claude stream JSON and ignores partial duplicates", async () => {
+  it("normalizes current Claude stream JSON with partial and final message events", async () => {
     const ctx = createFixtureContext();
     const terminalCalls: TerminalCall[] = [];
     const connector = new ClaudeConnector({
@@ -382,7 +371,8 @@ describe("native agent connectors", () => {
     expect(started.nativeTurnId).toBeNull();
     expect(started.nativeSessionIds).toEqual([started.session.nativeSessionId]);
     expect(started.events.filter((event) => event.type === "assistant_message")).toEqual([
-      expect.objectContaining({ payload: expect.objectContaining({ text: "/tmp/project" }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ text: "duplicate", delta: true }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ text: "/tmp/project", final: true }) }),
     ]);
     expect(started.events).toEqual(
       expect.arrayContaining([
@@ -412,6 +402,269 @@ describe("native agent connectors", () => {
     expect(terminalCalls).toEqual([
       expect.objectContaining({ status: "completed", nativeTurnId: null }),
     ]);
+  });
+
+  it("uses a distinct Claude stream identity for each Turn in one session", async () => {
+    const ctx = createFixtureContext();
+    const connector = new ClaudeConnector({
+      executable: fixtureBinary("fake-claude.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        HOME: ctx.root,
+        AIN_FIXTURE_SCENARIO: "claude-modern-jsonl",
+      },
+      killTimeoutMs: 50,
+    });
+    const harness = await createSessionHarness(connector, "claude", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, { ...turnInput("claude", null), turnId: "turn-claude-1" });
+    await waitForSettled(harness.session);
+    await connector.startTurn(harness.session, { ...turnInput("claude", null), turnId: "turn-claude-2" });
+    await waitForSettled(harness.session);
+
+    const streamIds = harness.events
+      .filter((event) => event.type === "assistant_message" && event.payload.final === true)
+      .map((event) => event.payload.streamId);
+    expect(streamIds).toEqual([
+      "claude:turn-claude-1:assistant",
+      "claude:turn-claude-2:assistant",
+    ]);
+  });
+
+  it("streams Codex app-server message deltas and emits one final message identity", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      useAppServer: true,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+
+    const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    await waitForSettled(started.session);
+
+    expect(started.nativeSessionIds).toEqual(["app-thread-codex"]);
+    expect(started.nativeTurnId).toBe("app-turn-codex");
+    expect(started.events.filter((event) => event.type === "assistant_message")).toEqual([
+      expect.objectContaining({ payload: expect.objectContaining({ text: "hello", streamId: "app-message-1", delta: true }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ text: " world", streamId: "app-message-1", delta: true }) }),
+      expect.objectContaining({ payload: expect.objectContaining({ text: "hello world", streamId: "app-message-1", final: true }) }),
+    ]);
+    expect(terminalCalls).toEqual([expect.objectContaining({ status: "completed" })]);
+    expect(ctx.spawnCalls.find((call) => call.args[0] === "app-server")?.args).toEqual(["app-server", "--stdio"]);
+  });
+
+  it("accepts the next Codex app-server Turn from the terminal callback", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      useAppServer: true,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+    const terminalCalls: TerminalCall[] = [];
+    let secondTurn: Promise<{ nativeTurnId: string | null }> | null = null;
+    const callbackCapable = connector as CodexConnector & {
+      setTurnCallbacks(callbacks: { onTerminal(input: TerminalCall): Promise<void> }): void;
+    };
+    callbackCapable.setTurnCallbacks({
+      onTerminal: async (input) => {
+        terminalCalls.push(input);
+        if (input.turnId === "turn-codex-1") {
+          secondTurn = connector.startTurn(harness.session, {
+            ...turnInput("codex", harness.session.nativeSessionId),
+            turnId: "turn-codex-2",
+          });
+          await secondTurn;
+        }
+      },
+    });
+
+    await connector.startTurn(harness.session, { ...turnInput("codex", null), turnId: "turn-codex-1" });
+    await withTimeout(waitForTerminalCount(terminalCalls, 2), 500);
+    await expect(secondTurn).resolves.toEqual({ nativeTurnId: "app-turn-codex" });
+  });
+
+  it("accepts the next Codex app-server Turn from the terminal event handler", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      useAppServer: true,
+    });
+    let secondTurn: Promise<{ nativeTurnId: string | null }> | null = null;
+    let session!: LiveSession;
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onEvent: async (event) => {
+        if (event.type === "turn_status" && event.payload.status === "completed" && secondTurn === null) {
+          secondTurn = connector.startTurn(session, { ...turnInput("codex", "resume"), turnId: "turn-codex-2" });
+          await secondTurn;
+        }
+      },
+    });
+    session = harness.session;
+
+    await connector.startTurn(session, { ...turnInput("codex", null), turnId: "turn-codex-1" });
+    await waitForSettled(session);
+    await expect(secondTurn).resolves.toEqual({ nativeTurnId: "app-turn-codex" });
+  });
+
+  it("surfaces Codex app-server approval requests and sends the selected decision", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "app-server-approval" },
+      useAppServer: true,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, {
+      ...turnInput("codex", null),
+      snapshot: { modelId: null, permissionMode: "request_approval", pluginVersions: [] },
+    });
+    await waitForEvent(harness.events, "permission");
+    expect(harness.events).toContainEqual(expect.objectContaining({
+      type: "permission",
+      payload: expect.objectContaining({ requestId: "approval-1", request: "Run pwd" }),
+    }));
+
+    await connector.respondToPermission(harness.session, "approval-1", "allow_once");
+    await waitForSettled(harness.session);
+    expect(readRecords(ctx.recordPath)).toContainEqual(expect.objectContaining({
+      commandType: "permission-response",
+      response: { id: "approval-1", result: { decision: "accept" } },
+    }));
+  });
+
+  it("warns on malformed Codex app-server JSON and continues the Turn", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "app-server-malformed-json" },
+      useAppServer: true,
+    });
+    const started = await startTurn(connector, "codex", ctx.projectPath, null);
+    await waitForSettled(started.session);
+
+    expect(started.events).toContainEqual(expect.objectContaining({
+      type: "warning",
+      payload: expect.objectContaining({ code: "malformed_json" }),
+    }));
+    expect(started.events).toContainEqual(expect.objectContaining({
+      type: "turn_status",
+      payload: expect.objectContaining({ status: "completed" }),
+    }));
+  });
+
+  it("times out when Codex app-server does not answer a startup request", async () => {
+    const ctx = createFixtureContext();
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "app-server-hang" },
+      commandTimeoutMs: 100,
+      killTimeoutMs: 20,
+      useAppServer: true,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+
+    await expect(withTimeout(
+      connector.startTurn(harness.session, turnInput("codex", null)),
+      250,
+    )).rejects.toThrow("initialize timed out");
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+  });
+
+  it("terminates Codex app-server when an interrupt request is not answered", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "app-server-cancel-hang" },
+      interruptTimeoutMs: 100,
+      killTimeoutMs: 20,
+      useAppServer: true,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+
+    const turn = await connector.startTurn(harness.session, turnInput("codex", null));
+    await expect(withTimeout(connector.cancelTurn(harness.session, turn.nativeTurnId), 500))
+      .resolves.toEqual({ confirmed: true });
+    expect(terminalCalls).toEqual([expect.objectContaining({ status: "cancelled" })]);
+  });
+
+  it("interrupts a Codex app-server Turn when event persistence fails", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      useAppServer: true,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onEvent: async (event) => {
+        if (event.type === "assistant_message") throw new Error("event store unavailable");
+        harness.events.push(event);
+      },
+    });
+
+    await connector.startTurn(harness.session, turnInput("codex", null));
+    await waitForSettled(harness.session);
+
+    expect(terminalCalls).toEqual([expect.objectContaining({
+      status: "interrupted",
+      error: expect.objectContaining({ code: "event_processing_failed", message: "event store unavailable" }),
+    })]);
+  });
+
+  it("recovers a Codex app-server Turn when its completed status event cannot be persisted", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new CodexConnector({
+      executable: fixtureBinary("fake-codex.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      modelsCachePath: ctx.modelsCachePath,
+      env: fixtureEnv(ctx.recordPath),
+      useAppServer: true,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    let failedCompletedStatus = false;
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null, {
+      onEvent: async (event) => {
+        if (event.type === "turn_status" && event.payload.status === "completed" && !failedCompletedStatus) {
+          failedCompletedStatus = true;
+          throw new Error("event store unavailable");
+        }
+        harness.events.push(event);
+      },
+    });
+
+    await connector.startTurn(harness.session, turnInput("codex", null));
+    await withTimeout(waitForTerminalCount(terminalCalls, 1), 500);
+
+    expect(terminalCalls).toEqual([expect.objectContaining({
+      status: "interrupted",
+      error: expect.objectContaining({ code: "event_processing_failed", message: "event store unavailable" }),
+    })]);
   });
 
   it("maps a Claude error result to a failed Turn", async () => {
@@ -486,6 +739,18 @@ describe("native agent connectors", () => {
     });
   });
 
+  it("does not advertise a configured non-Claude model as a Claude model", async () => {
+    const ctx = createFixtureContext();
+    mkdirSync(join(ctx.root, ".claude"), { recursive: true });
+    writeFileSync(join(ctx.root, ".claude", "settings.json"), JSON.stringify({ model: "gpt-5.6-sol" }));
+    const connector = new ClaudeConnector({ env: { HOME: ctx.root } });
+
+    await expect(connector.fetchCatalog(ctx.projectPath)).resolves.toEqual({
+      models: [],
+      permissionModes: ["request_approval", "help_me_approve", "full_access"],
+    });
+  });
+
   it("maps request approval explicitly for Codex", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({
@@ -517,7 +782,7 @@ describe("native agent connectors", () => {
     ]);
   });
 
-  it("maps request approval explicitly for Trae", async () => {
+  it("uses the headless default for Trae request approval", async () => {
     const ctx = createFixtureContext();
     const connector = new TraeConnector({
       executable: fixtureBinary("fake-traecli.mjs"),
@@ -542,9 +807,120 @@ describe("native agent connectors", () => {
       "exec",
       "--json",
       "--skip-git-repo-check",
-      "--permission-mode",
-      "default",
+      "-c",
+      "plugins.trae-queue@local.enabled=false",
     ]);
+  });
+
+  it("accepts the next Trae Turn from the terminal event handler", async () => {
+    const ctx = createFixtureContext();
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
+      killTimeoutMs: 50,
+    });
+    let secondTurn: Promise<{ nativeTurnId: string | null }> | null = null;
+    let session!: LiveSession;
+    const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null, {
+      onEvent: async (event) => {
+        if (event.type === "turn_status" && event.payload.status === "completed" && secondTurn === null) {
+          secondTurn = connector.startTurn(session, { ...turnInput("trae", session.nativeSessionId), turnId: "turn-trae-2" });
+          await secondTurn;
+        }
+      },
+    });
+    session = harness.session;
+
+    await connector.startTurn(session, { ...turnInput("trae", null), turnId: "turn-trae-1" });
+    await vi.waitFor(() => expect(secondTurn).not.toBeNull());
+
+    await expect(secondTurn).resolves.toEqual(expect.objectContaining({ nativeTurnId: expect.anything() }));
+  });
+
+  it("completes a Turn when shutdown follows a persisted final answer", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "final-output-hang" },
+      killTimeoutMs: 50,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, turnInput("trae", null));
+    await waitForEvent(harness.events, "assistant_message");
+    await connector.closeSession(harness.session);
+
+    expect(terminalCalls).toEqual([expect.objectContaining({ status: "completed" })]);
+  });
+
+  it("interrupts a Turn when work continues after a complete assistant item", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: { ...fixtureEnv(ctx.recordPath), AIN_FIXTURE_SCENARIO: "final-output-then-tool-hang" },
+      killTimeoutMs: 50,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, turnInput("trae", null));
+    await waitForEvent(harness.events, "shell");
+    await connector.closeSession(harness.session);
+
+    expect(terminalCalls).toEqual([expect.objectContaining({ status: "interrupted" })]);
+  });
+
+  it("injects the Ain One Queue hook only when Trae auto queue is enabled", async () => {
+    const ctx = createFixtureContext();
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
+      queueHome: join(ctx.root, "queue"),
+    });
+    const harness = await createSessionHarness(connector, "trae", ctx.projectPath, null);
+
+    await connector.startTurn(harness.session, {
+      ...turnInput("trae", null),
+      snapshot: {
+        modelId: null, permissionMode: "request_approval", pluginVersions: [], autoQueue: true,
+      },
+    });
+    await waitForSettled(harness.session);
+
+    const args = ctx.spawnCalls.find((call) => call.args[0] === "exec")?.args ?? [];
+    expect(args).toContain('plugins.trae-queue@local.enabled=false');
+    expect(args.some((arg) => arg.startsWith("hooks.Stop=") && arg.includes("trae-queue-hook.mjs"))).toBe(true);
+    expect(args.some((arg) => arg.startsWith("hooks.PostToolUse=") && arg.includes("trae-queue-hook.mjs"))).toBe(true);
+  });
+
+  it("releases an independently waiting Trae Queue hook when the session closes", async () => {
+    const ctx = createFixtureContext();
+    const queueHome = join(ctx.root, "queue");
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: fixtureEnv(ctx.recordPath),
+      queueHome,
+    });
+    const harness = await createSessionHarness(
+      connector, "trae", ctx.projectPath, "native-session-trae",
+    );
+    const hook = resolve(process.cwd(), "src/server/connectors/trae-queue-hook.mjs");
+    const statePath = join(queueHome, "hook-sessions", "native-session-trae", "state.json");
+    const child = nodeSpawn(process.execPath, [hook], { env: { ...process.env, TRAE_QUEUE_HOME: queueHome } });
+    child.stdin?.end(JSON.stringify({ hook_event_name: "Stop", session_id: "native-session-trae" }));
+    await waitForFile(statePath, 250);
+
+    await connector.closeSession(harness.session);
+
+    expect(await waitForProcessExit(child.pid!, 250)).toBe(true);
   });
 
   it("maps Trae assisted approval to its supported auto mode", async () => {
@@ -564,6 +940,8 @@ describe("native agent connectors", () => {
       "exec",
       "--json",
       "--skip-git-repo-check",
+      "-c",
+      "plugins.trae-queue@local.enabled=false",
       "--permission-mode",
       "auto",
     ]);
@@ -589,6 +967,8 @@ describe("native agent connectors", () => {
       "exec",
       "--json",
       "--skip-git-repo-check",
+      "-c",
+      "plugins.trae-queue@local.enabled=false",
       "--dangerously-bypass-approvals-and-sandbox",
     ]);
   });
@@ -814,260 +1194,6 @@ describe("native agent connectors", () => {
       }),
     ).rejects.toMatchObject({ definiteStartRejection: true });
     expect(ctx.spawnCalls.filter((call) => call.args[0] === "exec")).toHaveLength(0);
-  });
-
-  it("requires both opencode sdk adapter and local executable", async () => {
-    const ctx = createFixtureContext();
-    const withoutSdk = new OpenCodeConnector({
-      executable: fixtureBinary("fake-opencode.mjs"),
-      spawn: spawnRecorder(ctx.spawnCalls),
-      env: fixtureEnv(ctx.recordPath),
-    });
-
-    await expect(withoutSdk.probe()).resolves.toMatchObject({ status: "not_installed" });
-    await expect(withoutSdk.fetchCatalog(ctx.projectPath)).resolves.toEqual({
-      models: [],
-      permissionModes: [],
-    });
-    await expect(
-      withoutSdk.createOrResumeSession({
-        projectPath: ctx.projectPath,
-        conversationId: "conversation-opencode",
-        nativeSessionId: null,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
-
-    const withMissingExecutable = new OpenCodeConnector({
-      executable: "/missing/opencode",
-      sdkAdapter: createOpenCodeSdkAdapter(),
-    });
-    await expect(withMissingExecutable.probe()).resolves.toMatchObject({ status: "not_installed" });
-    await expect(
-      withMissingExecutable.createOrResumeSession({
-        projectPath: ctx.projectPath,
-        conversationId: "conversation-opencode",
-        nativeSessionId: null,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
-
-    await expect(
-      withMissingExecutable.startTurn(
-        {
-          id: "conversation-opencode",
-          nativeSessionId: null,
-        },
-        {
-          content: "say hello",
-          snapshot: {
-            modelId: null,
-            permissionMode: "help_me_approve",
-            pluginVersions: [],
-          },
-          turnId: "turn-opencode-start",
-        },
-      ),
-    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
-
-    const withBrokenExecutable = new OpenCodeConnector({
-      executable: "/usr/bin/false",
-      sdkAdapter: createOpenCodeSdkAdapter(),
-    });
-    await expect(
-      withBrokenExecutable.createOrResumeSession({
-        projectPath: ctx.projectPath,
-        conversationId: "conversation-opencode",
-        nativeSessionId: null,
-      }),
-    ).rejects.toBeInstanceOf(UnsupportedCapabilityError);
-  });
-
-  it("opencode sdk path emits normalized turn_status and terminal callback", async () => {
-    const ctx = createFixtureContext();
-    const terminalCalls: TerminalCall[] = [];
-    const connector = new OpenCodeConnector({
-      executable: fixtureBinary("fake-opencode.mjs"),
-      spawn: spawnRecorder(ctx.spawnCalls),
-      env: fixtureEnv(ctx.recordPath),
-      sdkAdapter: createOpenCodeSdkAdapter(),
-    });
-    setTurnCallbacks(connector, terminalCalls);
-
-    await expect(connector.probe()).resolves.toMatchObject({ status: "available" });
-
-    const started = await startTurn(connector, "opencode", ctx.projectPath, null);
-    await waitForSettled(started.session);
-
-    expect(started.session.nativeSessionId).toBe("sdk-session-opencode");
-    expect(started.nativeTurnId).toBe("sdk-turn-opencode");
-    expect(started.events.map((event) => event.type)).toEqual(
-      expect.arrayContaining(["assistant_message", "turn_status"]),
-    );
-    expect(terminalCalls).toHaveLength(1);
-    expect(terminalCalls[0]?.status).toBe("completed");
-  });
-
-  it("reports the official OpenCode adapter as limited until native events are streamed", async () => {
-    const ctx = createFixtureContext();
-    const create = vi.fn().mockResolvedValue({ data: { id: "sdk-session-opencode" } });
-    const prompt = vi.fn();
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      session: {
-        create,
-        prompt,
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: fixtureEnv(ctx.recordPath),
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-
-    await expect(connector.probe()).resolves.toMatchObject({
-      status: "capability_limited",
-      diagnostic: expect.stringContaining("stream"),
-    });
-    const harness = await createSessionHarness(connector, "opencode", ctx.projectPath, null);
-    expect(opencodeSdk.createOpencodeClient).toHaveBeenCalledWith({
-      baseUrl: expect.stringMatching(/^http:\/\/127\.0\.0\.1:\d+$/),
-    });
-    expect(ctx.spawnCalls).toContainEqual(
-      expect.objectContaining({
-        command: fixtureBinary("fake-opencode.mjs"),
-        args: ["serve", "--hostname=127.0.0.1", "--port=0"],
-        shell: false,
-      }),
-    );
-    expect(create).toHaveBeenCalledWith(
-      expect.objectContaining({ directory: ctx.projectPath }),
-      { throwOnError: true },
-    );
-    await expect(
-      connector.startTurn(harness.session, {
-        ...turnInput("opencode", null),
-        snapshot: { modelId: null, permissionMode: "full_access", pluginVersions: [] },
-      }),
-    ).rejects.toMatchObject({ definiteStartRejection: true });
-    expect(prompt).not.toHaveBeenCalled();
-
-    await connector.closeSession(harness.session);
-  });
-
-  it("advertises only full access for the official OpenCode transport", async () => {
-    const ctx = createFixtureContext();
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      provider: {
-        list: vi.fn().mockResolvedValue({
-          data: {
-            connected: ["openai"],
-            all: [{ id: "openai", models: { "gpt-5": {} } }],
-          },
-        }),
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn: spawnRecorder(ctx.spawnCalls),
-        env: fixtureEnv(ctx.recordPath),
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-
-    await expect(connector.fetchCatalog(ctx.projectPath)).resolves.toEqual({
-      models: ["openai/gpt-5"],
-      permissionModes: ["full_access"],
-    });
-  });
-
-  it("escalates OpenCode server cleanup when startup URL detection times out", async () => {
-    vi.useFakeTimers();
-    const child = Object.assign(new EventEmitter(), {
-      stdout: new PassThrough(),
-      stderr: new PassThrough(),
-      pid: 12_345,
-      exitCode: null,
-      signalCode: null,
-    }) as unknown as ChildProcess;
-    const kill = vi.fn((signal?: NodeJS.Signals | number) => {
-      if (signal === "SIGKILL") {
-        (child as ChildProcess & { signalCode: NodeJS.Signals | null }).signalCode = "SIGKILL";
-        child.emit("close", null, "SIGKILL");
-      }
-      return true;
-    });
-    child.kill = kill as typeof child.kill;
-    const adapter = createOfficialOpenCodeSdkAdapter({
-      executable: "opencode",
-      spawn: () => child,
-      killTimeoutMs: 50,
-    });
-
-    try {
-      const catalog = adapter.fetchCatalog("/tmp/project");
-      const rejected = expect(catalog).rejects.toThrow(
-        "Timed out waiting for OpenCode server to start",
-      );
-      await vi.advanceTimersByTimeAsync(5_000);
-      await vi.advanceTimersByTimeAsync(50);
-
-      await rejected;
-      expect(kill.mock.calls.map(([signal]) => signal)).toEqual([undefined, "SIGKILL"]);
-    } finally {
-      vi.useRealTimers();
-    }
-  });
-
-  it("closes a newly started OpenCode server when session creation fails", async () => {
-    const ctx = createFixtureContext();
-    const children: ChildProcess[] = [];
-    const recordSpawn = spawnRecorder(ctx.spawnCalls);
-    const createError = new Error("session create failed");
-    opencodeSdk.createOpencodeClient.mockReturnValue({
-      session: {
-        create: vi.fn().mockRejectedValue(createError),
-      },
-    });
-    const connector = createConnectorRegistry({
-      opencode: {
-        executable: fixtureBinary("fake-opencode.mjs"),
-        spawn(command, args, options) {
-          const child = recordSpawn(command, args, options);
-          children.push(child);
-          return child;
-        },
-        env: fixtureEnv(ctx.recordPath),
-        killTimeoutMs: 50,
-      },
-    }).opencode;
-
-    let caught: unknown;
-    try {
-      await connector.createOrResumeSession({
-        projectPath: ctx.projectPath,
-        conversationId: "conversation-opencode-create-failure",
-        nativeSessionId: null,
-      });
-    } catch (error) {
-      caught = error;
-    }
-
-    const serveCall = ctx.spawnCalls.find((call) => call.args[0] === "serve");
-    const terminatedBeforeCleanup = serveCall?.killSignals.includes(undefined) ?? false;
-    await Promise.all(children.map(async (child) => {
-      if (child.exitCode !== null || child.signalCode !== null) {
-        return;
-      }
-      await new Promise<void>((resolvePromise) => {
-        child.once("close", () => resolvePromise());
-        child.kill("SIGKILL");
-      });
-    }));
-
-    expect(caught).toBe(createError);
-    expect(terminatedBeforeCleanup).toBe(true);
   });
 
   it("claude new session can complete without session.started when uuid already exists", async () => {
@@ -1515,6 +1641,63 @@ describe("native agent connectors", () => {
     ]);
   });
 
+  it("classifies an occupied native session as a definite start rejection", async () => {
+    const ctx = createFixtureContext();
+    const terminalCalls: TerminalCall[] = [];
+    const connector = new TraeConnector({
+      executable: fixtureBinary("fake-traecli.mjs"),
+      spawn: spawnRecorder(ctx.spawnCalls),
+      env: {
+        ...fixtureEnv(ctx.recordPath),
+        AIN_FIXTURE_SCENARIO: "thread-conflict",
+      },
+      killTimeoutMs: 50,
+    });
+    setTurnCallbacks(connector, terminalCalls);
+    const harness = await createSessionHarness(
+      connector,
+      "trae",
+      ctx.projectPath,
+      "native-session-trae",
+    );
+    const input = turnInput("trae", "native-session-trae");
+    input.snapshot.permissionMode = "request_approval";
+
+    await expect(
+      withTimeout(connector.startTurn(harness.session, input), 250),
+    ).rejects.toMatchObject({
+      code: "session_in_use",
+      definiteStartRejection: true,
+      message: expect.not.stringContaining("thread-store conflict"),
+    });
+    await expect(withTimeout(waitForSettled(harness.session), 250)).resolves.toBeUndefined();
+    expect(terminalCalls).toEqual([
+      expect.objectContaining({
+        status: "start_failed",
+        error: {
+          code: "session_in_use",
+          message: "This Agent session is still in use by another process. Restart the workspace and try again.",
+        },
+      }),
+    ]);
+  });
+
+  it("handles stdin errors instead of leaving an uncaught stream error", async () => {
+    const ctx = createFixtureContext();
+    const child = createHangingChild();
+    const connector = new CodexConnector({
+      spawn: () => child,
+      modelsCachePath: ctx.modelsCachePath,
+    });
+    const harness = await createSessionHarness(connector, "codex", ctx.projectPath, null);
+    const started = connector.startTurn(harness.session, turnInput("codex", null));
+    const listenerCount = child.stdin?.listenerCount("error") ?? 0;
+
+    child.emit("error", new Error("stop test child"));
+    await expect(started).rejects.toThrow("stop test child");
+    expect(listenerCount).toBeGreaterThan(0);
+  });
+
   it("escalates to SIGKILL when SIGTERM is ignored", async () => {
     const ctx = createFixtureContext();
     const connector = new CodexConnector({
@@ -1689,16 +1872,12 @@ describe("native agent connectors", () => {
         spawn: spawnRecorder(ctx.spawnCalls),
         env: fixtureEnv(ctx.recordPath),
       },
-      opencode: {
-        sdkAdapter: createOpenCodeSdkAdapter(),
-      },
     });
 
-    expect(Object.keys(registry).sort()).toEqual(["claude", "codex", "opencode", "trae"]);
+    expect(Object.keys(registry).sort()).toEqual(["claude", "codex", "trae"]);
     expect(registry.codex).toBeInstanceOf(CodexConnector);
     expect(registry.claude).toBeInstanceOf(ClaudeConnector);
     expect(registry.trae).toBeInstanceOf(TraeConnector);
-    expect(registry.opencode).toBeInstanceOf(OpenCodeConnector);
   });
 });
 
@@ -1796,8 +1975,8 @@ async function startTurn(
 }> {
   const harness = await createSessionHarness(connector, id, projectPath, nativeSessionId);
   const input = turnInput(id, nativeSessionId);
-  if (id === "trae" || id === "opencode") {
-    input.snapshot.permissionMode = id === "trae" ? "request_approval" : "full_access";
+  if (id === "trae") {
+    input.snapshot.permissionMode = "request_approval";
   }
   const turn = await connector.startTurn(harness.session, input);
 
@@ -1852,6 +2031,22 @@ function turnInput(id: AgentProductId, nativeSessionId: string | null) {
 async function waitForSettled(session: LiveSession): Promise<void> {
   const runtime = session as LiveSession & { settled?: Promise<void> };
   await runtime.settled;
+}
+
+async function waitForEvent(events: ConnectorEvent[], type: ConnectorEvent["type"]): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (!events.some((event) => event.type === type)) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${type}`);
+    await sleep(5);
+  }
+}
+
+async function waitForTerminalCount(calls: TerminalCall[], count: number): Promise<void> {
+  const deadline = Date.now() + 500;
+  while (calls.length < count) {
+    if (Date.now() >= deadline) throw new Error(`Timed out waiting for ${count} terminal calls`);
+    await sleep(5);
+  }
 }
 
 function readRecords(recordPath: string): Array<Record<string, unknown>> {
@@ -1935,60 +2130,4 @@ async function withTimeout<T>(promise: Promise<T>, ms: number): Promise<T> {
 
 function getActiveTurn(session: LiveSession): unknown {
   return (session as LiveSession & { activeTurn?: unknown }).activeTurn;
-}
-
-function createOpenCodeSdkAdapter() {
-  return {
-    async probe() {
-      return { status: "available" as const, version: "sdk-test" };
-    },
-    async fetchCatalog() {
-      return {
-        models: ["opencode-sdk-model"],
-        permissionModes: ["request_approval", "help_me_approve", "full_access"] as PermissionMode[],
-      };
-    },
-    async createOrResumeSession(input: SessionInput) {
-      return {
-        nativeSessionId: input.nativeSessionId ?? "sdk-session-opencode",
-      };
-    },
-    async startTurn(
-      _session: LiveSession,
-      _input: ReturnType<typeof turnInput>,
-      sink: {
-        emitEvent: (event: ConnectorEvent) => Promise<void>;
-        syncNativeSessionId: (nativeSessionId: string | null) => Promise<void>;
-        emitTerminal: (input: {
-          turnId: string | undefined;
-          nativeTurnId: string | null;
-          status: TerminalTurnStatus;
-          error?: NormalizedError;
-        }) => Promise<void>;
-      },
-    ) {
-      await sink.syncNativeSessionId("sdk-session-opencode");
-      await sink.emitEvent({
-        type: "assistant_message",
-        payload: { text: "hello from opencode sdk" },
-      });
-      const settled = (async () => {
-        await sink.emitTerminal({
-          turnId: "turn-opencode-start",
-          nativeTurnId: "sdk-turn-opencode",
-          status: "completed",
-        });
-      })();
-      return {
-        nativeTurnId: "sdk-turn-opencode",
-        settled,
-        async cancel() {
-          return true;
-        },
-        async close() {
-          await settled;
-        },
-      };
-    },
-  };
 }

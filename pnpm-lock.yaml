@@ -8,9 +8,6 @@ importers:
 
   .:
     dependencies:
-      '@opencode-ai/sdk':
-        specifier: 1.18.19
-        version: 1.18.19
       markdown-to-jsx:
         specifier: 7.7.17
         version: 7.7.17(react@19.1.0)
@@ -359,9 +356,6 @@ packages:
     cpu: [x64]
     os: [linux]
     libc: [glibc]
-
-  '@opencode-ai/sdk@1.18.19':
-    resolution: {integrity: sha512-AnszRg7cJ3PA6/06mkqdTJDKn9NJuV26AJMWbKEgRsznbJvrhf3PT8UhQQOhyKQYCygx9ZOxyKMIPVOQdMSS1A==}
 
   '@playwright/test@1.54.2':
     resolution: {integrity: sha512-A+znathYxPf+72riFd1r1ovOLqsIIB0jKIoPjyK2kqEIe30/6jF6BC7QNluHuwUmsD2tv1XZVugN8GqfTMOxsA==}
@@ -1388,10 +1382,6 @@ snapshots:
 
   '@napi-rs/lzma-linux-x64-gnu@1.5.1':
     optional: true
-
-  '@opencode-ai/sdk@1.18.19':
-    dependencies:
-      cross-spawn: 7.0.6
 
   '@playwright/test@1.54.2':
     dependencies:

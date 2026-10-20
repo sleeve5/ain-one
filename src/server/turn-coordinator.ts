@@ -534,7 +534,7 @@ export class TurnCoordinator {
     status: TerminalTurnStatus;
     error?: NormalizedError;
   }): Promise<void> {
-    const { conversationId, status } = input;
+    const { conversationId } = input;
     const live = this.liveSessions.get(conversationId);
     let result = await this.commitTerminalWithRetry(input);
     const releasedLease = result === "stale" && live?.ownerTurnId === input.turnId;
@@ -626,7 +626,6 @@ export class TurnCoordinator {
   private async tryContinuePending(conversationId: string): Promise<void> {
     const previous = this.continuationQueues.get(conversationId) ?? Promise.resolve();
     const current = previous.catch(() => undefined).then(async () => {
-      const activeTurn = this.repositories.getActiveTurn(conversationId);
       const live = this.liveSessions.get(conversationId);
       const message = this.repositories.listQueuedMessages(conversationId)[0];
       if (!live?.reusableLease || !live.connector.continueTurn || !message || message.status !== "pending") return;

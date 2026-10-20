@@ -1,4 +1,4 @@
-export type AgentProductId = "codex" | "claude" | "trae" | "opencode";
+export type AgentProductId = "codex" | "claude" | "trae";
 
 export type PermissionMode =
   | "request_approval"
@@ -53,6 +53,7 @@ export interface Conversation {
   queuePaused: boolean;
   autoQueue?: boolean;
   archivedAt?: string | null;
+  latestEventSequence?: number;
   createdAt: string;
   updatedAt: string;
 }
@@ -170,12 +171,6 @@ export interface CancelResult {
   confirmed: boolean;
 }
 
-export interface NativePluginCandidate {
-  pluginId: string;
-  name: string;
-  versionId: string;
-}
-
 export interface MaterializeInput {
   projectPath: string;
   plugins: PluginVersion[];
@@ -202,7 +197,6 @@ export interface AgentConnector {
     nativeTurnId: string | null,
   ): Promise<CancelResult>;
   closeSession(session: LiveSession): Promise<void>;
-  discoverPlugins(): Promise<NativePluginCandidate[]>;
   materializePlugins(input: MaterializeInput): Promise<MaterializeResult>;
 }
 
@@ -244,10 +238,7 @@ export type GraphNode =
   | { id: string; type: "input"; name: string; config: { fields: GraphInputField[] } }
   | { id: string; type: "agent"; name: string; config: { agentProductId: AgentProductId; modelId: string | null; permissionMode: PermissionMode; prompt?: string; instruction?: string; inputs?: GraphPort[]; outputs?: GraphPort[] } }
   | { id: string; type: "output"; name: string; config: { fields: GraphPort[] } }
-  | { id: string; type: "loop_counter"; name: string; config: { maxIterations: number } }
-  | { id: string; type: "literal"; name: string; config: { value: string } }
-  | { id: string; type: "template"; name: string; config: { template: string } }
-  | { id: string; type: "passthrough"; name: string; config: Record<string, never> };
+  | { id: string; type: "loop_counter"; name: string; config: { maxIterations: number } };
 
 export interface GraphEdge {
   id: string;

@@ -30,7 +30,6 @@ export function createInitialWorkspaceUiState(): WorkspaceUiState {
       conversation: null,
       agents: [],
       installedPlugins: [],
-      pluginCandidates: [],
       pluginError: null,
     },
   };
@@ -42,44 +41,43 @@ export function applyConversationEvent(
 ): ConversationView {
   const rawEvents = appendRawEvent(conversation.rawEvents ?? conversation.events, event);
   const nextEvents = appendConversationEvent(conversation.events, event);
-  if (nextEvents === conversation.events && rawEvents === (conversation.rawEvents ?? conversation.events)) {
+  const latestEventSequence = Math.max(conversation.latestEventSequence ?? 0, event.sequence);
+  if (
+    nextEvents === conversation.events &&
+    rawEvents === (conversation.rawEvents ?? conversation.events) &&
+    latestEventSequence === conversation.latestEventSequence
+  ) {
     return conversation;
   }
+  const nextConversation = {
+    ...conversation,
+    events: nextEvents,
+    rawEvents,
+    latestEventSequence,
+  };
   if (event.type === "queue_status") {
-    return { ...conversation, events: nextEvents, rawEvents };
+    return nextConversation;
   }
 
   if (event.type !== "turn_status") {
-    return {
-      ...conversation,
-      events: nextEvents,
-      rawEvents,
-    };
+    return nextConversation;
   }
 
   const payloadStatus = readTurnStatus(event.payload);
   if (!payloadStatus) {
-    return {
-      ...conversation,
-      events: nextEvents,
-      rawEvents,
-    };
+    return nextConversation;
   }
 
   if (payloadStatus === "starting" || payloadStatus === "running" || payloadStatus === "cancelling") {
     return {
-      ...conversation,
-      events: nextEvents,
-      rawEvents,
+      ...nextConversation,
       activeTurnStatus: payloadStatus,
       latestTurnStatus: payloadStatus,
     };
   }
 
   return {
-    ...conversation,
-    events: nextEvents,
-    rawEvents,
+    ...nextConversation,
     activeTurnStatus: null,
     latestTurnId: readTurnId(event.payload) ?? conversation.latestTurnId,
     latestTurnStatus: payloadStatus,

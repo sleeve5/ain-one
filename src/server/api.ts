@@ -20,13 +20,12 @@ import {
   validateGraphDefinition,
   validateGraphDraft,
 } from "../shared/validation.js";
-import type { ProjectFilesService } from "./files.js";
-import { FilesServiceError } from "./files.js";
 import type { PluginScope, Repositories } from "./repositories.js";
 import type { CreateGraphInput, GraphRepository } from "./graph-repository.js";
+import type { GraphRunStart } from "./graph-runtime.js";
 
 const LOOPBACK_HOSTS = new Set(["127.0.0.1", "localhost", "::1"]);
-const SUPPORTED_AGENTS: AgentProductId[] = ["codex", "claude", "trae", "opencode"];
+const SUPPORTED_AGENTS: AgentProductId[] = ["codex", "claude", "trae"];
 
 interface TurnCoordinatorLike {
   enqueueMessage(conversationId: string, content: string): Promise<void>;
@@ -73,7 +72,6 @@ interface ApiServerOptions {
   token: string;
   repositories: Repositories;
   turnCoordinator: TurnCoordinatorLike;
-  files: ProjectFilesService;
   pickProjectDirectory?: () => Promise<string | null>;
   pickLocalPath?: (kind: "directory" | "file", purpose: "plugin" | "agent") => Promise<string | null>;
   allowedOrigins?: string[];
@@ -101,7 +99,7 @@ interface ApiServerOptions {
   validatePluginVersions?: (scope: PluginScope, pluginVersions: PluginVersion[]) => void;
   pluginHandler?: (request: PluginRequest) => Promise<PluginResponse>;
   graphRepository?: GraphRepository;
-  graphRuntime?: { run(graphId: string, input: string | Record<string, string>): Promise<GraphRun>; cancel(runId: string): Promise<boolean> };
+  graphRuntime?: { start(graphId: string, input: string | Record<string, string>): GraphRunStart | Promise<GraphRunStart>; cancel(runId: string): Promise<boolean> };
 }
 
 interface OriginRules {
@@ -275,8 +273,10 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       return;
     }
     if (graphMatch && request.method === "DELETE") {
-      if (options.graphRepository?.getLatestRun(graphMatch[0])?.status === "running") { sendError(response, 409, "graph_run_active", "A running Graph cannot be deleted"); return; }
-      if (!options.graphRepository?.getGraph(graphMatch[0])?.archivedAt) { sendError(response, 409, "graph_not_archived", "Only archived Graphs can be deleted"); return; }
+      const graph = options.graphRepository?.getGraph(graphMatch[0]);
+      if (!graph) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
+      if (options.graphRepository?.getLatestRun(graph.id)?.status === "running") { sendError(response, 409, "graph_run_active", "A running Graph cannot be deleted"); return; }
+      if (!graph.archivedAt) { sendError(response, 409, "graph_not_archived", "Only archived Graphs can be deleted"); return; }
       if (!options.graphRepository?.deleteGraph(graphMatch[0])) { sendError(response, 404, "graph_not_found", "Graph not found"); return; }
       response.writeHead(204); response.end(); return;
     }
@@ -294,14 +294,10 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       const graphErrors = validateGraphDefinition(graph.definition);
       if (graphErrors.length) { sendError(response, 400, "graph_not_runnable", graphErrors.join("; ")); return; }
       if (!options.graphRuntime) { sendError(response, 501, "graph_runtime_unsupported", "Graph runtime is unavailable"); return; }
-      const graphRepository = options.graphRepository;
-      if (!graphRepository) { sendError(response, 501, "graph_unsupported", "Graph is unavailable"); return; }
       const body = readRecord(await readJsonBody(request, bodyLimitBytes), "Invalid graph run payload");
       if (typeof body.input !== "string" && (!body.input || typeof body.input !== "object" || Array.isArray(body.input) || Object.values(body.input).some((value) => typeof value !== "string"))) throw new ValidationError("input must be a string or string map");
-      const runPromise = options.graphRuntime.run(graph.id, body.input as string | Record<string, string>);
-      await new Promise((resolve) => setImmediate(resolve));
-      const run = graphRepository.getLatestRun(graph.id) ?? await runPromise;
-      void runPromise.catch(() => undefined);
+      const { run, completion } = await options.graphRuntime.start(graph.id, body.input as string | Record<string, string>);
+      void completion.catch(() => undefined);
       sendJson(response, 202, { run });
       return;
     }
@@ -391,15 +387,23 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         sendError(response, 404, "project_not_found", "Project not found");
         return;
       }
-      if (body.name !== undefined) options.repositories.renameProject(projectId, body.name);
+      if (body.archived === true && options.graphRepository?.hasActiveRunForProject(projectId)) {
+        sendError(response, 409, "graph_run_active", "A Project with an active Graph Run cannot be archived");
+        return;
+      }
       if (body.archived !== undefined && options.repositories.archiveProject(projectId, body.archived) === "turn_active") {
         sendError(response, 409, "turn_active", "A Project with an active Turn cannot be archived");
         return;
       }
+      if (body.name !== undefined) options.repositories.renameProject(projectId, body.name);
       sendJson(response, 200, { project: options.repositories.getProject(projectId) });
       return;
     }
     if (request.method === "DELETE" && projectMatch) {
+      if (options.graphRepository?.hasActiveRunForProject(projectMatch[0])) {
+        sendError(response, 409, "graph_run_active", "A Project with an active Graph Run cannot be deleted");
+        return;
+      }
       const result = options.repositories.deleteArchivedProject(projectMatch[0]);
       if (result === "not_found") { sendError(response, 404, "project_not_found", "Project not found"); return; }
       if (result === "not_archived") { sendError(response, 409, "project_not_archived", "Only archived Projects can be deleted"); return; }
@@ -465,14 +469,19 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
         sendError(response, 404, "conversation_not_found", "Conversation not found");
         return;
       }
-      if (body.title !== undefined) {
-        options.repositories.renameConversation(conversationId, body.title);
-      }
       if (body.archived !== undefined) {
-        if (options.repositories.archiveConversation(conversationId, body.archived) === "turn_active") {
+        const result = options.repositories.archiveConversation(conversationId, body.archived);
+        if (result === "turn_active") {
           sendError(response, 409, "turn_active", "An active Conversation cannot be archived");
           return;
         }
+        if (result === "agent_unsupported") {
+          sendError(response, 409, "agent_retired", "This Conversation uses a retired Agent and cannot be restored");
+          return;
+        }
+      }
+      if (body.title !== undefined) {
+        options.repositories.renameConversation(conversationId, body.title);
       }
       sendJson(response, 200, { conversation: options.repositories.getConversation(conversationId) });
       return;
@@ -480,6 +489,15 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
 
     const forkConversationMatch = match(pathname, /^\/api\/conversations\/([^/]+)\/fork$/);
     if (request.method === "POST" && forkConversationMatch) {
+      const source = options.repositories.getConversation(forkConversationMatch[0]);
+      if (!source) {
+        sendError(response, 404, "conversation_not_found", "Conversation not found");
+        return;
+      }
+      if (!SUPPORTED_AGENTS.includes(source.agentProductId)) {
+        sendError(response, 409, "agent_retired", "This Conversation uses a retired Agent and cannot be forked");
+        return;
+      }
       const conversation = options.repositories.forkConversation(forkConversationMatch[0]);
       if (!conversation) {
         sendError(response, 404, "conversation_not_found", "Conversation not found");
@@ -958,57 +976,6 @@ export function createApiServer(options: ApiServerOptions): ApiServer {
       return;
     }
 
-    const filesMatch = match(pathname, /^\/api\/projects\/([^/]+)\/files$/);
-    if (request.method === "GET" && filesMatch) {
-      const project = options.repositories.getProject(filesMatch[0]);
-      if (!project) {
-        sendError(response, 404, "project_not_found", "Project not found");
-        return;
-      }
-      const path = readPathQuery(request.url);
-      const files = await options.files.list(project.path, path);
-      sendJson(response, 200, files);
-      return;
-    }
-
-    const previewMatch = match(pathname, /^\/api\/projects\/([^/]+)\/preview$/);
-    if (request.method === "GET" && previewMatch) {
-      const project = options.repositories.getProject(previewMatch[0]);
-      if (!project) {
-        sendError(response, 404, "project_not_found", "Project not found");
-        return;
-      }
-      const path = readPathQuery(request.url);
-      const preview = await options.files.preview(project.path, path);
-      sendJson(response, 200, preview);
-      return;
-    }
-
-    const gitStatusMatch = match(pathname, /^\/api\/projects\/([^/]+)\/git\/status$/);
-    if (request.method === "GET" && gitStatusMatch) {
-      const project = options.repositories.getProject(gitStatusMatch[0]);
-      if (!project) {
-        sendError(response, 404, "project_not_found", "Project not found");
-        return;
-      }
-      const status = await options.files.gitStatus(project.path);
-      sendJson(response, 200, status);
-      return;
-    }
-
-    const gitDiffMatch = match(pathname, /^\/api\/projects\/([^/]+)\/git\/diff$/);
-    if (request.method === "GET" && gitDiffMatch) {
-      const project = options.repositories.getProject(gitDiffMatch[0]);
-      if (!project) {
-        sendError(response, 404, "project_not_found", "Project not found");
-        return;
-      }
-      const path = readPathQuery(request.url);
-      const diff = await options.files.gitDiff(project.path, path);
-      sendJson(response, 200, diff);
-      return;
-    }
-
     if (request.method === "GET" && pathname === "/api/settings") {
       sendJson(response, 200, {
         host: options.host,
@@ -1067,14 +1034,6 @@ interface ClassifiedError {
 }
 
 function classifyError(error: unknown): ClassifiedError {
-  if (error instanceof FilesServiceError) {
-    return {
-      status: error.status,
-      code: error.code,
-      message: error.message,
-    };
-  }
-
   if (error instanceof InputError) {
     return {
       status: error.status,
@@ -1187,50 +1146,6 @@ async function readJsonBody(request: IncomingMessage, maxBytes: number): Promise
   } catch {
     throw new InputError(400, "invalid_json", "Request body must be valid JSON");
   }
-}
-
-function readPathQuery(rawUrl: string | undefined): string | null {
-  const rawValue = readRawQueryValue(rawUrl, "path");
-  if (rawValue === null) {
-    return null;
-  }
-
-  try {
-    return decodeURIComponent(rawValue.replace(/\+/g, "%20"));
-  } catch {
-    throw new InputError(
-      400,
-      "invalid_path_encoding",
-      "Query parameter path must be valid URL encoding",
-    );
-  }
-}
-
-function readRawQueryValue(rawUrl: string | undefined, key: string): string | null {
-  if (!rawUrl) {
-    return null;
-  }
-
-  const queryIndex = rawUrl.indexOf("?");
-  if (queryIndex === -1) {
-    return null;
-  }
-
-  const query = rawUrl.slice(queryIndex + 1);
-  if (query.length === 0) {
-    return null;
-  }
-
-  for (const part of query.split("&")) {
-    const equalsIndex = part.indexOf("=");
-    const rawKey = equalsIndex === -1 ? part : part.slice(0, equalsIndex);
-    if (rawKey !== key) {
-      continue;
-    }
-    return equalsIndex === -1 ? "" : part.slice(equalsIndex + 1);
-  }
-
-  return null;
 }
 
 function isAuthorized(request: IncomingMessage, token: string): boolean {

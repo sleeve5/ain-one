@@ -1,7 +1,7 @@
 import { readFile } from "node:fs/promises";
 import { join } from "node:path";
 import type { AgentCatalog, AgentProbe, LiveSession, SessionInput, StartTurnInput } from "../../shared/contracts.js";
-import { BaseConnectorOptions, isMissingExecutableError, parseVersion } from "./base.js";
+import { isMissingExecutableError, parseVersion } from "./base.js";
 import { CliJsonlConnector, readMcpArtifact, type JsonlEventContext } from "./cli-jsonl.js";
 
 export class ClaudeConnector extends CliJsonlConnector {

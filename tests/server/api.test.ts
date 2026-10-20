@@ -4,11 +4,10 @@ import { Agent, request as httpRequest } from "node:http";
 import { tmpdir } from "node:os";
 import { join } from "node:path";
 import { afterEach, describe, expect, it } from "vitest";
-import type { AgentConnector } from "../../src/shared/contracts.js";
+import type { AgentConnector, Project } from "../../src/shared/contracts.js";
 import { createDatabase } from "../../src/server/db.js";
 import { createRepositories } from "../../src/server/repositories.js";
 import { createApiServer, InputError } from "../../src/server/api.js";
-import { createProjectFilesService } from "../../src/server/files.js";
 import { TurnCoordinator } from "../../src/server/turn-coordinator.js";
 
 const TOKEN = "task-3-token";
@@ -134,7 +133,6 @@ async function createFixture(input?: {
     port: 0,
     token: TOKEN,
     repositories,
-    files: createProjectFilesService(),
     turnCoordinator: {
       enqueueMessage: async (conversationId, content) => {
         queuedByCoordinator.push(content);
@@ -148,6 +146,13 @@ async function createFixture(input?: {
       retryInterruptedTurn: async (conversationId, turnId) => {
         recoveryCommands.push(`retry:${conversationId}:${turnId}`);
         return true;
+      },
+      restartWorkspace: async () => {
+        recoveryCommands.push("restart-workspace");
+      },
+      resolveUncertainDelivery: async (conversationId, messageId, action) => {
+        recoveryCommands.push(`resolve:${conversationId}:${messageId}:${action}`);
+        return repositories.resolveUncertainMessage(conversationId, messageId, action);
       },
     },
     permissionResponder: input?.permissionResponder,
@@ -240,6 +245,236 @@ async function readSseEvents(response: Response, count: number): Promise<unknown
 }
 
 describe("loopback api", () => {
+  it("manages conversation titles, branches, and archives through the API", async () => {
+    const fixture = await createFixture();
+    try {
+      const renamed = await fixture.request(`/api/conversations/${fixture.conversation.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "API review" }),
+      });
+      expect(renamed.status).toBe(200);
+      expect(await readJson(renamed)).toMatchObject({ conversation: { title: "API review" } });
+
+      const forked = await fixture.request(`/api/conversations/${fixture.conversation.id}/fork`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(forked.status).toBe(201);
+      expect(await readJson(forked)).toMatchObject({
+        conversation: { title: "API review (branch)", projectId: fixture.project.id },
+      });
+
+      const archived = await fixture.request(`/api/conversations/${fixture.conversation.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      });
+      expect(archived.status).toBe(200);
+      const activeList = await fixture.request(`/api/projects/${fixture.project.id}/conversations`);
+      expect(JSON.stringify(await readJson(activeList))).not.toContain(fixture.conversation.id);
+      const archivedList = await fixture.request(
+        `/api/projects/${fixture.project.id}/conversations?archived=true`,
+      );
+      expect(JSON.stringify(await readJson(archivedList))).toContain(fixture.conversation.id);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("rejects restoring or forking a Conversation that uses a retired Agent", async () => {
+    const fixture = await createFixture();
+    try {
+      const legacy = fixture.repositories.createConversation({
+        projectId: fixture.project.id,
+        agentProductId: "opencode" as never,
+        modelId: "legacy-model",
+      });
+      expect(fixture.repositories.archiveConversation(legacy.id, true)).toBe("updated");
+
+      const restored = await fixture.request(`/api/conversations/${legacy.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ archived: false }),
+      });
+      expect(restored.status).toBe(409);
+      expect(await readJson(restored)).toMatchObject({ error: { code: "agent_retired" } });
+
+      const forked = await fixture.request(`/api/conversations/${legacy.id}/fork`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: "{}",
+      });
+      expect(forked.status).toBe(409);
+      expect(await readJson(forked)).toMatchObject({ error: { code: "agent_retired" } });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("permanently deletes an archived Conversation through the API", async () => {
+    const fixture = await createFixture();
+    try {
+      const rejected = await fixture.request(`/api/conversations/${fixture.conversation.id}`, { method: "DELETE" });
+      expect(rejected.status).toBe(409);
+      await fixture.request(`/api/conversations/${fixture.conversation.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ archived: true }),
+      });
+
+      const deleted = await fixture.request(`/api/conversations/${fixture.conversation.id}`, { method: "DELETE" });
+      expect(deleted.status).toBe(204);
+      expect(fixture.repositories.getConversation(fixture.conversation.id)).toBeNull();
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("permanently deletes an archived Project through the API", async () => {
+    const fixture = await createFixture();
+    try {
+      const rejected = await fixture.request(`/api/projects/${fixture.project.id}`, { method: "DELETE" });
+      expect(rejected.status).toBe(409);
+      fixture.repositories.archiveProject(fixture.project.id, true);
+
+      const deleted = await fixture.request(`/api/projects/${fixture.project.id}`, { method: "DELETE" });
+      expect(deleted.status).toBe(204);
+      expect(fixture.repositories.getProject(fixture.project.id)).toBeNull();
+      expect(fixture.repositories.getConversation(fixture.conversation.id)).toBeNull();
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("rejects new work for a disabled Agent", async () => {
+    const fixture = await createFixture();
+    try {
+      fixture.repositories.setAgentEnabled("codex", false);
+      const created = await fixture.request("/api/conversations", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ projectId: fixture.project.id, agentProductId: "codex", modelId: "gpt-test" }),
+      });
+      expect(created.status).toBe(409);
+      expect(await readJson(created)).toMatchObject({ error: { code: "agent_disabled" } });
+
+      const queued = await fixture.request(`/api/conversations/${fixture.conversation.id}/messages`, {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ content: "do not run" }),
+      });
+      expect(queued.status).toBe(409);
+      expect(await readJson(queued)).toMatchObject({ error: { code: "agent_disabled" } });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("rejects invalid workspace management patches", async () => {
+    const fixture = await createFixture();
+    try {
+      for (const [path, body] of [
+        [`/api/projects/${fixture.project.id}`, null],
+        [`/api/projects/${fixture.project.id}`, { name: "   " }],
+        [`/api/conversations/${fixture.conversation.id}`, {}],
+        [`/api/conversations/${fixture.conversation.id}`, { archived: "yes" }],
+      ] as const) {
+        const response = await fixture.request(path, {
+          method: "PATCH",
+          headers: { "content-type": "application/json" },
+          body: JSON.stringify(body),
+        });
+        expect(response.status).toBe(400);
+      }
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("does not rename a Project when the same patch cannot archive its active Turn", async () => {
+    const fixture = await createFixture();
+    try {
+      fixture.repositories.enqueueMessage(fixture.conversation.id, "active");
+      fixture.repositories.claimNextMessage(fixture.conversation.id, {
+        modelId: "gpt-test",
+        permissionMode: "request_approval",
+        pluginVersions: [],
+      });
+
+      const response = await fixture.request(`/api/projects/${fixture.project.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ name: "renamed", archived: true }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(fixture.repositories.getProject(fixture.project.id)).toMatchObject({
+        name: "demo",
+        archivedAt: null,
+      });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("does not rename a Conversation when the same patch cannot archive its active Turn", async () => {
+    const fixture = await createFixture();
+    try {
+      fixture.repositories.renameConversation(fixture.conversation.id, "Original");
+      fixture.repositories.enqueueMessage(fixture.conversation.id, "active");
+      fixture.repositories.claimNextMessage(fixture.conversation.id, {
+        modelId: "gpt-test",
+        permissionMode: "request_approval",
+        pluginVersions: [],
+      });
+
+      const response = await fixture.request(`/api/conversations/${fixture.conversation.id}`, {
+        method: "PATCH",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ title: "Renamed", archived: true }),
+      });
+
+      expect(response.status).toBe(409);
+      expect(fixture.repositories.getConversation(fixture.conversation.id)).toMatchObject({
+        title: "Original",
+        archivedAt: null,
+      });
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("restores an archived Project when its folder is opened again", async () => {
+    const fixture = await createFixture();
+    try {
+      const first = await fixture.request("/api/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: fixture.project.path, name: null }),
+      });
+      const firstPayload = await readJson(first) as { project: Project };
+      fixture.repositories.archiveProject(firstPayload.project.id, true);
+      const response = await fixture.request("/api/projects", {
+        method: "POST",
+        headers: { "content-type": "application/json" },
+        body: JSON.stringify({ path: fixture.project.path, name: null }),
+      });
+
+      expect(response.status).toBe(200);
+      expect(await readJson(response)).toMatchObject({
+        project: { id: firstPayload.project.id, archivedAt: null },
+      });
+      expect(fixture.repositories.listProjects()).toEqual([
+        expect.objectContaining({ id: firstPayload.project.id }),
+        expect.objectContaining({ id: fixture.project.id }),
+      ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
   it("rejects requests without the installation token", async () => {
     const fixture = await createFixture();
     try {
@@ -264,7 +499,6 @@ describe("loopback api", () => {
         continueConversation: async () => false,
         retryInterruptedTurn: async () => false,
       },
-      files: createProjectFilesService(),
     });
 
     await expect(api.start()).rejects.toThrow("Loopback host required");
@@ -303,7 +537,6 @@ describe("loopback api", () => {
         continueConversation: async () => false,
         retryInterruptedTurn: async () => false,
       },
-      files: createProjectFilesService(),
       allowedOrigins: ["http://127.0.0.1:0", "http://localhost:0", "http://[::1]:0"],
     });
 
@@ -518,6 +751,32 @@ describe("loopback api", () => {
     }
   });
 
+  it("resolves only uncertain messages through an explicit action", async () => {
+    const fixture = await createFixture();
+    try {
+      const message = fixture.repositories.enqueueMessage(fixture.conversation.id, "uncertain");
+      fixture.repositories.stageMessage(fixture.conversation.id, message.id, "delivery-1");
+      fixture.repositories.markConversationStagedMessageUncertain(fixture.conversation.id);
+
+      const resolved = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/messages/${message.id}/resolve`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "retry" }) },
+      );
+      expect(resolved.status).toBe(200);
+      expect(fixture.recoveryCommands).toContain(
+        `resolve:${fixture.conversation.id}:${message.id}:retry`,
+      );
+
+      const repeated = await fixture.request(
+        `/api/conversations/${fixture.conversation.id}/messages/${message.id}/resolve`,
+        { method: "POST", headers: { "content-type": "application/json" }, body: JSON.stringify({ action: "retry" }) },
+      );
+      expect(repeated.status).toBe(409);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
   it("returns explicit 501 for unsupported permission and plugin mutations", async () => {
     const fixture = await createFixture();
     try {
@@ -622,53 +881,17 @@ describe("loopback api", () => {
     }
   });
 
-  it("rejects malformed percent-encoding in file query paths", async () => {
+  it("does not expose removed Project Files and Git routes", async () => {
     const fixture = await createFixture();
     try {
-      const filesResponse = await fixture.request(
-        `/api/projects/${fixture.project.id}/files?path=%E0%A4%A`,
-      );
-      expect(filesResponse.status).toBe(400);
-      expect(await readJson(filesResponse)).toEqual({
-        error: {
-          code: "invalid_path_encoding",
-          message: "Query parameter path must be valid URL encoding",
-        },
-      });
-
-      const previewResponse = await fixture.request(
-        `/api/projects/${fixture.project.id}/preview?path=%E0%A4%A`,
-      );
-      expect(previewResponse.status).toBe(400);
-
-      const diffResponse = await fixture.request(
-        `/api/projects/${fixture.project.id}/git/diff?path=%E0%A4%A`,
-      );
-      expect(diffResponse.status).toBe(400);
-    } finally {
-      await fixture.stop();
-    }
-  });
-
-  it("supports valid percent-encoded file query paths", async () => {
-    const fixture = await createFixture();
-    try {
-      const nestedDir = join(fixture.project.path, "nested");
-      mkdirSync(nestedDir);
-      const filePath = join(nestedDir, "hello world.txt");
-      writeFileSync(filePath, "hi");
-
-      const encoded = encodeURIComponent("nested/hello world.txt");
-      const previewResponse = await fixture.request(
-        `/api/projects/${fixture.project.id}/preview?path=${encoded}`,
-      );
-      expect(previewResponse.status).toBe(200);
-      expect(await readJson(previewResponse)).toEqual(
-        expect.objectContaining({
-          path: "nested/hello world.txt",
-          content: "hi",
-        }),
-      );
+      for (const path of [
+        `/api/projects/${fixture.project.id}/files`,
+        `/api/projects/${fixture.project.id}/preview`,
+        `/api/projects/${fixture.project.id}/git/status`,
+        `/api/projects/${fixture.project.id}/git/diff`,
+      ]) {
+        expect((await fixture.request(path)).status).toBe(404);
+      }
     } finally {
       await fixture.stop();
     }
@@ -755,6 +978,21 @@ describe("loopback api", () => {
         `continue:${fixture.conversation.id}`,
         `retry:${fixture.conversation.id}:turn-1`,
       ]);
+    } finally {
+      await fixture.stop();
+    }
+  });
+
+  it("exposes workspace runtime restart", async () => {
+    const fixture = await createFixture();
+    try {
+      const restarted = await fixture.request("/api/workspace/restart", {
+        method: "POST",
+        body: "{}",
+      });
+
+      expect(restarted.status).toBe(200);
+      expect(fixture.recoveryCommands).toEqual(["restart-workspace"]);
     } finally {
       await fixture.stop();
     }
@@ -894,7 +1132,7 @@ describe("loopback api", () => {
         headers: { "content-type": "application/json" },
         body: JSON.stringify({
           projectId: fixture.project.id,
-          agentProductId: "opencode",
+          agentProductId: "codex",
           modelId: "openai/gpt-5",
         }),
       });
@@ -947,7 +1185,7 @@ describe("loopback api", () => {
     }
   });
 
-  it("rejects plugin enablement changes that affect an active Turn", async () => {
+  it("updates enablements for future Turns while the current Turn keeps its snapshot", async () => {
     const fixture = await createFixture();
     try {
       fixture.repositories.enqueueMessage(fixture.conversation.id, "active");
@@ -969,8 +1207,9 @@ describe("loopback api", () => {
             pluginVersions: [{ pluginId: "formatter", versionId: "v1" }],
           }),
         });
-        expect(response.status).toBe(409);
+        expect(response.status).toBe(200);
       }
+      expect(fixture.repositories.getActiveTurn(fixture.conversation.id)?.snapshot.pluginVersions).toEqual([]);
     } finally {
       await fixture.stop();
     }
@@ -1012,7 +1251,6 @@ describe("loopback api", () => {
       port: 0,
       token: TOKEN,
       repositories,
-      files: createProjectFilesService(),
       turnCoordinator: coordinator,
       updateAgentSettings: ({ agentProductId }) =>
         coordinator.setConnector(agentProductId, replacement),

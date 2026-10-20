@@ -66,11 +66,6 @@ export interface AgentSettingsView {
   projectCatalogs?: Record<string, AgentCatalog>;
 }
 
-export interface PluginCandidateView extends PluginOption {
-  candidateId: string;
-  sourceAgent: AgentProductId;
-}
-
 export interface ConversationView {
   id: string;
   projectId: string;
@@ -92,6 +87,8 @@ export interface ConversationView {
   rawEvents?: NormalizedEvent[];
   archivedAt?: string | null;
   lastTurnAt?: string;
+  hydrated?: boolean;
+  latestEventSequence?: number;
 }
 
 export interface ArchivedWorkspaceState {
@@ -111,12 +108,13 @@ export interface WorkspaceState {
   conversation: ConversationView | null;
   agents: AgentSettingsView[];
   installedPlugins: PluginOption[];
-  pluginCandidates: PluginCandidateView[];
   pluginError: string | null;
 }
 
 export interface AinOneApi {
   loadWorkspace(): Promise<WorkspaceState>;
+  loadConversation?(conversationId: string): Promise<ConversationView>;
+  loadAgentCatalog?(agentProductId: AgentProductId, projectId: string): Promise<AgentCatalog>;
   openProject(path: string): Promise<Project>;
   pickProject(): Promise<Project | null>;
   pickLocalPath?(kind: "directory" | "file"): Promise<string | null>;
@@ -151,7 +149,6 @@ export interface AinOneApi {
   setAgentEnabled?(agentProductId: AgentProductId, enabled: boolean): Promise<void>;
   installPlugin(path: string, type: "skill" | "mcp", compatibleAgents: AgentProductId[]): Promise<void>;
   refreshPluginImports(): Promise<void>;
-  acceptPluginCandidate(candidateId: string): Promise<void>;
   repairPluginMaterialization(
     agentProductId: AgentProductId,
     plugin: PluginVersion,
@@ -203,7 +200,6 @@ interface ConversationDetailResponse {
 
 interface PluginListResponse {
   plugins?: unknown;
-  candidates?: unknown;
 }
 
 const ACTIVE_TURN_STATUS = new Set<ActiveTurnStatus>(["starting", "running", "cancelling"]);
@@ -219,6 +215,8 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
   const baseUrl = (options.baseUrl ?? "").replace(/\/$/, "");
   const reconnectBaseDelayMs = options.reconnectBaseDelayMs ?? 250;
   const reconnectMaxDelayMs = options.reconnectMaxDelayMs ?? 8_000;
+  const catalogPromises = new Map<string, Promise<AgentCatalog>>();
+  let installedPlugins: PluginOption[] = [];
 
   const getJson = async <T>(path: string): Promise<T> => {
     const response = await fetchFn(`${baseUrl}${path}`, {
@@ -273,6 +271,24 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
     return await response.json() as T;
   };
 
+  const loadCatalog = (
+    agentProductId: AgentProductId,
+    projectId: string,
+  ): Promise<AgentCatalog> => {
+    const key = `${projectId}:${agentProductId}`;
+    let promise = catalogPromises.get(key);
+    if (!promise) {
+      promise = tryGetCatalog(getJson, agentProductId, projectId).then((catalog) => {
+        if (catalog.error && catalogPromises.get(key) === promise) {
+          catalogPromises.delete(key);
+        }
+        return catalog;
+      });
+      catalogPromises.set(key, promise);
+    }
+    return promise;
+  };
+
   return {
     async loadWorkspace(): Promise<WorkspaceState> {
       const [projectPayload, agentPayload, pluginPayload] = await Promise.all([
@@ -294,33 +310,19 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         path: project.path,
         archivedAt: project.archivedAt ?? null,
       }));
+      installedPlugins = pluginPayload.plugins;
 
       const primaryProject = projects[0] ?? null;
-      const catalogPromises = new Map<string, Promise<AgentCatalog>>();
-      const loadCatalog = (
-        agentProductId: AgentProductId,
-        projectId: string,
-      ): Promise<AgentCatalog> => {
-        const key = `${projectId}:${agentProductId}`;
-        let promise = catalogPromises.get(key);
-        if (!promise) {
-          promise = tryGetCatalog(getJson, agentProductId, projectId);
-          catalogPromises.set(key, promise);
-        }
-        return promise;
-      };
       const agents = await Promise.all(
         agentPayload.agents
           .filter((agent) => isPhaseOneAgentProductId(agent.agentProductId))
           .map(async (agent): Promise<AgentSettingsView> => {
-          const projectCatalogs = Object.fromEntries(
-            await Promise.all(
-              projects.map(async (project) => [
-                project.id,
-                await loadCatalog(agent.agentProductId, project.id),
-              ] as const),
-            ),
-          );
+          const catalog = primaryProject
+            ? await loadCatalog(agent.agentProductId, primaryProject.id)
+            : emptyCatalog();
+          const projectCatalogs = primaryProject
+            ? { [primaryProject.id]: catalog }
+            : {};
           return {
             id: agent.agentProductId,
             name: agentLabel(agent.agentProductId),
@@ -330,9 +332,7 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
             executablePathOverride: agent.executablePathOverride ?? undefined,
             enabled: agent.enabled !== false,
             diagnostic: agent.probe.diagnostic,
-            catalog: primaryProject
-              ? projectCatalogs[primaryProject.id]
-              : emptyCatalog(),
+            catalog,
             projectCatalogs,
           };
         }),
@@ -349,7 +349,6 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
           conversation: null,
           agents,
           installedPlugins: pluginPayload.plugins,
-          pluginCandidates: pluginPayload.candidates,
           pluginError: pluginPayload.error,
         };
       }
@@ -367,27 +366,14 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
           }
         })),
       ]);
-      const conversations = await Promise.all(
-        projectConversations.flatMap(({ project, conversations: projectItems }) =>
-          projectItems
-            .filter((conversation) => isPhaseOneAgentProductId(conversation.agentProductId))
-            .map(async (conversation) => {
-            const [detail, catalog] = await Promise.all([
-              getJson<ConversationDetailResponse>(
-                `/api/conversations/${encodeURIComponent(conversation.id)}`,
-              ),
-              loadCatalog(conversation.agentProductId, project.id),
-            ]);
-            return toConversationView(
-              detail.conversation,
-              detail,
-              catalog,
-              pluginPayload.plugins.filter((plugin) =>
-                plugin.compatibleAgents.includes(conversation.agentProductId),
-              ),
-            );
-          }),
-        ),
+      const conversations = projectConversations.flatMap(({ conversations: projectItems }) =>
+        projectItems
+          .filter((conversation) => isPhaseOneAgentProductId(conversation.agentProductId))
+          .map((conversation) => toConversationSummary(
+            conversation,
+            agents.find((agent) => agent.id === conversation.agentProductId)?.projectCatalogs?.[conversation.projectId] ?? null,
+            pluginPayload.plugins,
+          )),
       );
 
       const selectedProjectId = projects[0]?.id ?? null;
@@ -406,9 +392,27 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
         conversation: selectedConversation,
         agents,
         installedPlugins: pluginPayload.plugins,
-        pluginCandidates: pluginPayload.candidates,
         pluginError: pluginPayload.error,
       };
+    },
+
+    async loadConversation(conversationId): Promise<ConversationView> {
+      const detail = await getJson<ConversationDetailResponse>(
+        `/api/conversations/${encodeURIComponent(conversationId)}`,
+      );
+      const catalog = await loadCatalog(detail.conversation.agentProductId, detail.conversation.projectId);
+      return toConversationView(
+        detail.conversation,
+        detail,
+        catalog,
+        installedPlugins.filter((plugin) =>
+          plugin.compatibleAgents.includes(detail.conversation.agentProductId),
+        ),
+      );
+    },
+
+    async loadAgentCatalog(agentProductId, projectId): Promise<AgentCatalog> {
+      return loadCatalog(agentProductId, projectId);
     },
 
     async openProject(path): Promise<Project> {
@@ -558,6 +562,7 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
 
     async restartWorkspace(): Promise<void> {
       await postJson("/api/workspace/restart", {});
+      catalogPromises.clear();
     },
 
     subscribeConversationEvents(conversationId, afterSequence, onEvent): () => void {
@@ -627,10 +632,12 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
       await putJson(`/api/agents/${encodeURIComponent(agentProductId)}/settings`, {
         executablePath,
       });
+      clearCatalogs(catalogPromises, agentProductId);
     },
 
     async setAgentEnabled(agentProductId, enabled): Promise<void> {
       await putJson(`/api/agents/${encodeURIComponent(agentProductId)}/settings`, { enabled });
+      clearCatalogs(catalogPromises, agentProductId);
     },
 
     async installPlugin(path, type, compatibleAgents): Promise<void> {
@@ -646,10 +653,6 @@ export function createHttpAinOneApi(options: HttpAinOneApiOptions): AinOneApi {
 
     async refreshPluginImports(): Promise<void> {
       await postJson("/api/plugins/scan", {});
-    },
-
-    async acceptPluginCandidate(candidateId): Promise<void> {
-      await postJson(`/api/plugins/candidates/${encodeURIComponent(candidateId)}/accept`, {});
     },
 
     async repairPluginMaterialization(agentProductId, plugin): Promise<void> {
@@ -754,7 +757,53 @@ function toConversationView(
     rawEvents: detail.events ?? [],
     archivedAt: conversation.archivedAt ?? null,
     lastTurnAt: detail.latestTurn?.updatedAt ?? conversation.createdAt,
+    hydrated: true,
+    latestEventSequence: Math.max(0, ...(detail.events ?? []).map((event) => event.sequence)),
   };
+}
+
+function toConversationSummary(
+  conversation: Conversation,
+  catalog: AgentCatalog | null,
+  plugins: PluginOption[],
+): ConversationView {
+  return {
+    id: conversation.id,
+    projectId: conversation.projectId,
+    title: conversation.title ?? `Conversation ${conversation.id.slice(0, 8)}`,
+    agentProductId: conversation.agentProductId,
+    agentProductLabel: agentLabel(conversation.agentProductId),
+    modelId: conversation.modelId,
+    permissionMode: conversation.permissionMode,
+    availableModels: catalog?.models ?? (conversation.modelId ? [conversation.modelId] : []),
+    availablePermissionModes: catalog?.permissionModes.length
+      ? catalog.permissionModes
+      : [conversation.permissionMode],
+    enabledPluginIds: [],
+    availablePlugins: plugins.filter((plugin) =>
+      plugin.compatibleAgents.includes(conversation.agentProductId)
+    ),
+    activeTurnStatus: null,
+    latestTurnId: null,
+    latestTurnStatus: null,
+    queuePaused: conversation.queuePaused,
+    queuedMessages: [],
+    events: [],
+    rawEvents: [],
+    archivedAt: conversation.archivedAt ?? null,
+    lastTurnAt: conversation.updatedAt,
+    hydrated: false,
+    latestEventSequence: conversation.latestEventSequence ?? 0,
+  };
+}
+
+function clearCatalogs(
+  catalogs: Map<string, Promise<AgentCatalog>>,
+  agentProductId: AgentProductId,
+): void {
+  for (const key of catalogs.keys()) {
+    if (key.endsWith(`:${agentProductId}`)) catalogs.delete(key);
+  }
 }
 
 function normalizeActiveStatus(status: Turn["status"]): ActiveTurnStatus | null {
@@ -778,22 +827,18 @@ async function tryGetCatalog(
 
 async function tryLoadPlugins(
   getJson: <T>(path: string) => Promise<T>,
-): Promise<{ plugins: PluginOption[]; candidates: PluginCandidateView[]; error: string | null }> {
+): Promise<{ plugins: PluginOption[]; error: string | null }> {
   try {
     const payload = await getJson<PluginListResponse>("/api/plugins");
     return {
       plugins: Array.isArray(payload.plugins)
         ? payload.plugins.map(parseInstalledPlugin).filter(isPresent)
         : [],
-      candidates: Array.isArray(payload.candidates)
-        ? payload.candidates.map(parsePluginCandidate).filter(isPresent)
-        : [],
       error: null,
     };
   } catch (error) {
     return {
       plugins: [],
-      candidates: [],
       error: error instanceof Error ? error.message : "Could not load plugin inventory",
     };
   }
@@ -828,7 +873,7 @@ function parseInstalledPlugin(value: unknown): PluginOption | null {
   }
   const declaredAgents = record.compatibleAgents.filter(isAgentProductId);
   const compatibleAgents = declaredAgents.filter(isPhaseOneAgentProductId);
-  if (declaredAgents.length > 0 && compatibleAgents.length === 0) {
+  if (record.compatibleAgents.length > 0 && compatibleAgents.length === 0) {
     return null;
   }
   const materializations = Array.isArray(record.materializations)
@@ -874,26 +919,6 @@ function isMaterializationStatus(
     value === "turn_scoped";
 }
 
-function parsePluginCandidate(value: unknown): PluginCandidateView | null {
-  if (!value || typeof value !== "object") {
-    return null;
-  }
-  const record = value as Record<string, unknown>;
-  const installed = parseInstalledPlugin(value);
-  if (
-    !installed ||
-    typeof record.id !== "string" ||
-    !isPhaseOneAgentProductId(record.agentProductId)
-  ) {
-    return null;
-  }
-  return {
-    ...installed,
-    candidateId: record.id,
-    sourceAgent: record.agentProductId,
-  };
-}
-
 function pluginScopePath(scope: PluginScope): string {
   return scope.type === "global"
     ? "/api/plugins/enablements/global"
@@ -909,7 +934,7 @@ function emptyCatalog(): AgentCatalog {
 }
 
 function isAgentProductId(value: unknown): value is AgentProductId {
-  return value === "codex" || value === "claude" || value === "trae" || value === "opencode";
+  return value === "codex" || value === "claude" || value === "trae";
 }
 
 function isPresent<T>(value: T | null): value is T {

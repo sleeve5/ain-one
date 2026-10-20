@@ -51,16 +51,6 @@ export interface ScanNativeInput {
   compatibility?: CompatibilityMap;
 }
 
-export interface PluginCandidate {
-  id: string;
-  pluginId: string;
-  versionId: string;
-  type: PluginType;
-  path: string;
-  agentProductId: AgentProductId;
-  compatibleAgents: AgentProductId[];
-}
-
 export interface InstalledPluginVersion extends PluginVersion {
   type: PluginType;
   version?: string;
@@ -97,12 +87,8 @@ export interface MaterializeResult {
 
 export interface PluginHub {
   listInstalled(): InstalledPluginSummary[];
-  listCandidates(): PluginCandidate[];
   installLocal(input: InstallLocalInput): Promise<InstalledPluginVersion>;
-  scanNative(input: ScanNativeInput[]): Promise<PluginCandidate[]>;
-  scanConfiguredRoots(): Promise<PluginCandidate[]>;
   importConfiguredRoots(): Promise<InstalledPluginSummary[]>;
-  acceptCandidate(candidateId: string): Promise<InstalledPluginVersion>;
   repairMaterialization(agentProductId: AgentProductId, plugin: PluginVersion): Promise<void>;
   resolveForTurn(input: ResolveForTurnInput): PluginVersion[];
   materialize(
@@ -129,16 +115,6 @@ interface StoredVersion {
   compatibility: CompatibilityMap;
 }
 
-interface StoredCandidate {
-  id: string;
-  pluginId: string;
-  versionId: string;
-  type: PluginType;
-  path: string;
-  compatibility: CompatibilityMap;
-  agentProductId: AgentProductId;
-}
-
 interface ManagedTarget {
   pluginId: string;
   versionId: string;
@@ -148,7 +124,6 @@ interface ManagedTarget {
 
 interface PluginMetadata {
   versions: Record<string, Record<string, StoredVersion>>;
-  candidates: Record<string, StoredCandidate>;
   managedTargets: Partial<Record<AgentProductId, Record<string, ManagedTarget>>>;
 }
 
@@ -173,7 +148,6 @@ interface MaterializationJournal {
 
 const EMPTY_METADATA: PluginMetadata = {
   versions: {},
-  candidates: {},
   managedTargets: {},
 };
 
@@ -198,72 +172,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
   });
   void startupRecovery.catch(() => undefined);
 
-  const scanNative = async (inputs: ScanNativeInput[]): Promise<PluginCandidate[]> => {
-    await startupRecovery;
-    return withMetadataLock(metadataPath, () => {
-      const metadata = loadMetadata(metadataPath);
-      const candidates: PluginCandidate[] = [];
-      for (const item of inputs) {
-        const absolutePath = resolve(item.path);
-        const stats = safeLstat(absolutePath);
-        if (!stats) {
-          continue;
-        }
-
-        const source = inspectSourceForNativeScan(
-          absolutePath,
-          item.agentProductId,
-          item.compatibility ?? inferredScanCompatibility(item.agentProductId),
-          metadata,
-        );
-        if (!source) {
-          continue;
-        }
-
-        const installed = getStoredVersion(metadata, source.pluginId, source.contentHash);
-        if (installed) {
-          installed.version ??= source.version;
-          installed.compatibility = mergeCompatibility(installed.compatibility, source.compatibility);
-          for (const [candidateId, candidate] of Object.entries(metadata.candidates)) {
-            if (candidate.pluginId === source.pluginId && candidate.versionId === source.contentHash) {
-              delete metadata.candidates[candidateId];
-            }
-          }
-          continue;
-        }
-
-        const existing = Object.values(metadata.candidates).find(
-          (candidate) =>
-            candidate.pluginId === source.pluginId &&
-            candidate.versionId === source.contentHash,
-        );
-        if (existing) {
-          existing.compatibility = mergeCompatibility(existing.compatibility, source.compatibility);
-          candidates.push(mapCandidate(existing));
-          continue;
-        }
-
-        const id = randomUUID();
-        const candidate: StoredCandidate = {
-          id,
-          pluginId: source.pluginId,
-          versionId: source.contentHash,
-          type: source.type,
-          path: absolutePath,
-          compatibility: source.compatibility,
-          agentProductId: item.agentProductId,
-        };
-        metadata.candidates[id] = candidate;
-        candidates.push(mapCandidate(candidate));
-      }
-
-      saveMetadata(metadataPath, metadata);
-      return [...new Map(candidates.map((candidate) => [candidate.id, candidate])).values()];
-    });
-  };
-
-  const scanConfiguredRoots = async (): Promise<PluginCandidate[]> => {
-    const candidates: PluginCandidate[] = [];
+  const configuredInputs = async (): Promise<ScanNativeInput[]> => {
     const [discoveredSkillRoots, mcpInputs] = await Promise.all([
       options.discoverSkillRoots?.() ?? [],
       options.discoverMcpDefinitions?.() ?? [],
@@ -274,14 +183,7 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
         skillInputsForRoot(agentProductId, path),
       ),
     ];
-    for (const input of [...skillInputs, ...mcpInputs]) {
-      try {
-        candidates.push(...await scanNative([input]));
-      } catch {
-        // A malformed native plugin must not prevent other imports or server startup.
-      }
-    }
-    return candidates;
+    return [...skillInputs, ...mcpInputs];
   };
 
   return {
@@ -300,16 +202,6 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
             .sort(),
           materializations: materializationStatuses(version, metadata, options.skillRoots),
         }))
-        .sort((left, right) =>
-          left.pluginId.localeCompare(right.pluginId) ||
-          left.versionId.localeCompare(right.versionId),
-        );
-    },
-
-    listCandidates() {
-      assertNoPendingMaterializationRecovery(journalPath);
-      return Object.values(loadMetadata(metadataPath).candidates)
-        .map(mapCandidate)
         .sort((left, right) => left.pluginId.localeCompare(right.pluginId));
     },
 
@@ -324,39 +216,44 @@ export function createPluginHub(options: CreatePluginHubOptions): PluginHub {
       });
     },
 
-    scanNative,
-
-    scanConfiguredRoots,
-
     async importConfiguredRoots() {
-      for (const candidate of await scanConfiguredRoots()) {
+      await startupRecovery;
+      const importedKeys: string[] = [];
+      for (const input of await configuredInputs()) {
         try {
-          await this.acceptCandidate(candidate.id);
+          const imported = await withMetadataLock(metadataPath, () => {
+            const metadata = loadMetadata(metadataPath);
+            const source = inspectSourceForNativeScan(
+              input.path,
+              input.agentProductId,
+              input.compatibility ?? inferredScanCompatibility(input.agentProductId),
+              metadata,
+            );
+            if (!source) return null;
+            const installed = getStoredVersion(metadata, source.pluginId, source.contentHash);
+            let stored: StoredVersion;
+            if (installed) {
+              installed.version ??= source.version;
+              installed.compatibility = mergeCompatibility(installed.compatibility, source.compatibility);
+              stored = installed;
+            } else {
+              stored = storeVersion({ source, metadata, pluginsDir });
+            }
+            saveMetadata(metadataPath, metadata);
+            return mapInstalled(stored);
+          });
+          if (imported) {
+            const key = pluginVersionKey(imported);
+            const previous = importedKeys.indexOf(key);
+            if (previous >= 0) importedKeys.splice(previous, 1);
+            importedKeys.push(key);
+          }
         } catch {
           // One stale or malformed native plugin must not block the remaining imports.
         }
       }
-      return this.listInstalled();
-    },
-
-    async acceptCandidate(candidateId) {
-      await startupRecovery;
-      return withMetadataLock(metadataPath, () => {
-        const metadata = loadMetadata(metadataPath);
-        const candidate = metadata.candidates[candidateId];
-        if (!candidate) {
-          throw new Error("candidate not found");
-        }
-
-        const source = inspectSourceForCandidate(candidate, metadata);
-        if (source.contentHash !== candidate.versionId) {
-          throw new Error("stale candidate");
-        }
-        const stored = storeVersion({ source, metadata, pluginsDir });
-        delete metadata.candidates[candidateId];
-        saveMetadata(metadataPath, metadata);
-        return mapInstalled(stored);
-      });
+      const installed = new Map(this.listInstalled().map((plugin) => [pluginVersionKey(plugin), plugin]));
+      return importedKeys.flatMap((key) => installed.get(key) ?? []);
     },
 
     async repairMaterialization(agentProductId, plugin) {
@@ -515,30 +412,18 @@ function inspectSourceForNativeScan(
   return inspectSource(absolutePath, compatibilityInput);
 }
 
-function inspectSourceForCandidate(
-  candidate: StoredCandidate,
+function isEchoManagedSymlink(
+  agentProductId: AgentProductId,
+  pathValue: string,
   metadata: PluginMetadata,
-): {
-  path: string;
-  pluginId: string;
-  type: PluginType;
-  version?: string;
-  contentHash: string;
-  compatibility: CompatibilityMap;
-} {
-  const inspected = inspectSourceForNativeScan(
-    candidate.path,
-    candidate.agentProductId,
-    candidate.compatibility,
-    metadata,
-  );
-  if (!inspected) {
-    throw new Error("candidate source missing");
+): boolean {
+  const managed = metadata.managedTargets[agentProductId]?.[resolve(pathValue)];
+  if (!managed) {
+    return false;
   }
-  return {
-    ...inspected,
-    pluginId: candidate.pluginId,
-  };
+  const currentReal = safeRealpath(pathValue);
+  const materializedReal = safeRealpath(managed.materializedPath);
+  return Boolean(currentReal && materializedReal && currentReal === materializedReal);
 }
 
 function storeVersion(input: {
@@ -781,10 +666,6 @@ function skillInputsForRoot(agentProductId: AgentProductId, root: string): ScanN
     const path = join(root, entry.name);
     return existsSync(join(path, "SKILL.md")) ? [{ agentProductId, path }] : [];
   });
-}
-
-function hasStoredVersion(metadata: PluginMetadata, pluginId: string, hash: string): boolean {
-  return getStoredVersion(metadata, pluginId, hash) !== null;
 }
 
 interface SkillMaterializationPlan {
@@ -1426,35 +1307,6 @@ function containsSecretRef(value: unknown): boolean {
   return (Array.isArray(value) ? value : Object.values(value)).some(containsSecretRef);
 }
 
-function isEchoManagedSymlink(
-  agentProductId: AgentProductId,
-  pathValue: string,
-  metadata: PluginMetadata,
-): boolean {
-  const stats = safeLstat(pathValue);
-  if (!stats || !stats.isSymbolicLink()) {
-    return false;
-  }
-
-  const managedTargets = metadata.managedTargets[agentProductId] ?? {};
-  const managed = managedTargets[resolve(pathValue)];
-  if (!managed) {
-    return false;
-  }
-
-  const currentReal = safeRealpath(pathValue);
-  const materializedReal = safeRealpath(managed.materializedPath);
-  if (!currentReal || !materializedReal || currentReal !== materializedReal) {
-    return false;
-  }
-
-  try {
-    return hashSkillDirectory(managed.materializedPath) === managed.versionId;
-  } catch {
-    return false;
-  }
-}
-
 function assertNoRawSecretFields(value: unknown, pathParts: string[]): void {
   if (Array.isArray(value)) {
     for (let index = 0; index < value.length; index += 1) {
@@ -1551,12 +1403,10 @@ function loadMetadata(pathValue: string): PluginMetadata {
   }
   const parsed = JSON.parse(readFileSync(pathValue, "utf8")) as {
     versions?: unknown;
-    candidates?: PluginMetadata["candidates"];
     managedTargets?: PluginMetadata["managedTargets"];
   };
   return {
     versions: normalizeVersions(parsed.versions),
-    candidates: parsed.candidates ?? {},
     managedTargets: parsed.managedTargets ?? {},
   };
 }
@@ -1712,6 +1562,10 @@ function mapInstalled(version: StoredVersion): InstalledPluginVersion {
   };
 }
 
+function pluginVersionKey(plugin: { pluginId: string; versionId: string }): string {
+  return `${plugin.pluginId}\0${plugin.versionId}`;
+}
+
 function readSkillVersion(skillPath: string): string | undefined {
   const roots = [skillPath];
   if (basename(dirname(skillPath)) === "skills") roots.push(dirname(dirname(skillPath)));
@@ -1731,20 +1585,6 @@ function readSkillVersion(skillPath: string): string | undefined {
 
 function userFacingVersion(value: unknown): string | undefined {
   return typeof value === "string" ? value.match(/^(\d+\.\d+\.\d+)(?:[-+][0-9A-Za-z.-]+)?$/)?.[1] : undefined;
-}
-
-function mapCandidate(candidate: StoredCandidate): PluginCandidate {
-  return {
-    id: candidate.id,
-    pluginId: candidate.pluginId,
-    versionId: candidate.versionId,
-    type: candidate.type,
-    path: candidate.path,
-    agentProductId: candidate.agentProductId,
-    compatibleAgents: Object.keys(candidate.compatibility)
-      .filter(isAgentProductId)
-      .sort(),
-  };
 }
 
 function removePath(pathValue: string | null): void {
@@ -1802,7 +1642,7 @@ function normalizeVersions(raw: unknown): PluginMetadata["versions"] {
 }
 
 function isAgentProductId(value: string): value is AgentProductId {
-  return value === "codex" || value === "claude" || value === "trae" || value === "opencode";
+  return value === "codex" || value === "claude" || value === "trae";
 }
 
 function isErrno(error: unknown, code: string): boolean {

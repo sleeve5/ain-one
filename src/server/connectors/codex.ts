@@ -1,4 +1,3 @@
-import type { ChildProcess } from "node:child_process";
 import type { AgentCatalog, AgentProbe, LiveSession, PermissionDecision, SessionInput, StartTurnInput, TerminalTurnStatus } from "../../shared/contracts.js";
 import { BaseConnectorOptions, isMissingExecutableError, parseVersion, redactSecrets, truncateText, type ActiveTurnController, type RuntimeSession } from "./base.js";
 import { CliJsonlConnector, readMcpArtifact, renderTomlMcpOverride } from "./cli-jsonl.js";
@@ -6,13 +5,15 @@ import { CliJsonlConnector, readMcpArtifact, renderTomlMcpOverride } from "./cli
 export class CodexConnector extends CliJsonlConnector {
   readonly id = "codex" as const;
   private readonly useAppServer: boolean;
+  private readonly interruptTimeoutMs: number;
 
-  constructor(options: BaseConnectorOptions & { useAppServer?: boolean } = {}) {
+  constructor(options: BaseConnectorOptions & { interruptTimeoutMs?: number; useAppServer?: boolean } = {}) {
     super({
       modelsCachePath: options.modelsCachePath ?? `${process.env.HOME ?? "~"}/.codex/models_cache.json`,
       ...options,
     });
     this.useAppServer = options.useAppServer ?? false;
+    this.interruptTimeoutMs = options.interruptTimeoutMs ?? this.commandTimeoutMs;
   }
 
   protected defaultExecutable(): string {
@@ -127,12 +128,16 @@ export class CodexConnector extends CliJsonlConnector {
       if (!child.stdin?.writable) { reject(new Error("Codex app-server stdin is closed")); return; }
       child.stdin.write(`${JSON.stringify(message)}\n`, (error) => error ? reject(error) : resolve());
     });
-    const request = (method: string, params: Record<string, unknown>): Promise<unknown> => new Promise((resolve, reject) => {
+    const request = (
+      method: string,
+      params: Record<string, unknown>,
+      timeoutMs = this.commandTimeoutMs,
+    ): Promise<unknown> => new Promise((resolve, reject) => {
       const id = ++requestId;
       const timeout = setTimeout(() => {
         pending.delete(id);
-        reject(new Error(`${method} timed out after ${this.commandTimeoutMs}ms`));
-      }, this.commandTimeoutMs);
+        reject(new Error(`${method} timed out after ${timeoutMs}ms`));
+      }, timeoutMs);
       pending.set(id, { resolve, reject, timeout });
       void write({ id, method, params }).catch((error: Error) => {
         clearTimeout(timeout);
@@ -229,7 +234,11 @@ export class CodexConnector extends CliJsonlConnector {
         if (!nativeTurnId || !session.nativeSessionId || terminalSent) return false;
         cancelling = true;
         try {
-          await request("turn/interrupt", { threadId: session.nativeSessionId, turnId: nativeTurnId });
+          await request(
+            "turn/interrupt",
+            { threadId: session.nativeSessionId, turnId: nativeTurnId },
+            this.interruptTimeoutMs,
+          );
         } catch {
           this.killProcessTree(child);
         }

@@ -93,7 +93,7 @@ export function TrajectoryCanvas({ language = "en", events = [] }: TrajectoryCan
       {focusRange ? <div className="trajectory-canvas__range" role="status" aria-label="Selected time range"><span>{zh ? "时间选区" : "Time range"}: {formatRange(focusRange, records, language)}</span><button type="button" onClick={() => setFocusRange(null)}>{zh ? "清除" : "Clear"}</button></div> : null}
       <div className="trajectory-canvas__body">
         <div className="trajectory-canvas__ledger">
-          {records.length === 0 ? <div className="trajectory-canvas__empty">{zh ? "当前会话还没有轨迹" : "No trajectory in this conversation"}</div> : <table aria-label={zh ? "轨迹记录" : "Trajectory ledger"}><tbody>{model.turns.flatMap((turn) => {
+          {records.length === 0 ? <div className="trajectory-canvas__empty">{zh ? "当前对话还没有轨迹" : "No trajectory in this conversation"}</div> : <table aria-label={zh ? "轨迹记录" : "Trajectory ledger"}><tbody>{model.turns.flatMap((turn) => {
             if (collapsedTurns) return [<tr key={turn.id} className="trajectory-row trajectory-row--collapsed"><td><span className="trajectory-row__turn">{zh ? `轮次 ${turn.number}` : `Turn ${turn.number}`}</span></td><td>{turn.records.length} {zh ? "条记录" : "records"}</td></tr>];
             return turn.records.filter((record) => !collapsedCalls || !["reasoning", "tool", "shell", "file"].includes(record.kind)).map((record, index) => {
               const position = timelinePosition(record, records);

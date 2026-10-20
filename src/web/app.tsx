@@ -1,6 +1,5 @@
 import { startTransition, useEffect, useRef, useState } from "react";
 import type { AgentProductId, CreateConversationInput, PluginVersion } from "../shared/contracts.js";
-import { validateGraphDefinition } from "../shared/validation.js";
 import type {
   AinOneApi,
   AgentSettingsView,
@@ -24,8 +23,10 @@ import { ProjectSidebar } from "./components/project-sidebar.js";
 import { Settings } from "./components/settings.js";
 import { TrajectoryCanvas } from "./components/trajectory-canvas.js";
 import { readPreferences, writePreferences } from "./preferences.js";
+import { isSelectableAgent } from "./agent-meta.js";
 import {
   applyConversationEvent,
+  coalesceConversationEvents,
   createInitialWorkspaceUiState,
   type CanvasKind,
   type WorkspaceUiState,
@@ -55,9 +56,10 @@ export function App(props: AppProps) {
   const [graphMode, setGraphMode] = useState<"editor" | "runs">("editor");
   const [clearGraphRequest, setClearGraphRequest] = useState(0);
   const [configGraphRequest, setConfigGraphRequest] = useState(0);
-  const [graphValidation, setGraphValidation] = useState<string[] | null>(null);
+  const [workspaceRefresh, setWorkspaceRefresh] = useState(0);
   const [unreadConversationIds, setUnreadConversationIds] = useState<Set<string>>(() => new Set());
   const selectedConversationIdRef = useRef<string | null>(null);
+  const conversationRequests = useRef(new Map<string, number>());
   const workspaceRequest = useRef(0);
   const workspaceGeneration = useRef(0);
   const locallyArchivedProjects = useRef(new Set<string>());
@@ -66,7 +68,7 @@ export function App(props: AppProps) {
   const pendingWorkspaceSelection = useRef<WorkspaceSelection | null>(null);
   const pluginRequest = useRef(0);
   const pluginScopeRef = useRef<PluginScopeKind>("global");
-  const configurationWriteQueue = useRef<Promise<void> | null>(null);
+  const configurationWriteQueues = useRef(new Map<ConfigurationWriteKey, Promise<void>>());
   const configurationFailures = useRef<Record<ConfigurationWriteKey, string>>({});
   const agentExecutableWrites = useRef(new Map<AgentProductId, Promise<void>>());
   const enabledPluginVersionsRef = useRef<PluginVersion[]>([]);
@@ -76,7 +78,10 @@ export function App(props: AppProps) {
     () => globalThis.matchMedia?.("(max-width: 960px)").matches ?? false,
   );
 
-  const loadWorkspace = async (selection?: WorkspaceSelection): Promise<boolean> => {
+  const loadWorkspace = async (
+    selection?: WorkspaceSelection,
+    invalidateDetails = false,
+  ): Promise<boolean> => {
     if (selection) {
       pendingWorkspaceSelection.current = selection;
     }
@@ -99,19 +104,40 @@ export function App(props: AppProps) {
             !locallyArchivedProjects.current.has(conversation.projectId) &&
             !locallyArchivedConversations.current.has(conversation.id)
           ),
-          pluginCandidates: loadedWorkspace.pluginCandidates.filter((candidate) =>
-            isPhaseOneAgentProductId(candidate.sourceAgent)
-          ),
         };
-        const conversations = workspace.conversations.map((conversation) => ({
-          ...conversation,
-          events:
-            current.workspace.conversations.find((item) => item.id === conversation.id)?.events ??
-            conversation.events,
-          rawEvents:
-            current.workspace.conversations.find((item) => item.id === conversation.id)?.rawEvents ??
-            conversation.rawEvents,
-        }));
+        const conversations = workspace.conversations.map((conversation) => {
+          const existing = current.workspace.conversations.find((item) => item.id === conversation.id);
+          const existingSequence = existing?.latestEventSequence ?? 0;
+          const detailStale =
+            invalidateDetails ||
+            Boolean(existing?.hydrated && (conversation.latestEventSequence ?? 0) > existingSequence);
+          if (!existing?.hydrated || detailStale) {
+            return {
+              ...conversation,
+              events: existing?.events ?? conversation.events,
+              rawEvents: existing?.rawEvents ?? conversation.rawEvents,
+              hydrated: detailStale ? false : conversation.hydrated,
+              latestEventSequence: detailStale
+                ? existingSequence
+                : Math.max(conversation.latestEventSequence ?? 0, existingSequence),
+            };
+          }
+          return {
+            ...conversation,
+            activeTurnStatus: existing.activeTurnStatus,
+            latestTurnId: existing.latestTurnId,
+            latestTurnStatus: existing.latestTurnStatus,
+            queuedMessages: existing.queuedMessages,
+            enabledPluginIds: existing.enabledPluginIds,
+            events: existing.events,
+            rawEvents: existing.rawEvents,
+            hydrated: true,
+            latestEventSequence: Math.max(
+              conversation.latestEventSequence ?? 0,
+              existing.latestEventSequence ?? 0,
+            ),
+          };
+        });
         let selectedConversation: ConversationView | null;
         let selectedProjectId: string | null;
         if (requestedSelection?.conversationId) {
@@ -163,6 +189,7 @@ export function App(props: AppProps) {
           selectedGraphId,
         };
       });
+      setWorkspaceRefresh((current) => current + 1);
       const pendingSelection = pendingWorkspaceSelection.current;
       if (
         requestedSelection &&
@@ -210,11 +237,110 @@ export function App(props: AppProps) {
   const selectedProjectId = state.workspace.selectedProjectId;
   const selectedGraph = state.workspace.graphs?.find((graph) => graph.id === state.selectedGraphId) ?? null;
   selectedConversationIdRef.current = state.workspace.selectedConversationId;
+  const refreshConversation = async (
+    conversationId: string,
+    reportError = true,
+  ): Promise<void> => {
+    if (!props.api.loadConversation) return;
+    const request = (conversationRequests.current.get(conversationId) ?? 0) + 1;
+    conversationRequests.current.set(conversationId, request);
+    try {
+      const loaded = await props.api.loadConversation(conversationId);
+      if (conversationRequests.current.get(conversationId) !== request) return;
+      setState((current) => {
+        const existing = current.workspace.conversations.find((item) => item.id === conversationId);
+        if (!existing) return current;
+        const conversation = mergeConversationDetail(loaded, existing);
+        return {
+          ...current,
+          workspace: {
+            ...current.workspace,
+            conversation:
+              current.workspace.selectedConversationId === conversationId
+                ? conversation
+                : current.workspace.conversation,
+            conversations: current.workspace.conversations.map((item) =>
+              item.id === conversationId ? conversation : item
+            ),
+          },
+        };
+      });
+    } catch (error) {
+      if (
+        reportError &&
+        conversationRequests.current.get(conversationId) === request
+      ) {
+        showActionError(actionError(error, "Could not load Conversation"));
+      }
+    }
+  };
+
+  const loadAgentsForProject = async (
+    projectId: string,
+    agents = state.workspace.agents,
+  ): Promise<AgentSettingsView[]> => {
+    if (
+      !props.api.loadAgentCatalog ||
+      agents.every((agent) => {
+        const catalog = agent.projectCatalogs?.[projectId];
+        return catalog && !catalog.error;
+      })
+    ) return agents;
+    let loaded: AgentSettingsView[];
+    try {
+      loaded = await Promise.all(agents.map(async (agent) => {
+        if (agent.projectCatalogs?.[projectId] && !agent.projectCatalogs[projectId]?.error) {
+          return agent;
+        }
+        const catalog = await props.api.loadAgentCatalog!(agent.id, projectId);
+        return {
+          ...agent,
+          projectCatalogs: { ...agent.projectCatalogs, [projectId]: catalog },
+        };
+      }));
+    } catch (error) {
+      showActionError(actionError(error, "Could not load Agent catalog"));
+      return agents;
+    }
+    setState((current) => ({
+      ...current,
+      workspace: {
+        ...current.workspace,
+        agents: current.workspace.agents.map((agent) => {
+          const next = loaded.find((candidate) => candidate.id === agent.id);
+          const catalog = next?.projectCatalogs?.[projectId];
+          return catalog
+            ? { ...agent, projectCatalogs: { ...agent.projectCatalogs, [projectId]: catalog } }
+            : agent;
+        }),
+      },
+    }));
+    return loaded;
+  };
+
+  useEffect(() => {
+    if (!selectedProjectId) return;
+    void loadAgentsForProject(selectedProjectId);
+  }, [selectedProjectId, props.api, workspaceRefresh]);
+
+  useEffect(() => {
+    if (!selectedConversation || selectedConversation.hydrated !== false || !props.api.loadConversation) return;
+    void refreshConversation(selectedConversation.id);
+  }, [props.api, selectedConversation?.id, selectedConversation?.hydrated]);
+
   useEffect(() => {
     if (state.status !== "ready" || newConversation || selectedConversation || selectedGraph || !selectedProjectId) return;
     if (state.workspace.conversations.some((item) => item.projectId === selectedProjectId)) return;
-    const agent = preferredAgent(state.workspace.agents);
-    if (agent) setNewConversation(createNewConversationDraft(agent, selectedProjectId, preferences.defaultPermissionMode));
+    let active = true;
+    void loadAgentsForProject(selectedProjectId).then((agents) => {
+      const agent = preferredAgent(agents);
+      if (active && agent) {
+        setNewConversation(createNewConversationDraft(agent, selectedProjectId, preferences.defaultPermissionMode));
+      }
+    });
+    return () => {
+      active = false;
+    };
   }, [state.status, state.workspace.agents, state.workspace.conversations, selectedConversation, selectedGraph, selectedProjectId, newConversation, preferences.defaultPermissionMode]);
   const resolvePluginScope = (scope: PluginScopeKind): PluginScope | null => {
     if (scope === "global") {
@@ -262,58 +388,53 @@ export function App(props: AppProps) {
     }
   }, [settingsOpen, settingsSection, pluginScope, selectedProjectId, selectedConversation?.id]);
 
-  const conversationIds = state.workspace.conversations.map((item) => item.id).join("\0");
+  const conversationSubscriptions = state.workspace.conversations
+    .map((item) => item.id)
+    .join("\0");
 
   useEffect(() => {
-    const unsubscribe = state.workspace.conversations.map((conversation) => {
-      const replaySequence = conversation.events.reduce(
-        (sequence, event) => Math.max(sequence, event.sequence),
-        0,
-      );
-      return props.api.subscribeConversationEvents(conversation.id, replaySequence, (event) => {
-        if (selectedConversationIdRef.current !== conversation.id && (event.type === "assistant_message" || isTerminalTurnEvent(event))) {
-          setUnreadConversationIds((current) => new Set(current).add(conversation.id));
-        }
-        if (event.type === "turn_status") {
-          workspaceGeneration.current += 1;
-        }
-        startTransition(() => {
-          setState((current) => {
-            const existing = current.workspace.conversations.find(
-              (item) => item.id === conversation.id,
-            );
-            if (!existing) {
-              return current;
-            }
-
-            const nextConversation = applyConversationEvent(existing, event);
-            return {
-              ...current,
-              workspace: {
-                ...current.workspace,
-                conversation:
-                  current.workspace.selectedConversationId === nextConversation.id
-                    ? nextConversation
-                    : current.workspace.conversation,
-                conversations: current.workspace.conversations.map((item) =>
-                  item.id === nextConversation.id ? nextConversation : item,
-                ),
-              },
-            };
+    const unsubscribe = state.workspace.conversations.map((conversation) =>
+      props.api.subscribeConversationEvents(
+        conversation.id,
+        conversation.latestEventSequence ?? conversation.events.reduce(
+          (sequence, event) => Math.max(sequence, event.sequence),
+          0,
+        ),
+        (event) => {
+          if (selectedConversationIdRef.current !== conversation.id && (event.type === "assistant_message" || isTerminalTurnEvent(event))) {
+            setUnreadConversationIds((current) => new Set(current).add(conversation.id));
+          }
+          if (event.type === "turn_status") workspaceGeneration.current += 1;
+          startTransition(() => {
+            setState((current) => {
+              const existing = current.workspace.conversations.find(
+                (item) => item.id === conversation.id,
+              );
+              if (!existing) return current;
+              const nextConversation = applyConversationEvent(existing, event);
+              return {
+                ...current,
+                workspace: {
+                  ...current.workspace,
+                  conversation:
+                    current.workspace.selectedConversationId === nextConversation.id
+                      ? nextConversation
+                      : current.workspace.conversation,
+                  conversations: current.workspace.conversations.map((item) =>
+                    item.id === nextConversation.id ? nextConversation : item,
+                  ),
+                },
+              };
+            });
           });
-        });
-        if (isTerminalTurnEvent(event) || isQueueAcknowledgement(event)) {
-          void loadWorkspace();
-        }
-      });
-    });
-
-    return () => {
-      for (const stop of unsubscribe) {
-        stop();
-      }
-    };
-  }, [props.api, conversationIds]);
+          if (isTerminalTurnEvent(event) || isQueueAcknowledgement(event)) {
+            void refreshConversation(conversation.id, false);
+          }
+        },
+      )
+    );
+    return () => unsubscribe.forEach((stop) => stop());
+  }, [props.api, conversationSubscriptions]);
 
   const showActionError = (message: string): void => {
     setState((current) => ({ ...current, actionError: message }));
@@ -328,11 +449,17 @@ export function App(props: AppProps) {
     if (!conversation) {
       return;
     }
+    if (
+      conversationId === state.workspace.selectedConversationId &&
+      conversation.hydrated === false
+    ) {
+      void refreshConversation(conversationId);
+    }
     pendingWorkspaceSelection.current = null;
     resourceSelection.current += 1;
     setUnreadConversationIds((current) => { const next = new Set(current); next.delete(conversationId); return next; });
     setNewConversation(null);
-    setGraphMode("editor"); setGraphValidation(null);
+    setGraphMode("editor");
     workspaceGeneration.current += 1;
     setState((current) => ({
       ...current,
@@ -353,7 +480,7 @@ export function App(props: AppProps) {
     if (!graph) return;
     resourceSelection.current += 1;
     setNewConversation(null);
-    setGraphMode("editor"); setGraphValidation(validateGraphDefinition(graph.definition));
+    setGraphMode("editor");
     setState((current) => ({ ...current, actionError: null, activeCanvas: "conversation", selectedGraphId: graphId, workspace: { ...current.workspace, selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } }));
   };
 
@@ -416,15 +543,15 @@ export function App(props: AppProps) {
     write: () => Promise<void>,
     errorMessage: string,
   ): Promise<void> => {
-    const previous = configurationWriteQueue.current;
+    const previous = configurationWriteQueues.current.get(key);
     const operation = previous ? previous.catch(() => undefined).then(write) : write();
-    configurationWriteQueue.current = operation;
+    configurationWriteQueues.current.set(key, operation);
     void operation.then(
       () => {
         const previousError = configurationFailures.current[key];
         delete configurationFailures.current[key];
-        if (configurationWriteQueue.current === operation) {
-          configurationWriteQueue.current = null;
+        if (configurationWriteQueues.current.get(key) === operation) {
+          configurationWriteQueues.current.delete(key);
         }
         setState((current) =>
           current.actionError === previousError
@@ -438,8 +565,8 @@ export function App(props: AppProps) {
       (error) => {
         const message = actionError(error, errorMessage);
         configurationFailures.current[key] = message;
-        if (configurationWriteQueue.current === operation) {
-          configurationWriteQueue.current = null;
+        if (configurationWriteQueues.current.get(key) === operation) {
+          configurationWriteQueues.current.delete(key);
         }
         showActionError(message);
       },
@@ -491,6 +618,19 @@ export function App(props: AppProps) {
     }
   };
 
+  const pickPath = async (
+    picker: (() => Promise<string | null>) | undefined,
+    errorMessage: string,
+  ): Promise<string | null> => {
+    if (!picker) return null;
+    try {
+      return await picker();
+    } catch (error) {
+      showActionError(actionError(error, errorMessage));
+      return null;
+    }
+  };
+
   const updateAgentExecutablePath = async (
     agentProductId: AgentProductId,
     executablePath: string | null,
@@ -536,11 +676,13 @@ export function App(props: AppProps) {
     });
   };
 
-  const startNewConversation = (): void => {
+  const startNewConversation = async (): Promise<void> => {
     if (!selectedProjectId) return;
-    const agent = preferredAgent(state.workspace.agents);
+    const selection = ++resourceSelection.current;
+    const agents = await loadAgentsForProject(selectedProjectId);
+    if (resourceSelection.current !== selection) return;
+    const agent = preferredAgent(agents);
     if (!agent) return;
-    resourceSelection.current += 1;
     setNewConversation(createNewConversationDraft(agent, selectedProjectId, preferences.defaultPermissionMode));
     workspaceGeneration.current += 1;
     setState((current) => ({
@@ -556,7 +698,8 @@ export function App(props: AppProps) {
     const selection = ++resourceSelection.current;
     workspaceGeneration.current += 1;
     try {
-      const graph = await props.api.createGraph(selectedProjectId, defaultGraph(agentsForProject(state.workspace.agents, selectedProjectId)));
+      const agents = await loadAgentsForProject(selectedProjectId);
+      const graph = await props.api.createGraph(selectedProjectId, defaultGraph(agentsForProject(agents, selectedProjectId)));
       const selectCreated = resourceSelection.current === selection;
       if (selectCreated) { setNewConversation(null); setGraphMode("editor"); }
       setState((current) => ({ ...current, actionError: null, ...(selectCreated ? { activeCanvas: "conversation" as const, selectedGraphId: graph.id } : {}), workspace: { ...current.workspace, graphs: [graph, ...(current.workspace.graphs ?? []).filter((item) => item.id !== graph.id)], ...(selectCreated ? { selectedProjectId: graph.projectId, selectedConversationId: null, conversation: null } : {}) } }));
@@ -565,20 +708,23 @@ export function App(props: AppProps) {
   };
 
   const openProject = async (): Promise<void> => {
+    const selection = ++resourceSelection.current;
     try {
       const project = await props.api.pickProject();
       if (!project) return;
-      const agent = preferredAgent(state.workspace.agents);
-      resourceSelection.current += 1;
+      const agents = await loadAgentsForProject(project.id);
+      const agent = preferredAgent(agents);
+      const selectOpened = resourceSelection.current === selection;
       workspaceGeneration.current += 1;
-      setNewConversation(agent
-        ? createNewConversationDraft(agent, project.id, preferences.defaultPermissionMode)
-        : null);
+      if (selectOpened) {
+        setNewConversation(agent
+          ? createNewConversationDraft(agent, project.id, preferences.defaultPermissionMode)
+          : null);
+      }
       setState((current) => ({
         ...current,
         actionError: null,
-        selectedGraphId: null,
-        activeCanvas: "conversation",
+        ...(selectOpened ? { selectedGraphId: null, activeCanvas: "conversation" as const } : {}),
         workspace: {
           ...current.workspace,
           projects: current.workspace.projects.some((item) => item.id === project.id)
@@ -589,9 +735,11 @@ export function App(props: AppProps) {
                 path: project.path,
                 archivedAt: project.archivedAt ?? null,
               }],
-          selectedProjectId: project.id,
-          selectedConversationId: null,
-          conversation: null,
+          ...(selectOpened ? {
+            selectedProjectId: project.id,
+            selectedConversationId: null,
+            conversation: null,
+          } : {}),
         },
       }));
     } catch (error) {
@@ -694,7 +842,7 @@ export function App(props: AppProps) {
             onRestartWorkspace={async () => {
               try {
                 await props.api.restartWorkspace?.();
-                if (await loadWorkspace()) clearActionError();
+                if (await loadWorkspace(undefined, true)) clearActionError();
               } catch {
                 showActionError(preferences.language === "zh" ? "无法重启项目" : "Could not restart project");
               }
@@ -788,7 +936,7 @@ export function App(props: AppProps) {
             <div className="workspace__conversation-title">
               <h2>{selectedGraph?.name ?? conversation?.title ?? (newConversation ? (preferences.language === "zh" ? "新对话" : "New conversation") : (preferences.language === "zh" ? "选择资源" : "Select a resource"))}</h2>
               {!selectedGraph && (conversation ?? newConversation) ? <AgentBadge agent={(conversation ?? newConversation)!.agentProductId}/> : null}
-              {selectedGraph ? <div className="workspace__graph-actions">{graphValidation ? <span className="workspace__graph-status" data-valid={graphValidation.length === 0}>{graphValidation.length === 0 ? (preferences.language === "zh" ? "可运行" : "Runnable") : (preferences.language === "zh" ? "待完善" : "Incomplete")}</span> : null}<button type="button" onClick={() => setClearGraphRequest((value) => value + 1)}>{preferences.language === "zh" ? "清空图" : "Clear graph"}</button><button type="button" aria-label={preferences.language === "zh" ? "打开图配置" : "Open Graph configuration"} onClick={() => { setGraphMode("editor"); setConfigGraphRequest((value) => value + 1); }}>{preferences.language === "zh" ? "图配置" : "Graph configuration"}</button></div> : null}
+              {selectedGraph ? <div className="workspace__graph-actions"><button type="button" onClick={() => setClearGraphRequest((value) => value + 1)}>{preferences.language === "zh" ? "清空图" : "Clear graph"}</button><button type="button" aria-label={preferences.language === "zh" ? "打开图配置" : "Open Graph configuration"} onClick={() => { setGraphMode("editor"); setConfigGraphRequest((value) => value + 1); }}>{preferences.language === "zh" ? "图配置" : "Graph configuration"}</button></div> : null}
             </div>
             {selectedGraph ? <div className="canvas-switch" role="group" aria-label="Graph view"><button type="button" className="canvas-switch__button" data-active={graphMode === "editor"} aria-pressed={graphMode === "editor"} onClick={() => setGraphMode("editor")}>{preferences.language === "zh" ? "编排" : "Editor"}</button><button type="button" className="canvas-switch__button" data-active={graphMode === "runs"} aria-pressed={graphMode === "runs"} onClick={() => setGraphMode("runs")}>{preferences.language === "zh" ? "最近运行" : "Latest run"}</button></div> : <CanvasSwitch value={state.activeCanvas} language={preferences.language} onChange={changeCanvas} />}
           </div>
@@ -807,7 +955,7 @@ export function App(props: AppProps) {
               onChangeAgent={(agentProductId) => {
                 if (!newConversation) return;
                 const agent = state.workspace.agents.find((item) => item.id === agentProductId);
-                if (agent && isRunnableAgent(agent)) {
+                if (agent && isSelectableAgent(agent)) {
                   setNewConversation(createNewConversationDraft(agent, newConversation.projectId, preferences.defaultPermissionMode));
                 }
               }}
@@ -853,7 +1001,7 @@ export function App(props: AppProps) {
                     showActionError(preferences.language === "zh" ? "无法处理待确认消息" : "Could not resolve uncertain message");
                   }
               }}
-              onQueueMessage={async (content) => {
+              onQueueMessage={async (content, onConversationCreated) => {
                   if (newConversation) {
                     const input: CreateConversationInput = {
                       projectId: newConversation.projectId, agentProductId: newConversation.agentProductId,
@@ -864,6 +1012,7 @@ export function App(props: AppProps) {
                       const created = await props.api.createConversation(input);
                       createdId = created.id;
                       addCreatedConversation(created, "starting");
+                      onConversationCreated?.(created.id);
                       await props.api.queueMessage(created.id, content);
                       clearActionError();
                       return;
@@ -877,12 +1026,22 @@ export function App(props: AppProps) {
                     return;
                   }
                   try {
-                    while (configurationWriteQueue.current) {
-                      await configurationWriteQueue.current.catch(() => undefined);
+                    const keys = [
+                      `conversation:${conversation.id}`,
+                      pluginWriteKey({ type: "global" }),
+                      pluginWriteKey({ type: "project", id: conversation.projectId }),
+                      pluginWriteKey({ type: "conversation", id: conversation.id }),
+                    ];
+                    for (;;) {
+                      const pending = keys
+                        .map((key) => configurationWriteQueues.current.get(key))
+                        .filter((write): write is Promise<void> => Boolean(write));
+                      if (!pending.length) break;
+                      await Promise.all(pending.map((write) => write.catch(() => undefined)));
                     }
-                    const configurationError =
-                      configurationFailures.current[`conversation:${conversation.id}`] ??
-                      configurationFailures.current[`plugins:conversation:${conversation.id}`];
+                    const configurationError = keys
+                      .map((key) => configurationFailures.current[key])
+                      .find(Boolean);
                     if (configurationError) {
                       showActionError(configurationError);
                       throw new Error("configuration write failed");
@@ -954,7 +1113,7 @@ export function App(props: AppProps) {
             aria-hidden={!selectedGraph}
             inert={!selectedGraph}
           >
-            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={agentsForProject(state.workspace.agents, selectedGraph.projectId)} view={graphMode} clearRequest={clearGraphRequest} configRequest={configGraphRequest} onValidationChange={setGraphValidation} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} /> : null}
+            {selectedGraph ? <GraphCanvas language={preferences.language} api={props.api} graphId={selectedGraph.id} agents={agentsForProject(state.workspace.agents, selectedGraph.projectId)} view={graphMode} clearRequest={clearGraphRequest} configRequest={configGraphRequest} onGraphSaved={(saved) => setState((current) => ({ ...current, workspace: { ...current.workspace, graphs: [saved, ...(current.workspace.graphs ?? []).filter((item) => item.id !== saved.id)] } }))} /> : null}
           </section>
 
           <AppSettings
@@ -977,7 +1136,12 @@ export function App(props: AppProps) {
                 onSaveExecutablePath={(agentProductId, executablePath) => {
                   void updateAgentExecutablePath(agentProductId, executablePath).catch(() => undefined);
                 }}
-                onPickExecutablePath={async (agentProductId) => await props.api.pickAgentExecutable?.(agentProductId) ?? null}
+                onPickExecutablePath={(agentProductId) => pickPath(
+                  props.api.pickAgentExecutable
+                    ? () => props.api.pickAgentExecutable!(agentProductId)
+                    : undefined,
+                  "Could not select Agent executable",
+                )}
                 onSetEnabled={(agentProductId, enabled) => {
                   void reloadAfter(
                     () => props.api.setAgentEnabled?.(agentProductId, enabled) ?? Promise.resolve(),
@@ -1001,7 +1165,10 @@ export function App(props: AppProps) {
                     "Could not install plugin",
                   ).catch(() => undefined);
                 }}
-                onPickLocalPath={async (kind) => await props.api.pickLocalPath?.(kind) ?? null}
+                onPickLocalPath={(kind) => pickPath(
+                  props.api.pickLocalPath ? () => props.api.pickLocalPath!(kind) : undefined,
+                  "Could not select plugin path",
+                )}
                 onRefreshImports={() => {
                   void reloadAfter(
                     () => props.api.refreshPluginImports(),
@@ -1048,7 +1215,7 @@ export function App(props: AppProps) {
                   void write.then(
                     () => loadWorkspace(),
                     async () => {
-                      const pending = configurationWriteQueue.current;
+                      const pending = configurationWriteQueues.current.get(pluginWriteKey(resolvedScope));
                       if (pending && pending !== write) {
                         await pending.catch(() => undefined);
                       }
@@ -1092,6 +1259,48 @@ function cloneEvents(events: ConversationView["events"], conversationId: string)
   return events.map((event) => ({ ...event, id: `${conversationId}:${event.sequence}`, conversationId }));
 }
 
+function mergeConversationDetail(
+  loaded: ConversationView,
+  existing: ConversationView | undefined,
+): ConversationView {
+  if (!existing) return loaded;
+  const loadedEvents = conversationSourceEvents(loaded);
+  const loadedSequence = Math.max(
+    loaded.latestEventSequence ?? 0,
+    0,
+    ...loadedEvents.map((event) => event.sequence),
+  );
+  const existingEvents = conversationSourceEvents(existing);
+  const current = existingEvents
+    .filter((event) => event.sequence > loadedSequence)
+    .sort((left, right) => left.sequence - right.sequence)
+    .reduce(applyConversationEvent, loaded);
+  const rawEvents = [
+    ...loadedEvents,
+    ...existingEvents,
+  ]
+    .sort((left, right) => left.sequence - right.sequence)
+    .filter((event, index, events) =>
+      events.findIndex((candidate) =>
+        candidate.id === event.id || candidate.sequence === event.sequence
+      ) === index
+    );
+  return {
+    ...current,
+    events: coalesceConversationEvents(rawEvents),
+    rawEvents,
+    latestEventSequence: Math.max(
+      loaded.latestEventSequence ?? 0,
+      existing.latestEventSequence ?? 0,
+      ...rawEvents.map((event) => event.sequence),
+    ),
+  };
+}
+
+function conversationSourceEvents(conversation: ConversationView): ConversationView["events"] {
+  return conversation.rawEvents?.length ? conversation.rawEvents : conversation.events;
+}
+
 function pluginWriteKey(scope: PluginScope): string {
   return scope.type === "global" ? "plugins:global" : `plugins:${scope.type}:${scope.id}`;
 }
@@ -1100,12 +1309,8 @@ function actionError(error: unknown, fallback: string): string {
   return error instanceof Error && error.message ? `${fallback}: ${error.message}` : fallback;
 }
 
-function isRunnableAgent(agent: AgentSettingsView): boolean {
-  return agent.enabled !== false && (agent.status === "available" || agent.status === "capability_limited");
-}
-
 function preferredAgent(agents: AgentSettingsView[]): AgentSettingsView | undefined {
-  return agents.find(isRunnableAgent) ?? agents[0];
+  return agents.find(isSelectableAgent) ?? agents[0];
 }
 
 function agentsForProject(agents: AgentSettingsView[], projectId: string): AgentSettingsView[] {

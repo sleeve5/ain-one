@@ -1,6 +1,6 @@
 # Ain One
 
-Ain One is a local, project-first coding workspace for using installed Agent Products through one conversation UI. Phase 1 focuses on durable chat sessions, FIFO Turn coordination, Agent/model settings, compatible Skills and MCP management, and read-only project inspection. It uses each Agent Product's native harness and authentication rather than calling model-provider APIs directly.
+Ain One is a local, project-first coding workspace for using installed Agent Products through Chat and visual Graph workflows. It provides durable sessions, Turn coordination, Agent/model settings, compatible Skills and MCP management, execution trajectories, and configurable Graph runs. It uses each Agent Product's native harness and authentication rather than calling model-provider APIs directly.
 
 The current target is developers on macOS who already use Codex, Claude Code, or Trae CLI locally and want one place to manage project conversations without moving native session ownership into another harness.
 
@@ -12,7 +12,7 @@ The current target is developers on macOS who already use Codex, Claude Code, or
 - Microsoft Edge for `pnpm test:e2e`
 - At least one supported local Agent Product installed and authenticated
 
-Default executable names are `codex`, `claude`, and `traecli`. Agent Settings can override each executable with a canonical local path. An OpenCode adapter remains in the backend codebase for later activation, but Phase 1 does not expose OpenCode in the Web UI.
+Default executable names are `codex`, `claude`, and `traecli`. Agent Settings can select another local executable for each supported Agent.
 
 ## Quick Start
 
@@ -58,7 +58,7 @@ Environment variables:
 2. Select an available Agent Product and one of its reported models, then create a Conversation.
 3. Send messages from Conversation Canvas. The Agent Product is fixed for the lifetime of that Conversation; create another Conversation to use a different product.
 4. Change the model, permission mode, or compatible plugin versions only while no Turn is active. Each Turn persists the exact settings snapshot used for dispatch.
-5. Use the Inspector for the Project file tree, read-only previews, Git status, and Git diff.
+5. Create a Graph beside a Chat when work benefits from explicit inputs, Agent steps, loops, and outputs.
 
 Agent Settings reports installation, authentication, version, diagnostics, models, and supported permission modes. Ain One relies on the Agent Product's own login state; model-provider API keys are not an Ain One requirement.
 
@@ -72,13 +72,13 @@ When a queue is paused, **Continue pending queue** skips replaying the terminal 
 
 ## Skills and MCP
 
-Plugin Settings can install a local plugin path or accept a discovered native candidate. Ain One stores immutable versions and enables exact versions at Global, Project, or Conversation scope. Precedence is:
+Plugin Settings can install a local Skill or MCP definition and automatically imports plugins found in configured local Agent roots. Ain One stores immutable versions and enables exact versions at Global, Project, or Conversation scope. Precedence is:
 
 ```text
 Global < Project < Conversation
 ```
 
-Compatibility must be declared explicitly for each Agent Product. Ain One does not rewrite or convert incompatible Skill or MCP formats. Agent-native installations may be discovered and imported into the shared repository, but a new candidate requires explicit acceptance before Ain One manages it.
+Compatibility must be declared explicitly for each Agent Product. Ain One does not rewrite or convert incompatible Skill or MCP formats. Auto-import merges identical content discovered for multiple Agents and skips malformed entries without blocking the rest of the inventory.
 
 Plugin Settings shows per-Agent Skill materialization status. A safe missing or outdated managed copy can be repaired; conflicts are reported and never overwritten. MCP configuration is generated per Turn rather than installed globally. Codex and Trae receive native `mcp_servers` overrides; Claude Code receives a strict native `--mcp-config`.
 
@@ -88,21 +88,17 @@ MCP definitions reject raw secret-like values and accept opaque `secretRef` entr
 
 - The control plane binds to loopback and rejects non-loopback hosts.
 - API commands require an installation-scoped bearer token and validate browser origins.
-- Agent and Git commands are spawned directly with argument arrays and `shell: false`.
-- Project paths and file requests are canonicalized and constrained to the selected Project.
+- Agent and native picker commands are spawned directly with argument arrays and `shell: false`.
 - Connector diagnostics and normalized events redact common credential patterns.
 - Installed Skills and MCP servers are executable extensions. Review their source and compatibility declarations before accepting or enabling them.
 
 ## Canvases
 
-Conversation Canvas and Graph Canvas remain mounted while switching, so drafts and each canvas's local state are preserved. Conversation Canvas is usable in Phase 1. Graph Canvas is intentionally a placeholder and cannot edit or run graphs yet.
-
-Phase 2 will add an adapter for the Python Graph Runtime in `/Users/bytedance/Documents/ChatGPT/chatdev`. Normal Conversations and Graph Runs will keep separate native sessions.
+Conversation Canvas and Graph Canvas remain mounted while switching, so drafts and each canvas's local state are preserved. Graphs can be built visually or edited through their portable configuration, auto-saved, run, inspected, renamed, forked, and archived. Chat Turns and Graph Runs keep separate native sessions.
 
 ## Phase 1 Limits
 
 - macOS is the only acceptance target.
 - Interactive permission replies are not supported by the current non-interactive Codex, Claude Code, and Trae connector modes.
-- OpenCode is deferred and is not exposed in the Phase 1 Web UI, although its backend adapter is retained for later activation.
-- There is no embedded source editor, graph editor/runtime, online plugin marketplace, automatic plugin upgrade, or automatic cross-Agent session migration.
+- There is no embedded source editor, online plugin marketplace, automatic plugin upgrade, or automatic cross-Agent session migration.
 - Plugin compatibility is explicit; undeclared or incompatible formats remain unavailable rather than being transformed.

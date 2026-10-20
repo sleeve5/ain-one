@@ -17,15 +17,17 @@ import { expect, test } from "@playwright/test";
 const repositoryRoot = resolve(fileURLToPath(new URL("../..", import.meta.url)));
 const fakeCodex = realpathSync(join(repositoryRoot, "tests/fixtures/agents/fake-codex.mjs"));
 
-test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted restart flow", async ({ page }) => {
+test("runs the Phase 1 Project, guarded send, canvases, and interrupted restart flow", async ({ page }) => {
   test.setTimeout(90_000);
   const root = mkdtempSync(join(tmpdir(), "ain-one-e2e-"));
   const dataDir = join(root, "data");
   const projectDir = join(root, "sample-project");
+  const homeDir = join(root, "home");
   const gatePath = join(root, "complete-turns");
   const recordPath = join(root, "agent-invocations.jsonl");
   const token = "e2e-install-token";
   mkdirSync(dataDir);
+  mkdirSync(homeDir);
   createGitProject(projectDir);
 
   const apiPort = await freePort();
@@ -35,13 +37,29 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
   let dev: ChildProcess | null = null;
 
   try {
-    dev = await startDev({ dataDir, apiPort, webPort, token, gatePath, recordPath });
+    dev = await startDev({ dataDir, homeDir, apiPort, webPort, token, gatePath, recordPath });
+    await page.addInitScript(() => globalThis.localStorage.setItem("ain-one:language", "en"));
+    await page.route("**/api/host/pick-path?kind=file&purpose=agent&agentProductId=codex", async (route) => {
+      await route.fulfill({ status: 200, contentType: "application/json", body: JSON.stringify({ path: fakeCodex }) });
+    });
     await page.goto(webUrl);
-    await page.getByRole("button", { name: "Agent Settings" }).click();
-    await page.getByLabel("Codex executable path override").fill(fakeCodex);
-    await page.getByRole("button", { name: "Save Codex path" }).click();
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.getByRole("navigation", { name: "Settings sections" }).getByRole("button", { name: "Agent" }).click();
+    const savedAgent = page.waitForResponse((response) =>
+      response.url().endsWith("/api/agents/codex/settings") &&
+      response.request().method() === "PUT" &&
+      response.status() === 200,
+    );
+    const reloadedAgents = page.waitForResponse((response) =>
+      response.url().endsWith("/api/agents") &&
+      response.request().method() === "GET" &&
+      response.status() === 200,
+    );
+    await page.getByRole("button", { name: "Import another Codex path" }).click();
+    await savedAgent;
+    await reloadedAgents;
     await expect(page.getByText("Version: 0.147.0")).toBeVisible();
-    await page.getByRole("button", { name: "Workspace" }).click();
+    await page.getByRole("button", { name: "Close Settings" }).click();
 
     await page.route("**/api/projects/pick", async (route) => {
       const opened = await fetch(`${apiUrl}/api/projects`, {
@@ -61,45 +79,45 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
     await expect(page.getByRole("button", { name: "Open Project Folder" })).toBeVisible();
     await expect(page.getByLabel("Project path")).toHaveCount(0);
     await page.getByRole("button", { name: "Open Project Folder" }).click();
-    await expect(page.getByRole("button", { name: basename(projectDir) })).toBeVisible();
+    await expect(page.locator(".project-sidebar__project-button").filter({ hasText: basename(projectDir) })).toBeVisible();
     await expect(page.getByRole("option", { name: "OpenCode" })).toHaveCount(0);
 
-    await page.getByRole("button", { name: "Agent Settings" }).click();
+    await page.getByRole("button", { name: "Settings" }).click();
+    await page.getByRole("navigation", { name: "Settings sections" }).getByRole("button", { name: "Agent" }).click();
     await expect(page.getByText("OpenCode", { exact: true })).toHaveCount(0);
-    await page.getByRole("button", { name: "Workspace" }).click();
+    await page.getByRole("button", { name: "Close Settings" }).click();
 
-    await page.getByRole("button", { name: "Create Conversation" }).click();
-    await expect(page.getByText("Agent product: Codex")).toBeVisible();
+    await expect(page.getByRole("heading", { name: "New conversation" })).toBeVisible();
+    await expect(page.getByText("Codex", { exact: true }).first()).toBeVisible();
 
     await page.getByRole("textbox", { name: "Message" }).fill("first turn");
-    await page.getByRole("button", { name: "Send message" }).click();
-    await expect(page.getByRole("button", { name: "Queue message" })).toBeVisible();
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
 
     await page.getByRole("textbox", { name: "Message" }).fill("second turn");
-    await page.getByRole("button", { name: "Queue message" }).click();
-    await expect(page.getByText("second turn")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
     await expect.poll(() => execPrompts(recordPath)).toEqual(["first turn"]);
 
     await page.getByRole("textbox", { name: "Message" }).fill("draft survives");
-    await page.getByRole("button", { name: "Graph", exact: true }).click();
-    await page.getByLabel("Viewport marker").fill("center:12,8 zoom:2");
-    await page.getByRole("button", { name: "Conversation", exact: true }).click();
+    await page.getByRole("button", { name: "New graph" }).click();
+    const autoSavedGraph = page.waitForResponse((response) => response.url().includes("/api/graphs/") && response.request().method() === "PUT" && response.status() === 200);
+    await page.getByRole("button", { name: "Add Agent" }).click();
+    await expect(page.getByTestId("graph-flow").getByText("Agent 2")).toBeVisible();
+    await autoSavedGraph;
+    await page.locator(".project-sidebar__resource-button").filter({ has: page.getByText("Chat", { exact: true }) }).first().click();
     await expect(page.getByRole("textbox", { name: "Message" })).toHaveValue("draft survives");
-    await page.getByRole("button", { name: "Graph", exact: true }).click();
-    await expect(page.getByLabel("Viewport marker")).toHaveValue("center:12,8 zoom:2");
-    await page.getByRole("button", { name: "Conversation", exact: true }).click();
-
-    await page.getByRole("button", { name: "README.md" }).click();
-    await expect(page.getByLabel("Read-only file preview")).toContainText("after change");
-    await expect(page.getByLabel("Git diff")).toContainText("+after change");
+    await page.locator(".project-sidebar__resource-button").filter({ has: page.getByText("Graph", { exact: true }) }).first().click();
+    await expect(page.getByTestId("graph-flow").getByText("Agent 2")).toBeVisible();
+    await page.locator(".project-sidebar__resource-button").filter({ has: page.getByText("Chat", { exact: true }) }).first().click();
 
     writeFileSync(gatePath, "complete\n");
-    await expect.poll(() => execPrompts(recordPath), { timeout: 20_000 }).toEqual([
-      "first turn",
-      "second turn",
-    ]);
-    await expect(page.getByText("second turn")).not.toBeVisible();
-    await expect(page.getByRole("button", { name: "Send message" })).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeVisible();
+    await page.getByRole("textbox", { name: "Message" }).fill("second turn");
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    await expect.poll(() => execPrompts(recordPath), { timeout: 20_000 }).toEqual(["first turn", "second turn"]);
+    await expect(page.locator(".conversation-message__body").getByText("second turn", { exact: true })).toBeVisible();
+    await expect(page.getByRole("heading", { name: "Unsent messages" })).toHaveCount(0);
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeVisible();
     expect(persistedTurnState(dataDir)).toEqual({
       statuses: ["completed", "completed"],
       pending: [],
@@ -108,11 +126,10 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
 
     rmSync(gatePath, { force: true });
     await page.getByRole("textbox", { name: "Message" }).fill("restart turn");
-    await page.getByRole("button", { name: "Send message" }).click();
-    await expect(page.getByRole("button", { name: "Queue message" })).toBeVisible();
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
     await page.getByRole("textbox", { name: "Message" }).fill("after restart");
-    await page.getByRole("button", { name: "Queue message" }).click();
-    await expect(page.getByText("after restart")).toBeVisible();
+    await expect(page.getByRole("button", { name: "Send message", exact: true })).toBeDisabled();
     await expect.poll(() => execPrompts(recordPath)).toEqual([
       "first turn",
       "second turn",
@@ -121,46 +138,76 @@ test("runs the Phase 1 Project, FIFO, canvases, inspector, and interrupted resta
 
     await page.goto("about:blank");
     await stopDev(dev, [apiPort, webPort]);
-    dev = await startDev({ dataDir, apiPort, webPort, token, gatePath, recordPath });
+    dev = await startDev({ dataDir, homeDir, apiPort, webPort, token, gatePath, recordPath });
     await page.goto(webUrl);
-    await expect(page.getByRole("button", { name: basename(projectDir) })).toBeVisible();
-    await expect(page.getByText("Agent product: Codex")).toBeVisible();
-    await expect(page.getByRole("button", { name: "Retry interrupted Turn" })).toBeVisible();
-    await expect(page.getByText("after restart")).toBeVisible();
+    await expect(page.locator(".project-sidebar__project-button").filter({ hasText: basename(projectDir) })).toBeVisible();
+    await expect(page.getByText("Codex", { exact: true }).first()).toBeVisible();
     expect(persistedTurnState(dataDir)).toEqual({
-      statuses: ["completed", "completed", "interrupted"],
-      pending: ["after restart"],
-      queuePaused: true,
+      statuses: ["completed", "completed", "cancelled"],
+      pending: [],
+      queuePaused: false,
     });
     await page.waitForTimeout(500);
     expect(execPrompts(recordPath)).toEqual(["first turn", "second turn", "restart turn"]);
 
-    await page.getByRole("button", { name: "Continue pending queue" }).click();
+    await page.getByRole("button", { name: "Restart project" }).click();
+    await page.getByRole("textbox", { name: "Message" }).fill("after workspace restart");
+    await page.getByRole("button", { name: "Send message", exact: true }).click();
     await expect.poll(() => execPrompts(recordPath)).toEqual([
       "first turn",
       "second turn",
       "restart turn",
-      "after restart",
+      "after workspace restart",
     ]);
     writeFileSync(gatePath, "complete\n");
     await expect.poll(() => persistedEvents(dataDir), { timeout: 20_000 }).toEqual(
       expect.arrayContaining([
-        expect.objectContaining({ type: "assistant_message", text: "hello from codex" }),
+        expect.objectContaining({ type: "assistant_message", text: "hello world" }),
         expect.objectContaining({ type: "turn_status", status: "completed" }),
       ]),
     );
-    await expect(page.getByText("after restart")).not.toBeVisible();
-    await expect(page.getByText("hello from codex").first()).toBeVisible({ timeout: 20_000 });
-    expect(persistedTurnState(dataDir)).toEqual({
-      statuses: ["completed", "completed", "interrupted", "completed"],
+    await expect(page.locator(".conversation-message__body").getByText("after workspace restart", { exact: true })).toBeVisible();
+    await expect(page.getByText("hello world").first()).toBeVisible({ timeout: 20_000 });
+    await expect.poll(() => persistedTurnState(dataDir), { timeout: 20_000 }).toEqual({
+      statuses: ["completed", "completed", "cancelled", "completed"],
       pending: [],
       queuePaused: false,
     });
+
+    await page.locator(".project-sidebar__resource-button").filter({ has: page.getByText("Graph", { exact: true }) }).first().click();
+    await page.getByTestId("graph-flow").getByText("Agent 2").click();
+    await page.getByRole("button", { name: "Delete node" }).click();
+    await page.getByLabel("Task").fill("improve this draft");
+    await expect(page.getByRole("button", { name: "Run graph" })).toBeEnabled();
+    const savedGraph = page.waitForResponse((response) => response.url().includes("/api/graphs/") && response.request().method() === "PUT" && response.status() === 200);
+    await page.getByRole("button", { name: "Run graph" }).click();
+    await savedGraph;
+    await expect(page.locator(".graph-run-state [data-status=completed]")).toBeVisible({ timeout: 20_000 });
+    await expect(page.locator(".graph-node[data-kind=agent]")).toHaveAttribute("data-status", "completed");
+
+    await page.reload();
+    await page.locator(".project-sidebar__resource-button").filter({ has: page.getByText("Graph", { exact: true }) }).first().click();
+    await expect(page.locator(".graph-run-state [data-status=completed]")).toBeVisible({ timeout: 20_000 });
+    const nodes = page.locator(".react-flow__node");
+    const pane = page.locator(".react-flow__pane");
+    await expect(nodes).toHaveCount(3);
+    const paneBox = await pane.boundingBox();
+    const nodeBoxes = await nodes.evaluateAll((items) => items.map((item) => { const box = item.getBoundingClientRect(); return { left: box.left, top: box.top, right: box.right, bottom: box.bottom }; }));
+    if (!paneBox || nodeBoxes.length === 0) throw new Error("Graph canvas was not measurable");
+    await page.mouse.move(Math.max(paneBox.x + 2, Math.min(...nodeBoxes.map((box) => box.left)) - 12), Math.max(paneBox.y + 2, Math.min(...nodeBoxes.map((box) => box.top)) - 12));
+    await page.mouse.down();
+    await page.mouse.move(Math.min(paneBox.x + paneBox.width - 2, Math.max(...nodeBoxes.map((box) => box.right)) + 12), Math.min(paneBox.y + paneBox.height - 2, Math.max(...nodeBoxes.map((box) => box.bottom)) + 12), { steps: 8 });
+    await page.mouse.up();
+    await expect(page.locator(".graph-node[data-selected=true]")).toHaveCount(3);
+    await expect(page.locator(".react-flow__nodesselection")).toBeHidden();
+    await page.keyboard.press("Delete");
+    await expect(nodes).toHaveCount(0);
+    await expect(page.locator(".react-flow__edge")).toHaveCount(0);
   } finally {
     if (dev) {
       await stopDev(dev, [apiPort, webPort]);
     }
-    rmSync(root, { recursive: true, force: true });
+    rmSync(root, { recursive: true, force: true, maxRetries: 5, retryDelay: 50 });
   }
 });
 
@@ -189,17 +236,19 @@ function createGitProject(projectDir: string): void {
 
 async function startDev(input: {
   dataDir: string;
+  homeDir: string;
   apiPort: number;
   webPort: number;
   token: string;
   gatePath: string;
   recordPath: string;
 }): Promise<ChildProcess> {
-  const child = spawn("pnpm", ["dev"], {
+  const child = spawn(process.execPath, [join(repositoryRoot, "node_modules/vite/bin/vite.js")], {
     cwd: repositoryRoot,
     detached: true,
     env: {
       ...process.env,
+      HOME: input.homeDir,
       AIN_ONE_DATA_DIR: input.dataDir,
       AIN_ONE_PORT: String(input.apiPort),
       AIN_ONE_WEB_PORT: String(input.webPort),

@@ -4,7 +4,7 @@ import {
   createHttpAinOneApi,
   type ConversationView,
 } from "../../src/web/api.js";
-import { applyConversationEvent } from "../../src/web/store.js";
+import { applyConversationEvent, coalesceConversationEvents } from "../../src/web/store.js";
 
 describe("HTTP AinOneApi", () => {
   it("replays from zero when this app instance has no hydrated history", async () => {
@@ -105,6 +105,30 @@ describe("HTTP AinOneApi", () => {
         body: "{}",
       },
     ]);
+  });
+
+  it("posts an explicit permission decision", async () => {
+    const calls: Array<{ url: string; method: string; body: unknown }> = [];
+    const api = createHttpAinOneApi({
+      baseUrl: "http://127.0.0.1:3000",
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({
+          url: String(input),
+          method: init?.method ?? "GET",
+          body: typeof init?.body === "string" ? JSON.parse(init.body) : null,
+        });
+        return Response.json({ accepted: true });
+      },
+    });
+
+    await api.respondToPermission("conv-1", "approval-1", "deny_once");
+
+    expect(calls).toEqual([{
+      url: "http://127.0.0.1:3000/api/conversations/conv-1/permissions/approval-1",
+      method: "POST",
+      body: { decision: "deny_once" },
+    }]);
   });
 
   it("posts explicit recovery commands once", async () => {
@@ -297,7 +321,7 @@ describe("HTTP AinOneApi", () => {
           url: String(input),
           body: typeof init?.body === "string" ? init.body : null,
         });
-        return Response.json({ candidates: [] });
+        return Response.json({ plugins: [], candidates: [] });
       },
     });
 
@@ -306,9 +330,124 @@ describe("HTTP AinOneApi", () => {
     expect(calls).toEqual([{ url: "/api/plugins/scan", body: "{}" }]);
   });
 
-  it("loads conversation details in parallel and shares catalog requests", async () => {
+  it("uses native host pickers for plugin and Agent paths", async () => {
+    const calls: string[] = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        calls.push(String(input));
+        const url = String(input);
+        return Response.json({ path: url.includes("purpose=agent") ? "/tmp/chosen" : url.includes("kind=file") ? "/tmp/mcp.json" : "/tmp/chosen" });
+      },
+    });
+
+    await expect(api.pickLocalPath!("directory")).resolves.toBe("/tmp/chosen");
+    await expect(api.pickLocalPath!("file")).resolves.toBe("/tmp/mcp.json");
+    await expect(api.pickAgentExecutable!("codex")).resolves.toBe("/tmp/chosen");
+    expect(calls).toEqual([
+      "/api/host/pick-path?kind=directory&purpose=plugin",
+      "/api/host/pick-path?kind=file&purpose=plugin",
+      "/api/host/pick-path?kind=file&purpose=agent&agentProductId=codex",
+    ]);
+  });
+
+  it("deduplicates archived projects and conversations by id", async () => {
+    const projectOne = project("project-1", "One");
+    const archivedProject = { ...projectOne, archivedAt: "2026-08-24T00:00:00.000Z" };
+    const archivedConversation = { ...conversation("conv-1", "project-1"), archivedAt: "2026-08-24T00:00:00.000Z" };
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = String(input);
+        if (url.endsWith("/api/projects")) return jsonResponse({ projects: [projectOne] });
+        if (url.endsWith("/api/projects?archived=true")) return jsonResponse({ projects: [archivedProject, archivedProject] });
+        return jsonResponse({ conversations: [archivedConversation, archivedConversation] });
+      },
+    });
+
+    const archived = await api.loadArchived!();
+    expect(archived.projects).toHaveLength(1);
+    expect(archived.conversations).toHaveLength(1);
+  });
+
+  it("includes active resources owned by an archived Project", async () => {
+    const activeProject = project("active-project", "Active");
+    const archivedProject = {
+      ...project("archived-project", "Archived"),
+      archivedAt: "2026-08-24T00:00:00.000Z",
+    };
+    const activeConversation = conversation("active-conversation", "archived-project");
+    const archivedConversation = {
+      ...conversation("archived-conversation", "active-project"),
+      archivedAt: "2026-08-24T00:00:00.000Z",
+    };
+    const activeGraph = graph("active-graph", "archived-project");
+    const archivedGraph = {
+      ...graph("archived-graph", "active-project"),
+      archivedAt: "2026-08-24T00:00:00.000Z",
+    };
+    const requests: string[] = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = String(input);
+        requests.push(url);
+        if (url === "/api/projects") return jsonResponse({ projects: [activeProject] });
+        if (url === "/api/projects?archived=true") return jsonResponse({ projects: [archivedProject] });
+        if (url === "/api/projects/active-project/conversations?archived=true") return jsonResponse({ conversations: [archivedConversation] });
+        if (url === "/api/projects/archived-project/conversations") return jsonResponse({ conversations: [activeConversation] });
+        if (url === "/api/projects/archived-project/conversations?archived=true") return jsonResponse({ conversations: [] });
+        if (url === "/api/projects/active-project/graphs?archived=true") return jsonResponse({ graphs: [archivedGraph] });
+        if (url === "/api/projects/archived-project/graphs") return jsonResponse({ graphs: [activeGraph] });
+        if (url === "/api/projects/archived-project/graphs?archived=true") return jsonResponse({ graphs: [] });
+        throw new Error(`Unexpected request: ${url}`);
+      },
+    });
+
+    const archived = await api.loadArchived!();
+
+    expect(archived.conversations.map((item) => item.id).sort()).toEqual([
+      "active-conversation",
+      "archived-conversation",
+    ]);
+    expect(archived.graphs?.map((item) => item.id).sort()).toEqual([
+      "active-graph",
+      "archived-graph",
+    ]);
+    expect(requests).not.toContain("/api/projects/active-project/conversations");
+    expect(requests).not.toContain("/api/projects/active-project/graphs");
+  });
+
+  it("deletes an archived Conversation with an authenticated DELETE", async () => {
+    const calls: Array<{ url: string; method: string | undefined; authorization: string | null }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({ url: String(input), method: init?.method, authorization: new Headers(init?.headers).get("authorization") });
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    await api.deleteArchivedConversation!("conversation / 1");
+    expect(calls).toEqual([{ url: "/api/conversations/conversation%20%2F%201", method: "DELETE", authorization: "Bearer token" }]);
+  });
+
+  it("deletes an archived Project with an authenticated DELETE", async () => {
+    const calls: Array<{ url: string; method: string | undefined }> = [];
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input, init) => {
+        calls.push({ url: String(input), method: init?.method });
+        return new Response(null, { status: 204 });
+      },
+    });
+
+    await api.deleteArchivedProject!("project / 1");
+    expect(calls).toEqual([{ url: "/api/projects/project%20%2F%201", method: "DELETE" }]);
+  });
+
+  it("loads workspace summaries first and hydrates one Conversation on demand", async () => {
     const requested: string[] = [];
-    const detailResolvers = new Map<string, (response: Response) => void>();
     const api = createHttpAinOneApi({
       token: "token",
       fetchFn: async (input) => {
@@ -347,8 +486,15 @@ describe("HTTP AinOneApi", () => {
           return jsonResponse({ conversations: [] });
         }
         if (url.pathname.startsWith("/api/conversations/")) {
-          return await new Promise<Response>((resolve) => {
-            detailResolvers.set(url.pathname, resolve);
+          const id = url.pathname.endsWith("conv-1") ? "conv-1" : "conv-2";
+          return jsonResponse({
+            ...conversationDetail(id, "project-1"),
+            events: id === "conv-1"
+              ? [
+                  normalizedEvent({ id: "delta-1", sequence: 1, conversationId: id, payload: { text: "Hello", streamId: "stream-1", delta: true } }),
+                  normalizedEvent({ id: "final-1", sequence: 2, conversationId: id, payload: { text: "Hello world", streamId: "stream-1", final: true } }),
+                ]
+              : [normalizedEvent({ id: "event-" + id, sequence: 1, conversationId: id })],
           });
         }
         if (url.pathname === "/api/agents/codex/catalog") {
@@ -369,25 +515,39 @@ describe("HTTP AinOneApi", () => {
       },
     });
 
-    const loading = api.loadWorkspace();
-    await waitFor(() => detailResolvers.size === 2);
-
-    for (const [path, resolve] of detailResolvers) {
-      const id = path.endsWith("conv-1") ? "conv-1" : "conv-2";
-      resolve(jsonResponse(conversationDetail(id, "project-1")));
-    }
-    const workspace = await loading;
+    const workspace = await api.loadWorkspace();
 
     expect(
       requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-1")),
     ).toHaveLength(1);
     expect(
       requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-2")),
-    ).toHaveLength(1);
-    expect(workspace.agents[0]?.projectCatalogs?.["project-2"]?.models).toEqual([
-      "gpt-5-project-2",
-    ]);
+    ).toHaveLength(0);
+    expect(requested.some((path) => path.startsWith("/api/conversations/"))).toBe(false);
     expect(workspace.agents[0]?.executablePathOverride).toBe("/custom/codex");
+    expect(workspace.conversations).toEqual(expect.arrayContaining([
+      expect.objectContaining({ id: "conv-1", hydrated: false, events: [] }),
+      expect.objectContaining({ id: "conv-2", hydrated: false, events: [] }),
+    ]));
+
+    const hydrated = await api.loadConversation!("conv-1");
+    expect(hydrated).toMatchObject({
+      id: "conv-1",
+      hydrated: true,
+      events: [expect.objectContaining({ id: "final-1", payload: expect.objectContaining({ text: "Hello world" }) })],
+      rawEvents: [expect.objectContaining({ id: "delta-1" }), expect.objectContaining({ id: "final-1" })],
+    });
+    expect(
+      requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-1")),
+    ).toHaveLength(1);
+    await expect(api.loadAgentCatalog!("codex", "project-2")).resolves.toEqual({
+      models: ["gpt-5-project-2"],
+      permissionModes: ["request_approval"],
+    });
+    await api.loadAgentCatalog!("codex", "project-2");
+    expect(
+      requested.filter((path) => path.startsWith("/api/agents/codex/catalog?projectId=project-2")),
+    ).toHaveLength(1);
   });
 
   it("keeps catalog request failures explicit for the affected Project", async () => {
@@ -435,6 +595,69 @@ describe("HTTP AinOneApi", () => {
     });
   });
 
+  it("retries an Agent catalog after a transient failure", async () => {
+    let catalogRequests = 0;
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        if (url.pathname === "/api/agents/codex/catalog") {
+          catalogRequests += 1;
+          return catalogRequests === 1
+            ? jsonResponse({ error: { code: "catalog_failed" } }, { status: 503 })
+            : jsonResponse({
+                catalog: {
+                  models: ["gpt-5"],
+                  permissionModes: ["request_approval"],
+                },
+              });
+        }
+        throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
+      },
+    });
+
+    await expect(api.loadAgentCatalog!("codex", "project-1")).resolves.toMatchObject({
+      error: "Could not load Agent catalog",
+    });
+    await expect(api.loadAgentCatalog!("codex", "project-1")).resolves.toEqual({
+      models: ["gpt-5"],
+      permissionModes: ["request_approval"],
+    });
+    expect(catalogRequests).toBe(2);
+  });
+
+  it("reloads Agent catalogs after restarting the Project", async () => {
+    let catalogRequests = 0;
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        if (url.pathname === "/api/agents/codex/catalog") {
+          catalogRequests += 1;
+          return jsonResponse({
+            catalog: {
+              models: [`gpt-${catalogRequests}`],
+              permissionModes: ["request_approval"],
+            },
+          });
+        }
+        if (url.pathname === "/api/workspace/restart") {
+          return jsonResponse({ restarted: true });
+        }
+        throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
+      },
+    });
+
+    await expect(api.loadAgentCatalog!("codex", "project-1")).resolves.toMatchObject({
+      models: ["gpt-1"],
+    });
+    await api.restartWorkspace!();
+    await expect(api.loadAgentCatalog!("codex", "project-1")).resolves.toMatchObject({
+      models: ["gpt-2"],
+    });
+    expect(catalogRequests).toBe(2);
+  });
+
   it("keeps workspace loading usable while exposing plugin inventory failures", async () => {
     const api = createHttpAinOneApi({
       token: "token",
@@ -462,8 +685,29 @@ describe("HTTP AinOneApi", () => {
       projects: [],
       agents: [],
       installedPlugins: [],
-      pluginCandidates: [],
       pluginError: "plugins_failed: Plugin inventory is unavailable",
+    });
+  });
+
+  it("keeps workspace loading usable while exposing Graph inventory failures", async () => {
+    const api = createHttpAinOneApi({
+      token: "token",
+      fetchFn: async (input) => {
+        const url = new URL(String(input), "http://local");
+        if (url.pathname === "/api/projects") return jsonResponse({ projects: [project("project-1", "One")] });
+        if (url.pathname === "/api/agents") return jsonResponse({ agents: [] });
+        if (url.pathname === "/api/plugins") return jsonResponse({ plugins: [], candidates: [] });
+        if (url.pathname === "/api/projects/project-1/conversations") return jsonResponse({ conversations: [] });
+        if (url.pathname === "/api/projects/project-1/graphs") return jsonResponse({ error: { code: "graphs_failed", message: "Graph inventory is unavailable" } }, { status: 503 });
+        throw new Error(`Unexpected request: ${url.pathname}`);
+      },
+    });
+
+    await expect(api.loadWorkspace()).resolves.toMatchObject({
+      projects: [expect.objectContaining({ id: "project-1" })],
+      conversations: [],
+      graphs: [],
+      graphError: "graphs_failed: Graph inventory is unavailable",
     });
   });
 
@@ -547,7 +791,7 @@ describe("HTTP AinOneApi", () => {
     expect(workspace.installedPlugins[0]?.materializations).toEqual([
       { agentProductId: "codex", status: "materialized", repairable: false },
     ]);
-    expect(workspace.pluginCandidates).toEqual([]);
+    expect(workspace).not.toHaveProperty("pluginCandidates");
     expect(requested.some((path) => path.includes("opencode"))).toBe(false);
   });
 
@@ -568,39 +812,95 @@ describe("HTTP AinOneApi", () => {
     })).rejects.toThrow("turn_active: Settings can change only between Turns");
   });
 
-  it("loads directories without requesting file preview or diff", async () => {
-    const requested: string[] = [];
-    const api = createHttpAinOneApi({
-      token: "token",
-      fetchFn: async (input) => {
-        const url = new URL(String(input), "http://local");
-        requested.push(`${url.pathname}${url.search}`);
-        if (url.pathname.endsWith("/files")) {
-          return jsonResponse({
-            path: "src",
-            entries: [{ path: "src/web", type: "directory" }],
-          });
-        }
-        if (url.pathname.endsWith("/git/status")) {
-          return jsonResponse({ output: "## feature/ain-one-phase1\n" });
-        }
-        throw new Error(`Unexpected request: ${url.pathname}${url.search}`);
-      },
-    });
-
-    const inspector = await api.listProjectFiles("project-1", {
-      path: "src",
-      type: "directory",
-    });
-
-    expect(inspector.currentPath).toBe("src");
-    expect(requested).toContain("/api/projects/project-1/files?path=src");
-    expect(requested.some((path) => path.includes("/preview"))).toBe(false);
-    expect(requested.some((path) => path.includes("/git/diff"))).toBe(false);
-  });
 });
-
 describe("conversation event reducer", () => {
+  it("coalesces persisted assistant streams during conversation hydration", () => {
+    const events = [
+      normalizedEvent({
+        id: "question", sequence: 1, type: "user_message",
+        payload: { text: "你是什么模型", role: "user" },
+      }),
+      normalizedEvent({
+        id: "delta-1", sequence: 2, type: "assistant_message",
+        payload: { text: "我是", role: "assistant", streamId: "message-1", delta: true },
+      }),
+      normalizedEvent({
+        id: "delta-2", sequence: 3, type: "assistant_message",
+        payload: { text: " **Codex**", role: "assistant", streamId: "message-1", delta: true },
+      }),
+      normalizedEvent({
+        id: "final", sequence: 4, type: "assistant_message",
+        payload: { text: "我是 **Codex**。", role: "assistant", streamId: "message-1", final: true },
+      }),
+    ];
+
+    const projected = coalesceConversationEvents(events);
+
+    expect(projected).toHaveLength(2);
+    expect(projected[1]).toMatchObject({
+      id: "final",
+      sequence: 4,
+      payload: { text: "我是 **Codex**。", final: true },
+    });
+    expect(projected[1]?.payload).not.toHaveProperty("delta");
+  });
+
+  it("coalesces assistant deltas into one live message and replaces it with the final text", () => {
+    const conversation = conversationView([]);
+    const first = applyConversationEvent(conversation, normalizedEvent({
+      id: "delta-1", sequence: 1, type: "assistant_message",
+      payload: { text: "Hello", role: "assistant", streamId: "message-1", delta: true },
+    }));
+    const second = applyConversationEvent(first, normalizedEvent({
+      id: "delta-2", sequence: 2, type: "assistant_message",
+      payload: { text: " world", role: "assistant", streamId: "message-1", delta: true },
+    }));
+    const completed = applyConversationEvent(second, normalizedEvent({
+      id: "final-1", sequence: 3, type: "assistant_message",
+      payload: { text: "Hello world!", role: "assistant", streamId: "message-1", final: true },
+    }));
+
+    expect(second.events).toHaveLength(1);
+    expect(second.events[0]?.payload.text).toBe("Hello world");
+    expect(completed.events).toHaveLength(1);
+    expect(completed.events[0]?.payload.text).toBe("Hello world!");
+    expect(completed.events[0]?.sequence).toBe(3);
+  });
+
+  it("keeps live status events in the raw trajectory stream", () => {
+    const running = applyConversationEvent(conversationView([]), normalizedEvent({
+      id: "status-1", sequence: 1, type: "turn_status",
+      payload: { turnId: "turn-1", status: "running" },
+    }));
+
+    expect(running.rawEvents).toEqual([expect.objectContaining({ id: "status-1" })]);
+  });
+
+  it("starts a new assistant message when Trae reuses a stream id after a user follow-up", () => {
+    const previousAnswer = normalizedEvent({
+      id: "answer-1", sequence: 1, type: "assistant_message",
+      payload: { text: "我是 TraeCode", role: "assistant", streamId: "item-4", final: true },
+    });
+    const followUp = normalizedEvent({
+      id: "question-2", sequence: 2, type: "user_message",
+      payload: { text: "介绍一下你可用的所有模型", role: "user" },
+    });
+
+    const updated = applyConversationEvent(
+      conversationView([previousAnswer, followUp]),
+      normalizedEvent({
+        id: "answer-2", sequence: 3, type: "assistant_message",
+        payload: { text: "可用模型如下", role: "assistant", streamId: "item-4", final: true },
+      }),
+    );
+
+    expect(updated.events.map((event) => event.payload.text)).toEqual([
+      "我是 TraeCode",
+      "介绍一下你可用的所有模型",
+      "可用模型如下",
+    ]);
+  });
+
   it("deduplicates replayed events by id or sequence", () => {
     const first = normalizedEvent({ sequence: 1, id: "event-1" });
     const conversation = conversationView([first]);
@@ -615,6 +915,15 @@ describe("conversation event reducer", () => {
     );
 
     expect(duplicateSequence.events).toEqual([first]);
+  });
+
+  it("advances the replay cursor when an SSE event is applied", () => {
+    const updated = applyConversationEvent(
+      { ...conversationView([]), latestEventSequence: 3 },
+      normalizedEvent({ id: "event-4", sequence: 4 }),
+    );
+
+    expect(updated.latestEventSequence).toBe(4);
   });
 
   it("pauses recovery immediately when a Turn fails", () => {
@@ -654,11 +963,9 @@ function memoryStorage(initial: Record<string, string> = {}) {
     },
   };
 }
-
 function jsonResponse(body: unknown, init?: ResponseInit): Response {
   return Response.json(body, init);
 }
-
 function project(id: string, name: string) {
   return {
     id,
@@ -682,6 +989,20 @@ function conversation(id: string, projectId: string) {
   };
 }
 
+function graph(id: string, projectId: string) {
+  return {
+    id,
+    projectId,
+    name: id,
+    description: "",
+    definition: { nodes: [], edges: [], start: [], end: [] },
+    viewport: { x: 0, y: 0, zoom: 1 },
+    positions: {},
+    createdAt: "2026-08-19T00:00:00.000Z",
+    updatedAt: "2026-08-19T00:00:00.000Z",
+  };
+}
+
 function conversationDetail(id: string, projectId: string) {
   return {
     conversation: conversation(id, projectId),
@@ -692,14 +1013,13 @@ function conversationDetail(id: string, projectId: string) {
   };
 }
 
-function normalizedEvent(input: { sequence: number; id: string }): NormalizedEvent {
+function normalizedEvent(input: Partial<NormalizedEvent> & { sequence: number; id: string }): NormalizedEvent {
   return {
-    id: input.id,
     conversationId: "conv-1",
-    sequence: input.sequence,
     type: "assistant_message",
     payload: { text: "hello" },
     createdAt: "2026-08-19T00:00:00.000Z",
+    ...input,
   };
 }
 
@@ -723,15 +1043,4 @@ function conversationView(events: NormalizedEvent[]): ConversationView {
     queuedMessages: [],
     events,
   };
-}
-
-async function waitFor(predicate: () => boolean): Promise<void> {
-  const deadline = Date.now() + 1_000;
-  while (Date.now() < deadline) {
-    if (predicate()) {
-      return;
-    }
-    await new Promise((resolve) => setTimeout(resolve, 0));
-  }
-  throw new Error("Condition was not met");
 }

@@ -7,7 +7,7 @@ import type { AgentConnector, AgentProductId } from "../shared/contracts.js";
 import { createServerConfig, type ServerConfig } from "./config.js";
 import { createConnectorRegistry } from "./connectors/registry.js";
 import { createDatabase } from "./db.js";
-import { createProjectFilesService, pickLocalPath, pickProjectDirectory } from "./files.js";
+import { pickLocalPath, pickProjectDirectory } from "./files.js";
 import { createGraphRepository } from "./graph-repository.js";
 import { GraphRuntime } from "./graph-runtime.js";
 import { discoverNativeMcpDefinitions } from "./mcp-discovery.js";
@@ -46,7 +46,6 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       codex: { executable: executablePaths.codex, useAppServer: true },
       claude: { executable: executablePaths.claude },
       trae: { executable: executablePaths.trae },
-      opencode: { executable: executablePaths.opencode },
     });
   const discoverLocalPlugins = overrides.discoverLocalPlugins ?? true;
   const pluginHub = overrides.pluginHub ?? createPluginHub({
@@ -55,7 +54,6 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       codex: join(homedir(), ".codex", "skills"),
       claude: join(homedir(), ".claude", "skills"),
       trae: join(homedir(), ".trae", "skills"),
-      opencode: join(homedir(), ".config", "opencode", "skills"),
     } : {},
     discoverSkillRoots: discoverLocalPlugins ? () => discoverNativeSkillRoots({
       codexExecutable: executablePaths.codex ?? "codex",
@@ -73,14 +71,20 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
     const plugins = await pluginHub.importConfiguredRoots();
     const globalScope = { type: "global" } as const;
     const firstImport = !repositories.isPluginScopeConfigured(globalScope);
-    const added = plugins.filter((plugin) =>
+    const changedPluginIds = new Set(plugins.filter((plugin) =>
       plugin.compatibleAgents.length > 0 && (firstImport || !before.has(pluginVersionKey(plugin))),
-    );
-    if (added.length > 0) {
+    ).map((plugin) => plugin.pluginId));
+    if (changedPluginIds.size > 0) {
       const enabled = new Map(
         repositories.listPluginEnablements(globalScope).map((plugin) => [plugin.pluginId, plugin]),
       );
-      for (const plugin of added) enabled.set(plugin.pluginId, plugin);
+      for (const plugin of plugins) {
+        if (!changedPluginIds.has(plugin.pluginId) || plugin.compatibleAgents.length === 0) continue;
+        const current = enabled.get(plugin.pluginId);
+        if (!current || comparePluginVersions(plugin, current) >= 0) {
+          enabled.set(plugin.pluginId, plugin);
+        }
+      }
       repositories.setPluginEnablements(globalScope, [...enabled.values()]);
     }
     return plugins;
@@ -177,7 +181,6 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
         }
       }
     },
-    files: createProjectFilesService(),
     pickProjectDirectory,
     pickLocalPath: (kind, purpose) => pickLocalPath(kind, purpose),
     allowedOrigins: [
@@ -245,7 +248,6 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
           status: 200,
           body: {
             plugins: pluginHub.listInstalled(),
-            candidates: pluginHub.listCandidates(),
           },
         };
       }
@@ -268,12 +270,7 @@ export async function startServer(overrides: StartServerOptions = {}): Promise<R
       }
       if (method === "POST" && path === "/api/plugins/scan") {
         const plugins = await importLocalPlugins();
-        return { status: 200, body: { plugins, candidates: pluginHub.listCandidates() } };
-      }
-      const acceptMatch = /^\/api\/plugins\/candidates\/([^/]+)\/accept$/.exec(path);
-      if (method === "POST" && acceptMatch) {
-        const plugin = await pluginHub.acceptCandidate(decodeURIComponent(acceptMatch[1]));
-        return { status: 201, body: { plugin } };
+        return { status: 200, body: { plugins } };
       }
       const repairMatch = /^\/api\/plugins\/([^/]+)\/versions\/([^/]+)\/materializations\/([^/]+)\/repair$/.exec(path);
       if (method === "POST" && repairMatch) {
@@ -333,6 +330,23 @@ function pluginVersionKey(plugin: { pluginId: string; versionId: string }): stri
   return `${plugin.pluginId}\0${plugin.versionId}`;
 }
 
+function comparePluginVersions(
+  left: { version?: string; versionId: string },
+  right: { version?: string; versionId: string },
+): number {
+  if (left.version && right.version) {
+    const leftParts = left.version.split(".").map(Number);
+    const rightParts = right.version.split(".").map(Number);
+    for (let index = 0; index < 3; index += 1) {
+      const difference = leftParts[index]! - rightParts[index]!;
+      if (difference) return difference;
+    }
+  } else if (left.version || right.version) {
+    return left.version ? 1 : -1;
+  }
+  return 0;
+}
+
 function readObject(value: unknown, message: string): Record<string, unknown> {
   if (!value || typeof value !== "object" || Array.isArray(value)) {
     throw new InputError(400, "invalid_plugin_input", message);
@@ -349,7 +363,7 @@ function readRequiredString(value: Record<string, unknown>, key: string): string
 }
 
 function readAgentProductId(value: unknown): AgentProductId {
-  if (value === "codex" || value === "claude" || value === "trae" || value === "opencode") {
+  if (value === "codex" || value === "claude" || value === "trae") {
     return value;
   }
   throw new InputError(400, "invalid_agent_product", "Unsupported Agent Product");

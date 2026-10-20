@@ -10,7 +10,7 @@ export function GeneralSettings({ value, onChange }: GeneralSettingsProps) {
   return (
     <section className="general-settings">
       <h1>{zh ? "通用设置" : "General settings"}</h1>
-      <p>{zh ? "这些偏好应用于工作台和之后新建的会话。" : "These preferences apply to the workspace and sessions you start next."}</p>
+      <p>{zh ? "这些偏好应用于项目和之后新建的对话。" : "These preferences apply to projects and conversations you start next."}</p>
       <label>
         {zh ? "默认权限模式" : "Default permission mode"}
         <select

@@ -7,6 +7,10 @@ import { basename } from "node:path";
 
 const product = detectProduct();
 const args = process.argv.slice(2);
+if (product === "codex" && args[0] === "app-server") {
+  await runCodexAppServer();
+  process.exit(0);
+}
 const stdin = await readStdin();
 recordInvocation({
   product,
@@ -65,9 +69,20 @@ async function runExec(productId, argv) {
     process.exit(23);
   }
 
+  if (scenario === "thread-conflict") {
+    process.stderr.write(
+      `thread-store conflict: thread ${sessionId} already has an active writer\n`,
+    );
+    process.exit(1);
+  }
+
   if (scenario === "codex-modern-jsonl") {
     writeLine({ type: "thread.started", thread_id: sessionId });
     writeLine({ type: "turn.started" });
+    writeLine({
+      type: "item.started",
+      item: { id: "shell-1", type: "command_execution", command: "/bin/zsh -c pwd", status: "in_progress" },
+    });
     writeLine({
       type: "item.completed",
       item: { id: "reasoning-1", type: "reasoning", text: "confirmed working directory" },
@@ -214,7 +229,6 @@ async function runExec(productId, argv) {
   }
 
   if (scenario === "ignore-sigterm") {
-    recordInvocation({ product: productId, commandType: "signal-ready" });
     await new Promise((resolvePromise) => {
       process.on("SIGTERM", () => {
         recordInvocation({ product: productId, commandType: "signal", signal: "SIGTERM" });
@@ -222,6 +236,7 @@ async function runExec(productId, argv) {
       process.on("SIGINT", () => {
         recordInvocation({ product: productId, commandType: "signal", signal: "SIGINT" });
       });
+      recordInvocation({ product: productId, commandType: "signal-ready" });
       setTimeout(resolvePromise, 5_000);
     });
     return;
@@ -235,6 +250,38 @@ async function runExec(productId, argv) {
     while (!existsSync(gatePath)) {
       await sleep(20);
     }
+  }
+
+  if (scenario === "final-output-hang") {
+    writeLine({
+      type: "item.completed",
+      item: { id: "final-message", type: "agent_message", text: "finished answer" },
+    });
+    const keepAlive = setInterval(() => undefined, 1_000);
+    await new Promise((resolvePromise) => {
+      process.on("SIGTERM", resolvePromise);
+      process.on("SIGINT", resolvePromise);
+    });
+    clearInterval(keepAlive);
+    return;
+  }
+
+  if (scenario === "final-output-then-tool-hang") {
+    writeLine({
+      type: "item.completed",
+      item: { id: "progress-message", type: "agent_message", text: "I will inspect it" },
+    });
+    writeLine({
+      type: "item.completed",
+      item: { id: "tool-after-message", type: "command_execution", command: "pwd", status: "completed" },
+    });
+    const keepAlive = setInterval(() => undefined, 1_000);
+    await new Promise((resolvePromise) => {
+      process.on("SIGTERM", resolvePromise);
+      process.on("SIGINT", resolvePromise);
+    });
+    clearInterval(keepAlive);
+    return;
   }
 
   if (scenario === "malformed-json") {
@@ -279,6 +326,66 @@ async function runExec(productId, argv) {
       process.on("SIGINT", stop);
     });
   }
+}
+
+async function runCodexAppServer() {
+  let buffer = "";
+  const scenario = process.env.AIN_FIXTURE_SCENARIO ?? "normal";
+  for await (const chunk of process.stdin) {
+    buffer += chunk.toString();
+    for (;;) {
+      const newline = buffer.indexOf("\n");
+      if (newline < 0) break;
+      const line = buffer.slice(0, newline).trim();
+      buffer = buffer.slice(newline + 1);
+      if (!line) continue;
+      const message = JSON.parse(line);
+      if (scenario === "app-server-hang") continue;
+      if (scenario === "app-server-approval" && message.id === "approval-1") {
+        recordInvocation({ product: "codex", commandType: "permission-response", response: message });
+        writeCodexTurnResult();
+        continue;
+      }
+      if (message.method === "initialize") writeLine({ id: message.id, result: { userAgent: "fake-codex" } });
+      if (message.method === "thread/start" || message.method === "thread/resume") {
+        writeLine({ id: message.id, result: { thread: { id: message.params.threadId ?? "app-thread-codex" } } });
+      }
+      if (message.method === "turn/start") {
+        recordInvocation({
+          product: "codex",
+          commandType: "exec",
+          stdin: appServerPrompt(message.params),
+        });
+        writeLine({ id: message.id, result: { turn: { id: "app-turn-codex", status: "inProgress", items: [] } } });
+        if (scenario === "app-server-cancel-hang") continue;
+        if (scenario === "app-server-malformed-json") process.stdout.write('{"method":"broken"\n');
+        if (scenario === "app-server-approval") {
+          writeLine({ id: "approval-1", method: "item/commandExecution/requestApproval", params: { threadId: "app-thread-codex", turnId: "app-turn-codex", itemId: "command-1", command: "pwd", reason: "Run pwd", startedAtMs: Date.now() } });
+        } else {
+          if (scenario === "wait-for-file") void waitForGate().then(writeCodexTurnResult);
+          else writeCodexTurnResult();
+        }
+      }
+    }
+  }
+}
+
+function appServerPrompt(params) {
+  const input = Array.isArray(params?.input) ? params.input : [];
+  return input.find((item) => item?.type === "text")?.text ?? "";
+}
+
+async function waitForGate() {
+  const gatePath = process.env.AIN_FIXTURE_GATE_PATH;
+  if (!gatePath) throw new Error("AIN_FIXTURE_GATE_PATH is required for wait-for-file");
+  while (!existsSync(gatePath)) await sleep(20);
+}
+
+function writeCodexTurnResult() {
+  writeLine({ method: "item/agentMessage/delta", params: { threadId: "app-thread-codex", turnId: "app-turn-codex", itemId: "app-message-1", delta: "hello" } });
+  writeLine({ method: "item/agentMessage/delta", params: { threadId: "app-thread-codex", turnId: "app-turn-codex", itemId: "app-message-1", delta: " world" } });
+  writeLine({ method: "item/completed", params: { threadId: "app-thread-codex", turnId: "app-turn-codex", item: { type: "agentMessage", id: "app-message-1", text: "hello world" } } });
+  writeLine({ method: "turn/completed", params: { threadId: "app-thread-codex", turn: { id: "app-turn-codex", status: "completed", items: [] } } });
 }
 
 async function runOpenCodeServer(argv) {

@@ -29,7 +29,7 @@ export interface Repositories {
   createConversation(input: CreateConversationInput): Conversation;
   listConversations(projectId: string, archived?: boolean): Conversation[];
   renameConversation(conversationId: string, title: string): "updated" | "not_found";
-  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active";
+  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active" | "agent_unsupported";
   deleteArchivedConversation(conversationId: string): "deleted" | "not_found" | "not_archived" | "turn_active";
   forkConversation(conversationId: string): Conversation | null;
   getConversation(conversationId: string): Conversation | null;
@@ -239,6 +239,7 @@ class SqliteRepositories implements Repositories {
          auto_queue,
          title,
          archived_at,
+         (SELECT COALESCE(MAX(sequence), 0) FROM events WHERE conversation_id = conversations.id) AS latest_event_sequence,
          created_at,
          updated_at
        FROM conversations
@@ -276,7 +277,10 @@ class SqliteRepositories implements Repositories {
     return this.updateNamedRecord("conversations", conversationId, "title", title);
   }
 
-  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active" {
+  archiveConversation(conversationId: string, archived: boolean): "updated" | "not_found" | "turn_active" | "agent_unsupported" {
+    const conversation = this.getConversation(conversationId);
+    if (!conversation) return "not_found";
+    if (!archived && !isSupportedConversationAgent(conversation.agentProductId)) return "agent_unsupported";
     if (archived && this.getActiveTurn(conversationId)) return "turn_active";
     return this.updateArchive("conversations", conversationId, archived);
   }
@@ -299,6 +303,7 @@ class SqliteRepositories implements Repositories {
     return this.immediateTransaction(() => {
       const source = this.getConversation(conversationId);
       if (!source) return null;
+      if (!isSupportedConversationAgent(source.agentProductId)) return null;
       const fork = this.createConversation({
         projectId: source.projectId, agentProductId: source.agentProductId,
         modelId: source.modelId, permissionMode: source.permissionMode, autoQueue: source.autoQueue,
@@ -1373,6 +1378,7 @@ interface DbConversationRow {
   auto_queue: number;
   title: string | null;
   archived_at: string | null;
+  latest_event_sequence?: number;
   created_at: string;
   updated_at: string;
 }
@@ -1439,9 +1445,14 @@ function mapConversation(row: DbConversationRow): Conversation {
     queuePaused: row.queue_paused === 1,
     autoQueue: row.auto_queue === 1,
     archivedAt: row.archived_at,
+    ...(row.latest_event_sequence === undefined ? {} : { latestEventSequence: row.latest_event_sequence }),
     createdAt: row.created_at,
     updatedAt: row.updated_at,
   };
+}
+
+function isSupportedConversationAgent(value: string): value is AgentProductId {
+  return value === "codex" || value === "claude" || value === "trae";
 }
 
 function compactTitle(content: string): string {
